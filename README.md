@@ -2,6 +2,7 @@
 
 네이버 뉴스 API로 호텔 브랜드 관련 기사를 수집하고, AI로 감정·카테고리·위험도를 분석하여 Excel + Word 리포트를 생성합니다.
 
+![Architecture](assets/news_monitoring_architecture.png)
 ## ✨ 주요 기능
 
 - 📰 **자동 수집**: 네이버 뉴스 API로 브랜드 검색
