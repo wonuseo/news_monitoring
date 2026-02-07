@@ -11,10 +11,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # 모듈 임포트
-from collect import OUR_BRANDS, COMPETITORS, collect_all_news
-from process import normalize_df, dedupe_df, save_excel
-from classify import classify_all
-from report import generate_console_report, create_word_report
+from src.modules.collection.collect import OUR_BRANDS, COMPETITORS, collect_all_news
+from src.modules.processing.process import normalize_df, dedupe_df, save_excel
+from src.modules.analysis.classify import classify_all
+from src.modules.export.report import generate_console_report, create_word_report
+from src.modules.collection.scrape import collect_with_scraping, merge_api_and_scrape
+from src.modules.enhancement.fulltext import batch_fetch_full_text
+from src.modules.enhancement.looker_prep import add_time_series_columns
+from src.modules.export.sheets import connect_sheets, sync_all_sheets
 
 
 def load_env():
@@ -45,36 +49,77 @@ def main():
 사용 예시:
   python main.py
   python main.py --display 200
-  python main.py --chunk_size 50 --outdir reports
-  python main.py --dry_run  # AI 분류 없이 테스트
+  python main.py --scrape --start_date 2026-01-01 --end_date 2026-02-07
+  python main.py --fulltext --fulltext_risk_levels 상,중
+  python main.py --sheets --sheets_id YOUR_SHEET_ID
+  python main.py --looker_prep
         """
     )
-    parser.add_argument("--display", type=int, default=100, 
+    # 기존 옵션
+    parser.add_argument("--display", type=int, default=100,
                        help="네이버 API에서 가져올 기사 수 (기본: 100)")
-    parser.add_argument("--start", type=int, default=1, 
+    parser.add_argument("--start", type=int, default=1,
                        help="네이버 API 시작 인덱스 (기본: 1)")
-    parser.add_argument("--sort", type=str, default="date", choices=["date", "sim"], 
+    parser.add_argument("--sort", type=str, default="date", choices=["date", "sim"],
                        help="정렬 방식: date(최신순) 또는 sim(관련도순) (기본: date)")
-    parser.add_argument("--outdir", type=str, default="data", 
+    parser.add_argument("--outdir", type=str, default="data",
                        help="출력 디렉토리 (기본: data)")
-    parser.add_argument("--max_competitor_classify", type=int, default=20, 
+    parser.add_argument("--max_competitor_classify", type=int, default=20,
                        help="경쟁사별 분류할 최대 기사 수 (기본: 20)")
     parser.add_argument("--chunk_size", type=int, default=100,
                        help="AI 처리 시 청크 크기 (기본: 100)")
-    parser.add_argument("--dry_run", action="store_true", 
+    parser.add_argument("--dry_run", action="store_true",
                        help="AI 분류 없이 테스트 실행")
+
+    # 스크래핑 옵션
+    parser.add_argument("--scrape", action="store_true",
+                       help="Naver 뉴스 스크래핑 (날짜 범위 기반)")
+    parser.add_argument("--start_date", type=str, default="2026-01-01",
+                       help="스크래핑 시작 날짜 (YYYY-MM-DD, 기본: 2026-01-01)")
+    parser.add_argument("--end_date", type=str, default="2026-02-07",
+                       help="스크래핑 종료 날짜 (YYYY-MM-DD, 기본: 2026-02-07)")
+    parser.add_argument("--max_scrape_pages", type=int, default=10,
+                       help="스크래핑 최대 페이지 수 (기본: 10)")
+
+    # 전문 스크래핑 옵션
+    parser.add_argument("--fulltext", action="store_true",
+                       help="기사 전문 스크래핑")
+    parser.add_argument("--fulltext_risk_levels", type=str, default="상,중",
+                       help="전문을 스크래핑할 위험도 (기본: 상,중)")
+    parser.add_argument("--fulltext_max_articles", type=int, default=None,
+                       help="최대 전문 스크래핑 기사 수 (기본: 무제한)")
+
+    # Looker 준비 옵션
+    parser.add_argument("--looker_prep", action="store_true",
+                       help="Looker Studio용 시계열 컬럼 추가")
+
+    # Google Sheets 옵션
+    parser.add_argument("--sheets", action="store_true",
+                       help="Google Sheets로 데이터 업로드")
+    parser.add_argument("--sheets_id", type=str, default=None,
+                       help="Google Sheets ID (기본: .env의 GOOGLE_SHEET_ID)")
     
     args = parser.parse_args()
-    
+
     print("="*80)
     print("🚀 뉴스 모니터링 시스템 시작")
     print("="*80)
     print(f"\n설정:")
     print(f"  - 우리 브랜드: {', '.join(OUR_BRANDS)}")
     print(f"  - 경쟁사: {', '.join(COMPETITORS)}")
-    print(f"  - 기사 수: {args.display}개/브랜드")
+    if args.scrape:
+        print(f"  - 수집 모드: API + 스크래핑 ({args.start_date} ~ {args.end_date})")
+    else:
+        print(f"  - 수집 모드: API만")
+        print(f"  - 기사 수: {args.display}개/브랜드")
     print(f"  - 출력 디렉토리: {args.outdir}/")
     print(f"  - AI 청크 크기: {args.chunk_size}")
+    if args.fulltext:
+        print(f"  - 전문 스크래핑: {args.fulltext_risk_levels} (위험도)")
+    if args.looker_prep:
+        print(f"  - Looker 준비: 활성화")
+    if args.sheets:
+        print(f"  - Google Sheets 업로드: 활성화")
     if args.dry_run:
         print(f"  - 모드: DRY RUN (AI 분류 생략)")
     print()
@@ -88,16 +133,33 @@ def main():
     print("\n" + "="*80)
     print("STEP 1: 뉴스 수집")
     print("="*80)
-    df_raw = collect_all_news(
-        OUR_BRANDS, COMPETITORS,
-        args.display, args.start, args.sort,
-        env["naver_id"], env["naver_secret"]
-    )
-    
+
+    if args.scrape:
+        # 스크래핑 방식
+        df_scrape = collect_with_scraping(
+            OUR_BRANDS, COMPETITORS,
+            args.start_date, args.end_date,
+            args.max_scrape_pages
+        )
+        # API 방식도 동시에 수집 후 병합
+        df_api = collect_all_news(
+            OUR_BRANDS, COMPETITORS,
+            args.display, args.start, args.sort,
+            env["naver_id"], env["naver_secret"]
+        )
+        df_raw = merge_api_and_scrape(df_api, df_scrape)
+    else:
+        # API 방식만 (기존 동작)
+        df_raw = collect_all_news(
+            OUR_BRANDS, COMPETITORS,
+            args.display, args.start, args.sort,
+            env["naver_id"], env["naver_secret"]
+        )
+
     if len(df_raw) == 0:
         print("❌ 수집된 기사가 없습니다. 종료합니다.")
         return
-    
+
     save_excel(df_raw, outdir / "raw.xlsx")
     
     # Step 2: 처리
@@ -112,13 +174,34 @@ def main():
     print("\n" + "="*80)
     print("STEP 3: AI 분류")
     print("="*80)
-    df_result = classify_all(
-        df_processed, 
-        env["openai_key"], 
+    df_classified = classify_all(
+        df_processed,
+        env["openai_key"],
         args.max_competitor_classify,
         args.chunk_size,
         args.dry_run
     )
+
+    # Step 3.5: 전문 스크래핑 (선택적)
+    if args.fulltext:
+        print("\n" + "="*80)
+        print("STEP 3.5: 기사 전문 스크래핑")
+        print("="*80)
+        risk_levels = [r.strip() for r in args.fulltext_risk_levels.split(",")]
+        df_classified = batch_fetch_full_text(
+            df_classified,
+            risk_levels=risk_levels,
+            max_articles=args.fulltext_max_articles
+        )
+
+    # Step 3.7: Looker 준비 (선택적)
+    if args.looker_prep:
+        print("\n" + "="*80)
+        print("STEP 3.7: Looker Studio 준비")
+        print("="*80)
+        df_classified = add_time_series_columns(df_classified)
+
+    df_result = df_classified
     
     # 결과 저장 (여러 시트)
     result_path = outdir / "result.xlsx"
@@ -143,14 +226,34 @@ def main():
     print("\n" + "="*80)
     print("STEP 4: 리포트 생성")
     print("="*80)
-    
+
     # 콘솔 리포트
     generate_console_report(df_result)
-    
+
     # Word 리포트
     word_path = outdir / "report.docx"
     create_word_report(df_result, word_path)
-    
+
+    # Step 5: Google Sheets 업로드 (선택적)
+    if args.sheets:
+        print("\n" + "="*80)
+        print("STEP 5: Google Sheets 업로드")
+        print("="*80)
+
+        # 자격증명 경로 결정
+        creds_path = os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH")
+        if not creds_path:
+            print("❌ .env에 GOOGLE_SHEETS_CREDENTIALS_PATH가 설정되지 않았습니다")
+        else:
+            # 시트 ID 결정
+            sheet_id = args.sheets_id or os.getenv("GOOGLE_SHEET_ID")
+            if not sheet_id:
+                print("❌ --sheets_id 또는 .env의 GOOGLE_SHEET_ID를 지정하세요")
+            else:
+                spreadsheet = connect_sheets(creds_path, sheet_id)
+                if spreadsheet:
+                    sync_all_sheets(df_result, spreadsheet)
+
     # 완료
     print("\n" + "="*80)
     print("✅ 모든 작업 완료!")
@@ -160,6 +263,8 @@ def main():
     print(f"  📊 {outdir}/processed.xlsx - 정제된 데이터")
     print(f"  📊 {outdir}/result.xlsx - AI 분류 결과")
     print(f"  📄 {outdir}/report.docx - Word 리포트")
+    if args.sheets:
+        print(f"  ☁️  Google Sheets - 동기화 완료")
     print()
 
 
