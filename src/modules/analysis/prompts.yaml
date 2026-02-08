@@ -1,0 +1,444 @@
+version: "0.4"
+llm:
+  model_hint: "gpt-5-nano"
+  temperature: 0.2
+
+policy_text:
+  sentiment: |
+    You must output one of:
+    POSITIVE / NEUTRAL / NEGATIVE_CANDIDATE / NEGATIVE_CONFIRMED.
+
+    Interpret sentiment TOWARD the brand (not overall world sentiment).
+    This system is recall-first: false positives are acceptable; avoid false negatives.
+    - NEGATIVE_CONFIRMED: strong, explicit negative triggers or direct harm/accusation affecting the brand.
+    - NEGATIVE_CANDIDATE: weak/early signals, allegations, controversy framing, early regulatory attention, operational disruption.
+    - NEUTRAL: informational mention without clear praise/complaint/incident/regulatory/security signals.
+    - POSITIVE: awards, praise, rankings, strong recommendations.
+
+  danger: |
+    Danger is NOT emotion intensity. Danger means response necessity.
+
+    Decide Danger using ONLY these axes:
+    1) Severity (safety/legal/security are inherently high)
+    2) Attribution (likelihood the brand is responsible; negligence/cover-up framing increases it)
+    3) Momentum (rapid spread; multiple similar articles in short time window)
+
+    Danger levels:
+    - D3: public statement likely needed
+    - D2: continuous monitoring required
+    - D1: minor negative issue
+
+    D3 rules (any -> D3 immediately):
+    (A) Hard triggers: fatalities/serious injury/major accident/evacuation, major fire/collapse,
+        large-scale data breach/hacking/ransomware, strong legal actions (indictment/raid/major penalty/business suspension),
+        multiple victims.
+    (B) Strong attribution + blame framing: "cause", "responsibility", "cover-up", "false explanation", "recurrence", "again"
+        with brand as the subject.
+    (C) Momentum spike: >=3 similar articles within ~3 hours AND negative.
+
+    D2 rules:
+    Repeated/persistent/likely-to-spread negatives (system outage, booking errors, refund disputes),
+    controversy stage (abuse allegation, discrimination controversy),
+    or high-risk category (legal/security/safety) but facts/scale unclear.
+
+    D1 rules:
+    Single, minor complaint/review without legal/safety/security actions and no spread signals.
+
+  category: |
+    Categorization supports:
+    (1) retrieval of past playbooks and similar cases,
+    (2) macro monitoring of what topics are being covered.
+
+    You must output:
+    - ONE Issue Category (or OTHER if none fits),
+    - UP TO TWO Coverage Themes (or OTHER if none fits).
+
+    Issue Category (choose 1):
+    - Safety / Incident
+    - Hygiene / Food
+    - Security / Privacy / IT
+    - Legal / Regulation
+    - Customer Dispute
+    - Service Quality / Operations
+    - Pricing / Commercial
+    - Labor / HR
+    - Governance / Ethics
+    - Reputation / PR
+    - OTHER
+
+    Coverage Theme (choose up to 2):
+    - Business / Performance
+    - Brand / Marketing
+    - Product / Offering
+    - Customer Experience
+    - Operations / Technology
+    - People / Organization
+    - Risk / Crisis
+    - ESG / Social
+    - OTHER
+
+    Rules of thumb:
+    - Prefer the most operationally actionable Issue Category (playbook-driven).
+    - If the article is negative and high-risk, Risk / Crisis is often a relevant Coverage Theme (max 2 total).
+    - Use OTHER sparingly; only if none of the provided labels reasonably apply.
+
+output_schemas:
+  sentiment_llm:
+    type: object
+    required: ["sentiment_llm", "confidence", "evidence", "rationale"]
+    additionalProperties: false
+    properties:
+      sentiment_llm:
+        type: string
+        enum: ["POSITIVE", "NEUTRAL", "NEGATIVE_CANDIDATE", "NEGATIVE_CONFIRMED"]
+      confidence:
+        type: number
+        minimum: 0
+        maximum: 1
+      evidence:
+        type: array
+        items: { type: string }
+        minItems: 0
+        maxItems: 3
+      rationale:
+        type: string
+
+  sentiment_final:
+    type: object
+    required: ["sentiment_final", "confidence", "decision_rule", "evidence", "rationale"]
+    additionalProperties: false
+    properties:
+      sentiment_final:
+        type: string
+        enum: ["POSITIVE", "NEUTRAL", "NEGATIVE_CANDIDATE", "NEGATIVE_CONFIRMED"]
+      confidence:
+        type: number
+        minimum: 0
+        maximum: 1
+      decision_rule:
+        type: string
+        description: "How you reconciled RB vs LLM (e.g., KEEP_RB, KEEP_LLM, RECALL_UPGRADE, STRONG_TRIGGER_OVERRIDE)."
+      evidence:
+        type: array
+        items: { type: string }
+        minItems: 0
+        maxItems: 3
+      rationale:
+        type: string
+
+  danger_llm:
+    type: object
+    required: ["danger_llm", "confidence", "evidence", "rationale"]
+    additionalProperties: false
+    properties:
+      danger_llm:
+        type: string
+        enum: ["D1", "D2", "D3"]
+      confidence:
+        type: number
+        minimum: 0
+        maximum: 1
+      evidence:
+        type: array
+        items: { type: string }
+        minItems: 0
+        maxItems: 3
+      rationale:
+        type: string
+
+  danger_final:
+    type: object
+    required: ["danger_final", "confidence", "decision_rule", "evidence", "rationale"]
+    additionalProperties: false
+    properties:
+      danger_final:
+        type: string
+        enum: ["D1", "D2", "D3"]
+      confidence:
+        type: number
+        minimum: 0
+        maximum: 1
+      decision_rule:
+        type: string
+        description: "How you reconciled RB vs LLM (e.g., HARD_TRIGGER_OVERRIDE, KEEP_RB, KEEP_LLM)."
+      evidence:
+        type: array
+        items: { type: string }
+        minItems: 0
+        maxItems: 3
+      rationale:
+        type: string
+
+  # -----------------------
+  # Category schemas (NEW)
+  # -----------------------
+  category_llm:
+    type: object
+    required: ["issue_category_llm", "coverage_themes_llm", "confidence", "evidence", "rationale"]
+    additionalProperties: false
+    properties:
+      issue_category_llm:
+        type: string
+        enum:
+          - "Safety / Incident"
+          - "Hygiene / Food"
+          - "Security / Privacy / IT"
+          - "Legal / Regulation"
+          - "Customer Dispute"
+          - "Service Quality / Operations"
+          - "Pricing / Commercial"
+          - "Labor / HR"
+          - "Governance / Ethics"
+          - "Reputation / PR"
+          - "OTHER"
+      coverage_themes_llm:
+        type: array
+        minItems: 0
+        maxItems: 2
+        items:
+          type: string
+          enum:
+            - "Business / Performance"
+            - "Brand / Marketing"
+            - "Product / Offering"
+            - "Customer Experience"
+            - "Operations / Technology"
+            - "People / Organization"
+            - "Risk / Crisis"
+            - "ESG / Social"
+            - "OTHER"
+      confidence:
+        type: number
+        minimum: 0
+        maximum: 1
+      evidence:
+        type: array
+        minItems: 0
+        maxItems: 3
+        items: { type: string }
+      rationale:
+        type: string
+
+  category_final:
+    type: object
+    required: ["issue_category_final", "coverage_themes_final", "confidence", "decision_rule", "evidence", "rationale"]
+    additionalProperties: false
+    properties:
+      issue_category_final:
+        type: string
+        enum:
+          - "Safety / Incident"
+          - "Hygiene / Food"
+          - "Security / Privacy / IT"
+          - "Legal / Regulation"
+          - "Customer Dispute"
+          - "Service Quality / Operations"
+          - "Pricing / Commercial"
+          - "Labor / HR"
+          - "Governance / Ethics"
+          - "Reputation / PR"
+          - "OTHER"
+      coverage_themes_final:
+        type: array
+        minItems: 0
+        maxItems: 2
+        items:
+          type: string
+          enum:
+            - "Business / Performance"
+            - "Brand / Marketing"
+            - "Product / Offering"
+            - "Customer Experience"
+            - "Operations / Technology"
+            - "People / Organization"
+            - "Risk / Crisis"
+            - "ESG / Social"
+            - "OTHER"
+      confidence:
+        type: number
+        minimum: 0
+        maximum: 1
+      decision_rule:
+        type: string
+        description: "How you reconciled RB vs LLM (e.g., KEEP_RB, KEEP_LLM, PLAYBOOK_TIE_BREAK, USE_OTHER)."
+      evidence:
+        type: array
+        minItems: 0
+        maxItems: 3
+        items: { type: string }
+      rationale:
+        type: string
+
+prompts:
+  # 1) LLM-based sentiment (independent)
+  sentiment_llm:
+    system: |
+      You are a risk monitoring analyst. Follow the policy strictly. Output ONLY valid JSON.
+    user: |
+      POLICY (Sentiment):
+      {{policy_sentiment}}
+
+      ARTICLE (title + description):
+      - title: {{title}}
+      - description: {{description}}
+
+      RULE-BASED CONTEXT (for reference):
+      - brand_mentions: {{brand_mentions}}
+      - brand_scope_rb: {{brand_scope_rb}}
+      - sentiment_rb: {{sentiment_rb}}
+      - reason_codes_rb: {{reason_codes_rb}}
+      - matched_rules_rb: {{matched_rules_rb}}
+
+      Task:
+      Determine sentiment toward the brand using the 4-state scheme.
+
+      Output JSON schema:
+      {{schema_sentiment_llm}}
+
+  # 2) Final sentiment arbitration (RB vs LLM)
+  sentiment_final:
+    system: |
+      You are the final arbiter. Recall-first. Prefer catching negatives over missing them. Output ONLY valid JSON.
+    user: |
+      POLICY (Sentiment):
+      {{policy_sentiment}}
+
+      ARTICLE (title + description):
+      - title: {{title}}
+      - description: {{description}}
+
+      CANDIDATE RESULTS:
+      - rule_based: {{sentiment_rb}}
+      - llm_based: {{sentiment_llm}}
+
+      RULE-BASED EXPLANATION:
+      - brand_scope_rb: {{brand_scope_rb}}
+      - reason_codes_rb: {{reason_codes_rb}}
+      - matched_rules_rb: {{matched_rules_rb}}
+
+      Decide the FINAL sentiment.
+      If uncertain between NEUTRAL and NEGATIVE_CANDIDATE, choose NEGATIVE_CANDIDATE (recall-first).
+
+      Output JSON schema:
+      {{schema_sentiment_final}}
+
+  # 3) LLM-based danger (only for BRAND_TARGETED + NEGATIVE_*)
+  danger_llm:
+    system: |
+      You are a crisis-response triage analyst. Follow the Danger policy strictly. Output ONLY valid JSON.
+    user: |
+      POLICY (Danger):
+      {{policy_danger}}
+
+      ARTICLE (title + description):
+      - title: {{title}}
+      - description: {{description}}
+
+      CONTEXT:
+      - brand_scope_rb: {{brand_scope_rb}}
+      - sentiment_final: {{sentiment_final}}
+      - reason_codes_rb: {{reason_codes_rb}}
+      - matched_rules_rb: {{matched_rules_rb}}
+
+      RULE-BASED DANGER CONTEXT:
+      - danger_rb: {{danger_rb}}
+      - risk_score_rb: {{risk_score_rb}}
+      - score_breakdown_rb: {{score_breakdown_rb}}
+
+      Task:
+      Determine danger level (D1/D2/D3) based on response necessity.
+
+      Output JSON schema:
+      {{schema_danger_llm}}
+
+  # 4) Final danger arbitration (RB vs LLM)
+  danger_final:
+    system: |
+      You are the final arbiter for danger. Use hard-trigger override for D3. Output ONLY valid JSON.
+    user: |
+      POLICY (Danger):
+      {{policy_danger}}
+
+      ARTICLE (title + description):
+      - title: {{title}}
+      - description: {{description}}
+
+      CANDIDATE RESULTS:
+      - rule_based: {{danger_rb}} (score={{risk_score_rb}})
+      - llm_based: {{danger_llm}}
+
+      RULE-BASED DETAILS:
+      - score_breakdown_rb: {{score_breakdown_rb}}
+      - reason_codes_rb: {{reason_codes_rb}}
+
+      Decide FINAL danger level.
+      If any hard-trigger is present in rule-based breakdown, choose D3.
+
+      Output JSON schema:
+      {{schema_danger_final}}
+
+  # -----------------------
+  # 5) LLM-based category (NEW)
+  # -----------------------
+  category_llm:
+    system: |
+      You are a monitoring analyst. Categorize for response playbooks and reporting. Output ONLY valid JSON.
+    user: |
+      POLICY (Category):
+      {{policy_category}}
+
+      ARTICLE (title + description):
+      - title: {{title}}
+      - description: {{description}}
+
+      CONTEXT:
+      - brand_scope_rb: {{brand_scope_rb}}
+      - sentiment_final: {{sentiment_final}}
+      - danger_final: {{danger_final}}
+      - reason_codes_rb: {{reason_codes_rb}}
+
+      RULE-BASED CATEGORY CONTEXT (for reference):
+      - issue_category_rb: {{issue_category_rb}}
+      - coverage_themes_rb: {{coverage_themes_rb}}
+      - matched_rules_rb: {{matched_rules_rb}}
+
+      Task:
+      1) Choose ONE Issue Category (or OTHER).
+      2) Choose up to TWO Coverage Themes (or OTHER).
+      Provide rationale + up to 3 evidence snippets.
+
+      Output JSON schema:
+      {{schema_category_llm}}
+
+  # -----------------------
+  # 6) Final category arbitration (RB vs LLM) (NEW)
+  # -----------------------
+  category_final:
+    system: |
+      You are the final arbiter for category. Prefer the most operationally actionable playbook. Output ONLY valid JSON.
+    user: |
+      POLICY (Category):
+      {{policy_category}}
+
+      ARTICLE (title + description):
+      - title: {{title}}
+      - description: {{description}}
+
+      CANDIDATE RESULTS:
+      - rule_based_issue: {{issue_category_rb}}
+      - rule_based_themes: {{coverage_themes_rb}}
+      - llm_based_issue: {{issue_category_llm}}
+      - llm_based_themes: {{coverage_themes_llm}}
+
+      RULE-BASED DETAILS:
+      - reason_codes_rb: {{reason_codes_rb}}
+      - matched_rules_rb: {{matched_rules_rb}}
+
+      Decide FINAL:
+      - ONE Issue Category (or OTHER)
+      - up to TWO Coverage Themes (or OTHER)
+      If tied, choose the category that implies the clearest response playbook.
+      Use OTHER only if none fits.
+
+      Output JSON schema:
+      {{schema_category_final}}

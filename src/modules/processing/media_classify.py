@@ -8,6 +8,7 @@ import time
 import requests
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
+from pathlib import Path
 import pandas as pd
 
 
@@ -34,48 +35,60 @@ def extract_domain_safe(url: str) -> str:
         return ""
 
 
-def load_media_directory(spreadsheet) -> Dict[str, Dict]:
+def load_media_directory(spreadsheet=None, csv_path: Path = None) -> Dict[str, Dict]:
     """
-    Google Sheets에서 media_directory 시트 로드
+    media_directory 로드 (Google Sheets 또는 CSV). 우선순위: Sheets > CSV > 빈 dict
 
     Args:
-        spreadsheet: gspread Spreadsheet 객체
+        spreadsheet: gspread Spreadsheet 객체 (선택사항)
+        csv_path: CSV 파일 경로 (선택사항)
 
     Returns:
         {domain: {"media_name": ..., "media_group": ..., "media_type": ...}} 형태의 딕셔너리
     """
-    try:
-        # 워크시트 선택 (없으면 빈 dict 반환)
+    # 1. Google Sheets 시도
+    if spreadsheet:
         try:
             worksheet = spreadsheet.worksheet("media_directory")
-        except:
-            print("  ℹ️  'media_directory' 워크시트가 없습니다. 신규 생성합니다.")
-            return {}
+            existing_data = worksheet.get_all_records()
 
-        # 모든 데이터 읽기
-        existing_data = worksheet.get_all_records()
+            if existing_data:
+                media_dir = {}
+                for row in existing_data:
+                    domain = row.get("domain", "").strip()
+                    if domain:
+                        media_dir[domain] = {
+                            "media_name": row.get("media_name", ""),
+                            "media_group": row.get("media_group", ""),
+                            "media_type": row.get("media_type", "")
+                        }
+                print(f"📂 media_directory (Google Sheets): {len(media_dir)}개 도메인 로드")
+                return media_dir
+        except Exception as e:
+            print(f"  ⚠️  Google Sheets 로드 실패: {e}, CSV 시도")
 
-        if not existing_data:
-            print("  ℹ️  'media_directory' 워크시트가 비어있습니다.")
-            return {}
+    # 2. CSV 시도
+    if csv_path and csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path, encoding='utf-8-sig')
 
-        # 딕셔너리로 변환
-        media_dir = {}
-        for row in existing_data:
-            domain = row.get("domain", "").strip()
-            if domain:
-                media_dir[domain] = {
-                    "media_name": row.get("media_name", ""),
-                    "media_group": row.get("media_group", ""),
-                    "media_type": row.get("media_type", "")
-                }
+            media_dir = {}
+            for _, row in df.iterrows():
+                domain = str(row.get("domain", "")).strip()
+                if domain:
+                    media_dir[domain] = {
+                        "media_name": str(row.get("media_name", "")),
+                        "media_group": str(row.get("media_group", "")),
+                        "media_type": str(row.get("media_type", ""))
+                    }
+            print(f"📂 media_directory (CSV): {len(media_dir)}개 도메인 로드")
+            return media_dir
+        except Exception as e:
+            print(f"  ⚠️  CSV 로드 실패: {e}")
 
-        print(f"📂 media_directory: {len(media_dir)}개 도메인 로드")
-        return media_dir
-
-    except Exception as e:
-        print(f"⚠️  media_directory 로드 실패: {e}")
-        return {}
+    # 3. 빈 dict
+    print("  ℹ️  media_directory가 없습니다. 신규 생성합니다.")
+    return {}
 
 
 def classify_media_outlets_batch(
@@ -100,37 +113,18 @@ def classify_media_outlets_batch(
     # 도메인 목록을 텍스트로 변환
     domain_list = "\n".join(domains)
 
-    prompt = f"""당신은 한국 언론사 분류 전문가입니다. 각 도메인의 언론사 정보를 분류하세요.
+    prompt = f"""한국 언론사 정보를 분류하세요.
 
-도메인 목록:
+도메인:
 {domain_list}
 
-JSON 배열만 반환하세요:
-[
-  {{
-    "domain": "chosun.com",
-    "media_name": "조선일보",
-    "media_group": "조선미디어그룹",
-    "media_type": "종합지"
-  }},
-  ...
-]
+JSON만 반환:
+[{{"domain":"example.com","media_name":"예시언론","media_group":"예시그룹","media_type":"종합지"}},...]
 
-media_type 분류 기준:
-- 종합지: 조선일보, 중앙일보, 동아일보 등 일반 종합 일간지
-- 경제지: 한국경제, 매일경제, 서울경제 등 경제 전문지
-- IT전문지: 블로터, 전자신문, 디지털타임스 등
-- 방송사: KBS, MBC, SBS, JTBC 등
-- 통신사: 연합뉴스, 뉴시스, 뉴스1 등
-- 인터넷신문: 오마이뉴스, 프레시안, 미디어오늘 등 온라인 전용
-- 기타: 위 분류에 해당하지 않는 경우
-
-media_group 규칙:
-- 알려진 그룹이 있으면 기재 (예: 조선미디어그룹, 중앙일보그룹)
-- 독립 언론사는 media_name과 동일하게 기재
-- 불명확하면 media_name과 동일하게 기재
-
-JSON 배열만 출력하세요."""
+분류:
+- 종합지/경제지/IT전문지/방송사/통신사/인터넷신문/기타
+- group은 모르면 media_name 동일
+- JSON만"""
 
     headers = {
         "Authorization": f"Bearer {openai_key}",
@@ -143,7 +137,7 @@ JSON 배열만 출력하세요."""
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.2,
-        "max_tokens": len(domains) * 80
+        "max_tokens": min(len(domains) * 100, 8000)  # 최소 100토큰/도메인, 최대 8000
     }
 
     try:
@@ -171,16 +165,29 @@ JSON 배열만 출력하세요."""
         result = response.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-        # JSON 추출
+        # JSON 추출 및 정제
         try:
+            # 1. 마크다운 코드 블록 제거
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            # 2. JSON 배열 패턴 추출 ([...])
+            import re
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            if json_match:
+                content = json_match.group(0)
+
+            # 3. JSON 파싱
             classifications = json.loads(content)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             if retry:
-                print(" (JSON 파싱 실패, 2초 대기 후 재시도)")
+                print(f" (JSON 파싱 실패: {str(e)[:50]}, 2초 대기 후 재시도)")
                 time.sleep(2)
                 return classify_media_outlets_batch(domains, openai_key, retry=False)
             else:
-                print(" (JSON 파싱 실패, 기본값 사용)")
+                print(f" (JSON 파싱 실패: {str(e)[:50]}, 기본값 사용)")
                 return _fallback_classification(domains)
 
         # 도메인 기준 딕셔너리로 변환
@@ -225,47 +232,66 @@ def _fallback_classification(domains: List[str]) -> Dict[str, Dict]:
     }
 
 
-def update_media_directory(spreadsheet, new_entries: Dict[str, Dict]) -> None:
+def update_media_directory(spreadsheet=None, new_entries: Dict[str, Dict] = None, csv_path: Path = None) -> None:
     """
-    Google Sheets의 media_directory에 신규 도메인 추가
+    media_directory 업데이트 (Google Sheets 및/또는 CSV)
 
     Args:
-        spreadsheet: gspread Spreadsheet 객체
+        spreadsheet: gspread Spreadsheet 객체 (선택사항)
         new_entries: {domain: {"media_name": ..., "media_group": ..., "media_type": ...}}
+        csv_path: CSV 파일 경로 (선택사항)
     """
     if not new_entries:
         return
 
-    try:
-        # 워크시트 가져오기 (없으면 생성)
+    # 1. Google Sheets 업데이트
+    if spreadsheet:
         try:
-            worksheet = spreadsheet.worksheet("media_directory")
-        except:
-            worksheet = spreadsheet.add_worksheet(title="media_directory", rows=1, cols=4)
-            # 헤더 추가
-            worksheet.append_row(["domain", "media_name", "media_group", "media_type"])
+            try:
+                worksheet = spreadsheet.worksheet("media_directory")
+            except:
+                worksheet = spreadsheet.add_worksheet(title="media_directory", rows=1, cols=4)
+                worksheet.append_row(["domain", "media_name", "media_group", "media_type"])
 
-        # 신규 항목 추가
-        for domain, info in new_entries.items():
-            row = [
-                domain,
-                info.get("media_name", ""),
-                info.get("media_group", ""),
-                info.get("media_type", "")
+            for domain, info in new_entries.items():
+                row = [domain, info.get("media_name", ""), info.get("media_group", ""), info.get("media_type", "")]
+                worksheet.append_row(row)
+
+            print(f"✅ media_directory (Google Sheets): {len(new_entries)}개 신규 도메인 추가")
+        except Exception as e:
+            print(f"⚠️  Google Sheets 업데이트 실패: {e}")
+
+    # 2. CSV 업데이트 (항상 실행)
+    if csv_path:
+        try:
+            if csv_path.exists():
+                existing_df = pd.read_csv(csv_path, encoding='utf-8-sig')
+            else:
+                existing_df = pd.DataFrame(columns=["domain", "media_name", "media_group", "media_type"])
+
+            new_rows = [
+                {"domain": domain, "media_name": info.get("media_name", ""),
+                 "media_group": info.get("media_group", ""), "media_type": info.get("media_type", "")}
+                for domain, info in new_entries.items()
             ]
-            worksheet.append_row(row)
 
-        print(f"✅ media_directory: {len(new_entries)}개 신규 도메인 추가")
+            new_df = pd.DataFrame(new_rows)
+            updated_df = pd.concat([existing_df, new_df], ignore_index=True)
+            updated_df = updated_df.drop_duplicates(subset=["domain"], keep="last")
 
-    except Exception as e:
-        print(f"⚠️  media_directory 업데이트 실패: {e}")
-        print("  → Google Sheets 업로드 시 자동으로 추가됩니다.")
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            updated_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+
+            print(f"✅ media_directory (CSV): {len(new_entries)}개 신규 도메인 추가")
+        except Exception as e:
+            print(f"⚠️  CSV 저장 실패: {e}")
 
 
 def add_media_columns(
     df: pd.DataFrame,
     spreadsheet=None,
-    openai_key: str = None
+    openai_key: str = None,
+    csv_path: Path = None
 ) -> pd.DataFrame:
     """
     DataFrame에 언론사 정보 컬럼 추가
@@ -274,6 +300,7 @@ def add_media_columns(
         df: 처리된 DataFrame (originallink 컬럼 필요)
         spreadsheet: gspread Spreadsheet 객체 (선택사항)
         openai_key: OpenAI API 키 (선택사항)
+        csv_path: media_directory CSV 경로 (선택사항)
 
     Returns:
         4개의 새로운 컬럼이 추가된 DataFrame:
@@ -308,24 +335,22 @@ def add_media_columns(
             print("  ⚠️  추출된 도메인이 없습니다.")
             return df
 
-        # media_directory 로드 (Sheets 연결 가능한 경우)
-        existing_media = {}
-        new_domains = []
+        # media_directory 로드 (Google Sheets 또는 CSV)
+        existing_media = load_media_directory(spreadsheet=spreadsheet, csv_path=csv_path)
+        new_domains = [d for d in unique_domains if d not in existing_media]
 
-        if spreadsheet:
-            existing_media = load_media_directory(spreadsheet)
-            new_domains = [d for d in unique_domains if d not in existing_media]
-        else:
-            new_domains = list(unique_domains)
-
-        # 신규 도메인 분류 (OpenAI)
+        # 신규 도메인 분류 (OpenAI) - 배치 처리 (100개씩)
         if new_domains and openai_key:
-            new_media = classify_media_outlets_batch(new_domains, openai_key)
+            new_media = {}
+            for i in range(0, len(new_domains), 100):
+                batch = new_domains[i:i+100]
+                batch_result = classify_media_outlets_batch(batch, openai_key)
+                new_media.update(batch_result)
+
             existing_media.update(new_media)
 
-            # media_directory 업데이트 (Sheets)
-            if spreadsheet:
-                update_media_directory(spreadsheet, new_media)
+            # media_directory 업데이트 (Sheets + CSV)
+            update_media_directory(spreadsheet=spreadsheet, new_entries=new_media, csv_path=csv_path)
 
         # DataFrame에 정보 추가
         for idx, row in df.iterrows():
