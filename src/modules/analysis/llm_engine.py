@@ -61,7 +61,6 @@ def call_openai_structured(
     response_schema: dict,
     openai_key: str,
     model: str = "gpt-4o-mini",
-    temperature: float = 0.2,
     retry: bool = True
 ) -> Optional[Dict]:
     """
@@ -73,7 +72,6 @@ def call_openai_structured(
         response_schema: JSON schema for response format
         openai_key: OpenAI API 키
         model: 모델명
-        temperature: 온도
         retry: 재시도 여부
 
     Returns:
@@ -90,7 +88,6 @@ def call_openai_structured(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": temperature,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -107,15 +104,27 @@ def call_openai_structured(
         if response.status_code == 401:
             raise RuntimeError("OpenAI API 인증 실패 (401). API 키를 확인하세요.")
         elif response.status_code == 429:
-            print("⚠️  OpenAI 요청 한도 초과 (429). 5초 대기 중...")
+            try:
+                error_detail = response.json()
+                print(f"⚠️  OpenAI 요청 한도 초과 (429): {error_detail}")
+            except:
+                print(f"⚠️  OpenAI 요청 한도 초과 (429). 응답: {response.text[:200]}")
+            print("5초 대기 중...")
             time.sleep(5)
             if retry:
                 return call_openai_structured(
                     system_prompt, user_prompt, response_schema,
-                    openai_key, model, temperature, retry=False
+                    openai_key, model, retry=False
                 )
             else:
                 raise RuntimeError("OpenAI 요청 한도 초과 (재시도 후에도 실패)")
+        elif response.status_code == 400:
+            # Bad request - 보통 잘못된 모델명이나 파라미터
+            try:
+                error_detail = response.json()
+                raise RuntimeError(f"OpenAI 요청 오류 (400): {error_detail}")
+            except json.JSONDecodeError:
+                raise RuntimeError(f"OpenAI 요청 오류 (400): {response.text[:200]}")
         elif response.status_code >= 500:
             raise RuntimeError(f"OpenAI 서버 오류 ({response.status_code})")
 
@@ -134,7 +143,7 @@ def call_openai_structured(
             time.sleep(2)
             return call_openai_structured(
                 system_prompt, user_prompt, response_schema,
-                openai_key, model, temperature, retry=False
+                openai_key, model, retry=False
             )
         else:
             return None
@@ -148,6 +157,8 @@ def analyze_sentiment_llm(
 ) -> Optional[Dict]:
     """
     LLM 기반 감정 분석 (독립 판단)
+
+    Model: gpt-5-nano (1차 판단용)
 
     Args:
         article: {"title": ..., "description": ...}
@@ -181,11 +192,11 @@ def analyze_sentiment_llm(
 
     user_prompt = render_prompt(prompt_config["user"], context)
 
-    # Call OpenAI
+    # Call OpenAI (1차 판단 - gpt-5-nano)
     response_schema = prompts_config["output_schemas"]["sentiment_llm"]
     result = call_openai_structured(
         system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-4o-mini", temperature=0.2
+        openai_key, model="gpt-5-nano"
     )
 
     return result
@@ -200,6 +211,8 @@ def analyze_sentiment_final(
 ) -> Optional[Dict]:
     """
     LLM 기반 최종 감정 판단 (RB vs LLM 조정)
+
+    Model: gpt-5-mini (Final 판단용 - RB≠LLM일 때만 호출)
 
     Args:
         article: {"title": ..., "description": ...}
@@ -235,11 +248,11 @@ def analyze_sentiment_final(
 
     user_prompt = render_prompt(prompt_config["user"], context)
 
-    # Call OpenAI
+    # Call OpenAI (Final 판단 - gpt-5-mini)
     response_schema = prompts_config["output_schemas"]["sentiment_final"]
     result = call_openai_structured(
         system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-4o-mini", temperature=0.2
+        openai_key, model="gpt-5-mini"
     )
 
     return result
@@ -254,6 +267,8 @@ def analyze_danger_llm(
 ) -> Optional[Dict]:
     """
     LLM 기반 위험도 분석 (독립 판단)
+
+    Model: gpt-5-nano (1차 판단용)
 
     Args:
         article: {"title": ..., "description": ...}
@@ -298,11 +313,11 @@ def analyze_danger_llm(
 
     user_prompt = render_prompt(prompt_config["user"], context)
 
-    # Call OpenAI
+    # Call OpenAI (1차 판단 - gpt-5-nano)
     response_schema = prompts_config["output_schemas"]["danger_llm"]
     result = call_openai_structured(
         system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-4o-mini", temperature=0.2
+        openai_key, model="gpt-5-nano"
     )
 
     return result
@@ -317,6 +332,8 @@ def analyze_danger_final(
 ) -> Optional[Dict]:
     """
     LLM 기반 최종 위험도 판단 (RB vs LLM 조정)
+
+    Model: gpt-5-mini (Final 판단용 - RB≠LLM일 때만 호출)
 
     Args:
         article: {"title": ..., "description": ...}
@@ -355,11 +372,11 @@ def analyze_danger_final(
 
     user_prompt = render_prompt(prompt_config["user"], context)
 
-    # Call OpenAI
+    # Call OpenAI (Final 판단 - gpt-5-mini)
     response_schema = prompts_config["output_schemas"]["danger_final"]
     result = call_openai_structured(
         system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-4o-mini", temperature=0.2
+        openai_key, model="gpt-5-mini"
     )
 
     return result
@@ -375,6 +392,8 @@ def analyze_category_llm(
 ) -> Optional[Dict]:
     """
     LLM 기반 카테고리 분석 (독립 판단)
+
+    Model: gpt-5-nano (1차 판단용)
 
     Args:
         article: {"title": ..., "description": ...}
@@ -413,11 +432,11 @@ def analyze_category_llm(
 
     user_prompt = render_prompt(prompt_config["user"], context)
 
-    # Call OpenAI
+    # Call OpenAI (1차 판단 - gpt-5-nano)
     response_schema = prompts_config["output_schemas"]["category_llm"]
     result = call_openai_structured(
         system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-4o-mini", temperature=0.2
+        openai_key, model="gpt-5-nano"
     )
 
     return result
@@ -432,6 +451,8 @@ def analyze_category_final(
 ) -> Optional[Dict]:
     """
     LLM 기반 최종 카테고리 판단 (RB vs LLM 조정)
+
+    Model: gpt-5-mini (Final 판단용 - RB≠LLM일 때만 호출)
 
     Args:
         article: {"title": ..., "description": ...}
@@ -472,11 +493,11 @@ def analyze_category_final(
 
     user_prompt = render_prompt(prompt_config["user"], context)
 
-    # Call OpenAI
+    # Call OpenAI (Final 판단 - gpt-5-mini)
     response_schema = prompts_config["output_schemas"]["category_final"]
     result = call_openai_structured(
         system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-4o-mini", temperature=0.2
+        openai_key, model="gpt-5-mini"
     )
 
     return result
@@ -552,20 +573,32 @@ def analyze_article_llm(
         result["sentiment_llm_evidence"] = []
         result["sentiment_llm_rationale"] = ""
 
-    # Step 2: Sentiment Final
-    sentiment_final = analyze_sentiment_final(article, rb_result, sentiment_llm, prompts_config, openai_key)
-    if sentiment_final:
-        result["sentiment_final"] = sentiment_final.get("sentiment_final", "")
-        result["sentiment_final_confidence"] = sentiment_final.get("confidence", 0.0)
-        result["sentiment_final_decision_rule"] = sentiment_final.get("decision_rule", "")
-        result["sentiment_final_evidence"] = sentiment_final.get("evidence", [])
-        result["sentiment_final_rationale"] = sentiment_final.get("rationale", "")
+    # Step 2: Sentiment Final (RB=LLM이면 스킵)
+    sentiment_rb = rb_result.get("sentiment_rb", "")
+    sentiment_llm_val = result.get("sentiment_llm", "")
+
+    if sentiment_rb == sentiment_llm_val and sentiment_rb:
+        # RB = LLM이면 Final API 호출 생략, 바로 사용
+        result["sentiment_final"] = sentiment_rb
+        result["sentiment_final_confidence"] = result.get("sentiment_llm_confidence", 0.0)
+        result["sentiment_final_decision_rule"] = "KEEP_RB=LLM"
+        result["sentiment_final_evidence"] = result.get("sentiment_llm_evidence", [])
+        result["sentiment_final_rationale"] = "RB와 LLM 일치"
     else:
-        result["sentiment_final"] = rb_result.get("sentiment_rb", "")  # Fallback to RB
-        result["sentiment_final_confidence"] = 0.0
-        result["sentiment_final_decision_rule"] = "LLM failed, used RB"
-        result["sentiment_final_evidence"] = []
-        result["sentiment_final_rationale"] = ""
+        # RB ≠ LLM이면 Final 조정 호출
+        sentiment_final = analyze_sentiment_final(article, rb_result, sentiment_llm, prompts_config, openai_key)
+        if sentiment_final:
+            result["sentiment_final"] = sentiment_final.get("sentiment_final", "")
+            result["sentiment_final_confidence"] = sentiment_final.get("confidence", 0.0)
+            result["sentiment_final_decision_rule"] = sentiment_final.get("decision_rule", "")
+            result["sentiment_final_evidence"] = sentiment_final.get("evidence", [])
+            result["sentiment_final_rationale"] = sentiment_final.get("rationale", "")
+        else:
+            result["sentiment_final"] = rb_result.get("sentiment_rb", "")  # Fallback to RB
+            result["sentiment_final_confidence"] = 0.0
+            result["sentiment_final_decision_rule"] = "LLM failed, used RB"
+            result["sentiment_final_evidence"] = []
+            result["sentiment_final_rationale"] = ""
 
     # Step 3: Danger LLM (conditional)
     danger_llm = analyze_danger_llm(
@@ -582,21 +615,33 @@ def analyze_article_llm(
         result["danger_llm_evidence"] = []
         result["danger_llm_rationale"] = ""
 
-    # Step 4: Danger Final (conditional)
+    # Step 4: Danger Final (conditional, RB=LLM이면 스킵)
     if danger_llm:
-        danger_final = analyze_danger_final(article, rb_result, danger_llm, prompts_config, openai_key)
-        if danger_final:
-            result["danger_final"] = danger_final.get("danger_final", "")
-            result["danger_final_confidence"] = danger_final.get("confidence", 0.0)
-            result["danger_final_decision_rule"] = danger_final.get("decision_rule", "")
-            result["danger_final_evidence"] = danger_final.get("evidence", [])
-            result["danger_final_rationale"] = danger_final.get("rationale", "")
+        danger_rb = rb_result.get("danger_rb", "")
+        danger_llm_val = result.get("danger_llm", "")
+
+        if danger_rb == danger_llm_val and danger_rb:
+            # RB = LLM이면 Final API 호출 생략
+            result["danger_final"] = danger_rb
+            result["danger_final_confidence"] = result.get("danger_llm_confidence", 0.0)
+            result["danger_final_decision_rule"] = "KEEP_RB=LLM"
+            result["danger_final_evidence"] = result.get("danger_llm_evidence", [])
+            result["danger_final_rationale"] = "RB와 LLM 일치"
         else:
-            result["danger_final"] = rb_result.get("danger_rb", "")  # Fallback to RB
-            result["danger_final_confidence"] = 0.0
-            result["danger_final_decision_rule"] = "LLM failed, used RB"
-            result["danger_final_evidence"] = []
-            result["danger_final_rationale"] = ""
+            # RB ≠ LLM이면 Final 조정 호출
+            danger_final = analyze_danger_final(article, rb_result, danger_llm, prompts_config, openai_key)
+            if danger_final:
+                result["danger_final"] = danger_final.get("danger_final", "")
+                result["danger_final_confidence"] = danger_final.get("confidence", 0.0)
+                result["danger_final_decision_rule"] = danger_final.get("decision_rule", "")
+                result["danger_final_evidence"] = danger_final.get("evidence", [])
+                result["danger_final_rationale"] = danger_final.get("rationale", "")
+            else:
+                result["danger_final"] = rb_result.get("danger_rb", "")  # Fallback to RB
+                result["danger_final_confidence"] = 0.0
+                result["danger_final_decision_rule"] = "LLM failed, used RB"
+                result["danger_final_evidence"] = []
+                result["danger_final_rationale"] = ""
     else:
         result["danger_final"] = ""
         result["danger_final_confidence"] = 0.0
@@ -622,17 +667,39 @@ def analyze_article_llm(
         result["category_llm_evidence"] = []
         result["category_llm_rationale"] = ""
 
-    # Step 6: Category Final
-    category_final = analyze_category_final(article, rb_result, category_llm, prompts_config, openai_key)
-    if category_final:
-        result["issue_category_final"] = category_final.get("issue_category_final", "")
-        result["coverage_themes_final"] = category_final.get("coverage_themes_final", [])
-        result["category_final_confidence"] = category_final.get("confidence", 0.0)
-        result["category_final_decision_rule"] = category_final.get("decision_rule", "")
-        result["category_final_evidence"] = category_final.get("evidence", [])
-        result["category_final_rationale"] = category_final.get("rationale", "")
+    # Step 6: Category Final (RB=LLM이면 스킵)
+    issue_category_rb = rb_result.get("issue_category_rb", "")
+    coverage_themes_rb = rb_result.get("coverage_themes_rb", [])
+    issue_category_llm_val = result.get("issue_category_llm", "")
+    coverage_themes_llm_val = result.get("coverage_themes_llm", [])
+
+    # 리스트 비교 (순서 무관)
+    themes_match = (
+        sorted(coverage_themes_rb) == sorted(coverage_themes_llm_val)
+        if isinstance(coverage_themes_rb, list) and isinstance(coverage_themes_llm_val, list)
+        else coverage_themes_rb == coverage_themes_llm_val
+    )
+
+    if issue_category_rb == issue_category_llm_val and themes_match and issue_category_rb:
+        # RB = LLM이면 Final API 호출 생략
+        result["issue_category_final"] = issue_category_rb
+        result["coverage_themes_final"] = coverage_themes_rb
+        result["category_final_confidence"] = result.get("category_llm_confidence", 0.0)
+        result["category_final_decision_rule"] = "KEEP_RB=LLM"
+        result["category_final_evidence"] = result.get("category_llm_evidence", [])
+        result["category_final_rationale"] = "RB와 LLM 일치"
     else:
-        result["issue_category_final"] = rb_result.get("issue_category_rb", "")  # Fallback to RB
+        # RB ≠ LLM이면 Final 조정 호출
+        category_final = analyze_category_final(article, rb_result, category_llm, prompts_config, openai_key)
+        if category_final:
+            result["issue_category_final"] = category_final.get("issue_category_final", "")
+            result["coverage_themes_final"] = category_final.get("coverage_themes_final", [])
+            result["category_final_confidence"] = category_final.get("confidence", 0.0)
+            result["category_final_decision_rule"] = category_final.get("decision_rule", "")
+            result["category_final_evidence"] = category_final.get("evidence", [])
+            result["category_final_rationale"] = category_final.get("rationale", "")
+        else:
+            result["issue_category_final"] = rb_result.get("issue_category_rb", "")  # Fallback to RB
         result["coverage_themes_final"] = rb_result.get("coverage_themes_rb", [])
         result["category_final_confidence"] = 0.0
         result["category_final_decision_rule"] = "LLM failed, used RB"

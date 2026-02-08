@@ -1,7 +1,6 @@
 version: "0.4"
 llm:
   model_hint: "gpt-5-nano"
-  temperature: 0.2
 
 policy_text:
   sentiment: |
@@ -102,6 +101,7 @@ output_schemas:
         maxItems: 3
       rationale:
         type: string
+        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
 
   sentiment_final:
     type: object
@@ -125,6 +125,7 @@ output_schemas:
         maxItems: 3
       rationale:
         type: string
+        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
 
   danger_llm:
     type: object
@@ -145,6 +146,7 @@ output_schemas:
         maxItems: 3
       rationale:
         type: string
+        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
 
   danger_final:
     type: object
@@ -168,6 +170,7 @@ output_schemas:
         maxItems: 3
       rationale:
         type: string
+        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
 
   # -----------------------
   # Category schemas (NEW)
@@ -218,6 +221,7 @@ output_schemas:
         items: { type: string }
       rationale:
         type: string
+        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
 
   category_final:
     type: object
@@ -268,6 +272,7 @@ output_schemas:
         items: { type: string }
       rationale:
         type: string
+        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
 
 prompts:
   # 1) LLM-based sentiment (independent)

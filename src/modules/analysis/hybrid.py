@@ -5,12 +5,67 @@ Rule-Based + LLM 하이브리드 분석 시스템
 
 import time
 import json
+import os
 from datetime import datetime
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 import pandas as pd
+from tqdm import tqdm
 
 from .rule_engine import load_rules, analyze_batch_rb
 from .llm_engine import load_prompts, analyze_article_llm
+
+# CSV 쓰기 Lock (멀티스레드 환경에서 파일 쓰기 경합 방지)
+csv_write_lock = Lock()
+
+
+def _process_single_article(
+    idx: int,
+    article: Dict,
+    rb_result: Dict,
+    prompts_config: dict,
+    openai_key: str,
+    rb_columns: List[str],
+    llm_columns: List[str]
+) -> Dict:
+    """
+    단일 기사 LLM 분석 (병렬 처리용 헬퍼 함수)
+
+    Args:
+        idx: DataFrame 인덱스
+        article: {"title": ..., "description": ...}
+        rb_result: Rule-Based 분석 결과
+        prompts_config: prompts.yaml 설정
+        openai_key: OpenAI API 키
+        rb_columns: RB 컬럼 리스트
+        llm_columns: LLM 컬럼 리스트
+
+    Returns:
+        {"idx": idx, "success": True/False, "result": {...}, "error": ..., "error_type": ...}
+    """
+    try:
+        llm_result = analyze_article_llm(article, rb_result, prompts_config, openai_key)
+        return {
+            "idx": idx,
+            "success": True,
+            "result": llm_result,
+            "error": None,
+            "error_type": None
+        }
+    except Exception as e:
+        import traceback
+        error_type = type(e).__name__
+        error_msg = str(e)
+        error_trace = traceback.format_exc()
+        return {
+            "idx": idx,
+            "success": False,
+            "result": None,
+            "error": error_msg,
+            "error_type": error_type,
+            "error_trace": error_trace
+        }
 
 
 def classify_hybrid(
@@ -18,22 +73,29 @@ def classify_hybrid(
     openai_key: str,
     chunk_size: int = 50,
     dry_run: bool = False,
-    max_competitor_classify: int = 50
+    max_competitor_classify: int = 50,
+    max_workers: int = 10,
+    result_csv_path: Optional[str] = None
 ) -> pd.DataFrame:
     """
-    하이브리드 분석 메인 함수
+    하이브리드 분석 메인 함수 (병렬 처리 최적화)
 
     3단계 프로세스:
     1. Rule-Based 분석 (전체 기사)
     2. LLM 분석 (조건부: 우리 브랜드 전체 + 경쟁사 상위 N개)
+       - ThreadPoolExecutor로 병렬 처리 (max_workers 설정)
+       - 청크 단위로 진행률 표시 (tqdm)
+       - 성공한 기사는 즉시 result.csv에 append
     3. 결과 병합 및 DataFrame 반환
 
     Args:
         df: 입력 DataFrame (title, description 필수)
         openai_key: OpenAI API 키
-        chunk_size: LLM 배치 크기
+        chunk_size: LLM 배치 크기 (청크당 기사 수)
         dry_run: True면 LLM 호출 생략 (Rule-Based만)
         max_competitor_classify: 경쟁사별 최대 분류 개수
+        max_workers: 병렬 처리 워커 수 (기본값: 10)
+        result_csv_path: 결과 저장 CSV 경로 (None이면 저장하지 않음)
 
     Returns:
         분석 결과가 추가된 DataFrame
@@ -152,22 +214,25 @@ def classify_hybrid(
     print(f"  - 경쟁사: {sum(1 for idx in indices_to_classify if df.at[idx, 'group'] == 'COMPETITOR')}개")
 
     # ========================================
-    # STEP 3: LLM 분석 (청크 단위)
+    # STEP 3: LLM 분석 (병렬 처리)
     # ========================================
-    print(f"\n[3/3] LLM 분석 중 (청크 크기: {chunk_size})...")
+    print(f"\n[3/3] LLM 분석 중 (청크 크기: {chunk_size}, 워커: {max_workers})...")
 
     timestamp = datetime.now().isoformat()
     total = len(indices_to_classify)
     total_chunks = (total + chunk_size - 1) // chunk_size
+
+    # 전체 진행률 표시용 tqdm
+    pbar = tqdm(total=total, desc="LLM 분석", unit="기사")
 
     for chunk_start in range(0, total, chunk_size):
         chunk_end = min(chunk_start + chunk_size, total)
         chunk_indices = indices_to_classify[chunk_start:chunk_end]
         chunk_num = (chunk_start // chunk_size) + 1
 
-        print(f"\n--- 청크 {chunk_num}/{total_chunks} ({len(chunk_indices)}개 기사) ---")
-
-        for i, idx in enumerate(chunk_indices):
+        # 청크 내 기사 정보 준비
+        articles_to_process = []
+        for idx in chunk_indices:
             article = {
                 "title": df.at[idx, "title"],
                 "description": df.at[idx, "description"]
@@ -188,41 +253,114 @@ def classify_hybrid(
                 else:
                     rb_result[col] = value
 
-            # LLM 분석 수행
-            try:
-                llm_result = analyze_article_llm(article, rb_result, prompts_config, openai_key)
+            articles_to_process.append({
+                "idx": idx,
+                "article": article,
+                "rb_result": rb_result
+            })
 
-                # LLM 결과를 DataFrame에 병합
-                for col in llm_columns:
-                    if col in llm_result:
-                        value = llm_result[col]
-                        # JSON serializable 타입으로 변환
-                        if isinstance(value, (dict, list)):
-                            value = json.dumps(value, ensure_ascii=False)
-                        df.at[idx, col] = value
+        # 병렬 처리 (ThreadPoolExecutor)
+        success_count = 0
+        fail_count = 0
 
-                df.at[idx, "classified_at"] = timestamp
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_idx = {
+                executor.submit(
+                    _process_single_article,
+                    item["idx"],
+                    item["article"],
+                    item["rb_result"],
+                    prompts_config,
+                    openai_key,
+                    rb_columns,
+                    llm_columns
+                ): item["idx"]
+                for item in articles_to_process
+            }
 
-                # Progress indicator
-                if (i + 1) % 10 == 0:
-                    print(f"  진행: {i + 1}/{len(chunk_indices)}개 완료")
+            # Process completed tasks
+            for future in as_completed(future_to_idx):
+                result = future.result()
+                idx = result["idx"]
 
-                # Rate limiting
-                time.sleep(0.5)
+                if result["success"]:
+                    # LLM 결과를 DataFrame에 병합
+                    llm_result = result["result"]
+                    for col in llm_columns:
+                        if col in llm_result:
+                            value = llm_result[col]
+                            # JSON serializable 타입으로 변환
+                            if isinstance(value, (dict, list)):
+                                value = json.dumps(value, ensure_ascii=False)
+                            df.at[idx, col] = value
 
-            except Exception as e:
-                print(f"  ⚠️  기사 {idx} LLM 분석 실패: {e}")
-                # Fallback: RB 결과 사용
-                df.at[idx, "sentiment_final"] = df.at[idx, "sentiment_rb"]
-                df.at[idx, "sentiment_final_decision_rule"] = f"LLM failed: {str(e)}"
-                df.at[idx, "danger_final"] = df.at[idx, "danger_rb"]
-                df.at[idx, "danger_final_decision_rule"] = f"LLM failed: {str(e)}"
-                df.at[idx, "classified_at"] = timestamp
+                    df.at[idx, "classified_at"] = timestamp
+                    success_count += 1
 
-        print(f"  ✅ 청크 {chunk_num}/{total_chunks} 완료")
-        time.sleep(1)
+                    # 성공한 기사 즉시 CSV에 저장 (Lock 사용)
+                    if result_csv_path:
+                        try:
+                            with csv_write_lock:
+                                row_df = df.loc[[idx]].copy()
+                                # 파일이 없으면 header 포함, 있으면 append만
+                                file_exists = os.path.exists(result_csv_path)
+                                row_df.to_csv(
+                                    result_csv_path,
+                                    mode='a' if file_exists else 'w',
+                                    header=not file_exists,
+                                    index=False,
+                                    encoding='utf-8-sig'
+                                )
+                        except Exception as csv_err:
+                            print(f"⚠️  CSV 저장 실패 [idx={idx}]: {csv_err}")
+                else:
+                    # Fallback: RB 결과 사용
+                    df.at[idx, "sentiment_final"] = df.at[idx, "sentiment_rb"]
+                    df.at[idx, "sentiment_final_decision_rule"] = f"LLM failed: {result['error']}"
+                    df.at[idx, "danger_final"] = df.at[idx, "danger_rb"]
+                    df.at[idx, "danger_final_decision_rule"] = f"LLM failed: {result['error']}"
+                    df.at[idx, "classified_at"] = timestamp
+                    fail_count += 1
 
-    print(f"\n✅ 하이브리드 분석 완료: {total}개 기사 처리")
+                    # 실패 에러 메시지 출력
+                    title = df.at[idx, 'title'] if pd.notna(df.at[idx, 'title']) else ""
+                    print(f"\n❌ 분류 실패 [idx={idx}]:")
+                    print(f"   제목: {title[:80]}...")
+                    print(f"   에러 타입: {result.get('error_type', 'Unknown')}")
+                    print(f"   에러 메시지: {result['error']}")
+                    # Traceback은 너무 길어서 첫 실패만 출력
+                    if fail_count == 1 and 'error_trace' in result:
+                        print(f"   상세 Traceback (첫 실패만):\n{result['error_trace']}")
+
+                # 진행률 업데이트
+                pbar.update(1)
+
+        pbar.set_postfix({"청크": f"{chunk_num}/{total_chunks}", "성공": success_count, "실패": fail_count})
+
+        # 청크 완료 통계 출력
+        chunk_total = success_count + fail_count
+        success_rate = (success_count / chunk_total * 100) if chunk_total > 0 else 0
+        print(f"\n  청크 {chunk_num}/{total_chunks} 완료: 성공 {success_count}/{chunk_total} ({success_rate:.1f}%)")
+
+        # 청크 간 짧은 대기 (rate limiting)
+        if chunk_num < total_chunks:
+            time.sleep(0.5)
+
+    pbar.close()
+
+    # 전체 통계 출력
+    total_processed = sum(1 for idx in indices_to_classify if pd.notna(df.at[idx, "classified_at"]))
+    total_success = sum(1 for idx in indices_to_classify
+                       if pd.notna(df.at[idx, "classified_at"])
+                       and "LLM failed" not in str(df.at[idx, "sentiment_final_decision_rule"]))
+    total_failed = total_processed - total_success
+    overall_success_rate = (total_success / total_processed * 100) if total_processed > 0 else 0
+
+    print(f"\n✅ 하이브리드 분석 완료:")
+    print(f"   총 처리: {total_processed}개 기사")
+    print(f"   성공: {total_success}개 ({overall_success_rate:.1f}%)")
+    print(f"   실패: {total_failed}개 ({100-overall_success_rate:.1f}%)")
 
     return df
 

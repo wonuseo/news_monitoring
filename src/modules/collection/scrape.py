@@ -1,22 +1,19 @@
 """
-scrape.py - Naver News Scraping Module
-네이버 뉴스를 BeautifulSoup로 스크래핑하여 날짜 범위 기반 기사 수집
+scrape.py - Naver News Scraping Module with Playwright
+Playwright를 사용하여 네이버 뉴스 검색 결과를 스크래핑 (JavaScript 렌더링 지원)
 """
 
 import time
-import requests
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
-from bs4 import BeautifulSoup
-from html import unescape
-import re
+from datetime import datetime
+from typing import List, Dict
+from playwright.sync_api import sync_playwright
 
 
 def scrape_naver_news_by_date(query: str, start_date: str, end_date: str,
                               max_pages: int = 10) -> List[Dict]:
     """
-    네이버 뉴스를 날짜 범위로 스크래핑
+    Playwright를 사용하여 Naver 뉴스 검색 결과 스크래핑 (JavaScript 렌더링 지원)
 
     Args:
         query: 검색어 (브랜드명)
@@ -29,136 +26,123 @@ def scrape_naver_news_by_date(query: str, start_date: str, end_date: str,
     """
     all_articles = []
 
-    # 날짜를 YYYYMMDD 형식으로 변환
+    # 날짜 검증
     try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
     except ValueError as e:
         print(f"❌ 날짜 형식 오류: {e}")
         return []
 
-    # 검색 URL
     base_url = "https://search.naver.com/search.naver"
 
-    for page in range(1, max_pages + 1):
-        try:
-            # 네이버 검색: ds(시작일), de(종료일) 파라미터 사용
-            params = {
-                "where": "news",
-                "query": query,
-                "ds": start_date.replace("-", "."),
-                "de": end_date.replace("-", "."),
-                "start": (page - 1) * 10 + 1,
-                "news_by_date": "1"
-            }
-
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            }
-
-            response = requests.get(base_url, params=params, headers=headers, timeout=10)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.content, "lxml")
-
-            # 네이버 뉴스 검색 결과 파싱
-            articles = soup.find_all("li", class_="bx")
-
-            if not articles:
-                print(f"  페이지 {page}: 결과 없음")
-                break
-
-            for article in articles:
+    try:
+        with sync_playwright() as p:
+            # 각 페이지 요청마다 새 브라우저 인스턴스 생성 (macOS 안정성)
+            for page_num in range(1, max_pages + 1):
+                browser = None
                 try:
-                    # 제목
-                    title_elem = article.find("a", class_="news_tit")
-                    if not title_elem:
-                        continue
-                    title = title_elem.get_text(strip=True)
+                    # 브라우저 실행 (페이지마다 새로 실행)
+                    browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+                    page = browser.new_page()
+                    page.set_viewport_size({"width": 1920, "height": 1080})
 
-                    # 링크
-                    link = title_elem.get("href", "")
+                    # URL 구성
+                    start_idx = (page_num - 1) * 10 + 1
+                    params = {
+                        "where": "news",
+                        "query": query,
+                        "ds": start_date.replace("-", "."),
+                        "de": end_date.replace("-", "."),
+                        "start": start_idx,
+                        "news_by_date": "1"
+                    }
 
-                    # 설명
-                    desc_elem = article.find("div", class_="dsc")
-                    description = ""
-                    if desc_elem:
-                        description = desc_elem.get_text(strip=True)
+                    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+                    url = f"{base_url}?{query_string}"
 
-                    # 출판 날짜
-                    date_elem = article.find("span", class_="sub_time")
-                    pubdate_str = ""
-                    if date_elem:
-                        pubdate_str = date_elem.get_text(strip=True)
+                    print(f"  📄 페이지 {page_num} 로드 중...", end="", flush=True)
+                    try:
+                        page.goto(url, wait_until="networkidle", timeout=30000)
+                    except Exception:
+                        # networkidle 타임아웃 시 load로 폴백
+                        page.goto(url, wait_until="load", timeout=10000)
 
-                    # 출처 (원본 링크는 네이버 크롤링으로는 어려움)
-                    source_elem = article.find("a", class_="press")
-                    source = ""
-                    if source_elem:
-                        source = source_elem.get_text(strip=True)
+                    # JavaScript 렌더링 대기
+                    time.sleep(2)
 
-                    if title and link:
-                        all_articles.append({
-                            "title": unescape(title),
-                            "description": unescape(description),
-                            "link": link,
-                            "originallink": "",  # 스크래핑으로는 원본 링크 미포함
-                            "pubDate": pubdate_str,
-                            "source": source
-                        })
+                    # 기사 항목 추출
+                    articles_html = page.query_selector_all("li.bx div.news_wrap")
+                    page_articles = 0
+
+                    for article_element in articles_html:
+                        try:
+                            # 제목 추출
+                            title_elem = article_element.query_selector("a.news_tit")
+                            if not title_elem:
+                                continue
+                            title = title_elem.get_attribute("title") or title_elem.text_content()
+                            title = title.strip() if title else ""
+
+                            # 링크 추출
+                            link = title_elem.get_attribute("href") or ""
+
+                            # 설명 추출
+                            desc_elem = article_element.query_selector("div.dsc")
+                            description = desc_elem.text_content().strip() if desc_elem else ""
+
+                            # 날짜 추출
+                            date_elem = article_element.query_selector("span.sub_time")
+                            pub_date = ""
+                            if date_elem:
+                                pub_date = date_elem.text_content().strip()
+
+                            # 출처 추출
+                            press_elem = article_element.query_selector("a.press")
+                            source = press_elem.text_content().strip() if press_elem else ""
+
+                            if title and link:
+                                all_articles.append({
+                                    "title": title,
+                                    "description": description,
+                                    "link": link,
+                                    "originallink": "",
+                                    "pubDate": pub_date,
+                                    "source": source
+                                })
+                                page_articles += 1
+
+                        except Exception:
+                            continue
+
+                    print(f" ✓ {page_articles}개 기사")
+
+                    # 더 이상 기사가 없으면 중단
+                    if page_articles == 0:
+                        print(f"  ⚠️  더 이상 기사가 없습니다.")
+                        break
+
+                    # Rate limiting
+                    time.sleep(0.5)
 
                 except Exception as e:
-                    print(f"    기사 파싱 오류: {e}")
-                    continue
-
-            print(f"  페이지 {page}: {len(articles)}개 기사")
-            time.sleep(0.5)  # Rate limiting
-
-        except requests.exceptions.RequestException as e:
-            print(f"  페이지 {page}: 요청 오류 - {e}")
-            break
-        except Exception as e:
-            print(f"  페이지 {page}: 오류 - {e}")
-            break
-
-    return all_articles
-
-
-def parse_naver_date(date_str: str) -> Optional[str]:
-    """
-    네이버 검색 결과의 상대 시간 문자열을 절대 날짜로 변환
-    예: "2시간 전" → ISO 형식
-
-    Note: 스크래핑 시점의 시간 정보가 필요하므로 현재 시간 기준으로 계산
-    """
-    if not date_str or not date_str.strip():
-        return None
-
-    try:
-        now = datetime.now()
-
-        # 상대 시간 파싱
-        if "초 전" in date_str:
-            secs = int(re.search(r'(\d+)', date_str).group(1))
-            dt = now - timedelta(seconds=secs)
-        elif "분 전" in date_str:
-            mins = int(re.search(r'(\d+)', date_str).group(1))
-            dt = now - timedelta(minutes=mins)
-        elif "시간 전" in date_str:
-            hours = int(re.search(r'(\d+)', date_str).group(1))
-            dt = now - timedelta(hours=hours)
-        elif "일 전" in date_str:
-            days = int(re.search(r'(\d+)', date_str).group(1))
-            dt = now - timedelta(days=days)
-        else:
-            # 절대 날짜 형식 시도 (예: "2026.02.07")
-            dt = datetime.strptime(date_str.replace(".", "-"), "%Y-%m-%d")
-
-        return dt.isoformat()
+                    print(f" ❌ 오류: {e}")
+                    if page_num == 1:
+                        print(f"  첫 페이지 로드 실패. 스크래핑을 건너뜁니다.")
+                        break
+                finally:
+                    # 각 페이지 요청 후 브라우저 정리
+                    if browser:
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
 
     except Exception as e:
-        print(f"⚠️  날짜 파싱 실패 '{date_str}': {e}")
-        return None
+        print(f"❌ Playwright 오류: {e}")
+        return []
+
+    return all_articles
 
 
 def merge_api_and_scrape(df_api: pd.DataFrame, df_scrape: pd.DataFrame) -> pd.DataFrame:
@@ -184,9 +168,6 @@ def merge_api_and_scrape(df_api: pd.DataFrame, df_scrape: pd.DataFrame) -> pd.Da
         print("  ⚠️  스크래핑 데이터 없음, API 데이터만 사용")
         df_api["data_source"] = "api"
         return df_api
-
-    # 필수 컬럼 확인
-    required_cols = ["title", "description", "link", "originallink", "pubDate"]
 
     # 데이터 소스 마킹
     df_api = df_api.copy()

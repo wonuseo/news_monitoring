@@ -136,7 +136,6 @@ JSON만 반환:
         "messages": [
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.2,
         "max_tokens": min(len(domains) * 100, 8000)  # 최소 100토큰/도메인, 최대 8000
     }
 
@@ -244,7 +243,7 @@ def update_media_directory(spreadsheet=None, new_entries: Dict[str, Dict] = None
     if not new_entries:
         return
 
-    # 1. Google Sheets 업데이트
+    # 1. Google Sheets 업데이트 (배치 처리로 rate limit 방지)
     if spreadsheet:
         try:
             try:
@@ -253,9 +252,15 @@ def update_media_directory(spreadsheet=None, new_entries: Dict[str, Dict] = None
                 worksheet = spreadsheet.add_worksheet(title="media_directory", rows=1, cols=4)
                 worksheet.append_row(["domain", "media_name", "media_group", "media_type"])
 
-            for domain, info in new_entries.items():
-                row = [domain, info.get("media_name", ""), info.get("media_group", ""), info.get("media_type", "")]
-                worksheet.append_row(row)
+            # 배치 업데이트: 모든 행을 한 번에 추가
+            rows_to_add = [
+                [domain, info.get("media_name", ""), info.get("media_group", ""), info.get("media_type", "")]
+                for domain, info in new_entries.items()
+            ]
+
+            # append_rows로 한 번에 추가 (1 write request)
+            if rows_to_add:
+                worksheet.append_rows(rows_to_add)
 
             print(f"✅ media_directory (Google Sheets): {len(new_entries)}개 신규 도메인 추가")
         except Exception as e:

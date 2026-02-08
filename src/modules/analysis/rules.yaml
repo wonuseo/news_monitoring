@@ -1,0 +1,252 @@
+version: "0.3"
+mode: "MVP_TITLE_DESC_ONLY"
+
+fields:
+  title: "title"
+  description: "description"
+  publisher: "publisher"
+  datetime: "datetime"
+  url: "url"
+
+# -----------------------------
+# Brands
+# -----------------------------
+brands:
+  our:
+    - "롯데호텔"
+    - "호텔롯데"
+    - "시그니엘"
+    - "L7"
+  competitors:
+    - "신라호텔"
+    - "조선호텔"
+  aliases: {}
+
+# -----------------------------
+# Brand Scope (Rule-Based)
+# -----------------------------
+brand_scope:
+  values: ["BRAND_TARGETED", "BRAND_MENTIONED", "VENUE_ONLY"]
+
+  # If no brand mention in (title+desc) => VENUE_ONLY
+  require_brand_mention: true
+
+  # If brand mention + any targeted cue in same field => BRAND_TARGETED else BRAND_MENTIONED
+  targeted_cues_regex:
+    - "(?i)책임|원인|과실|부실|관리\\s?소홀|은폐|축소|거짓\\s?해명|재발|또"
+    - "(?i)논란|비판|공분|불매|파장|확산|여론"
+    - "(?i)사고|화재|붕괴|대피|정전|부상|사망|응급|이송|구급대|병원"
+    - "(?i)식중독|위생|오염|이물질"
+    - "(?i)수사|기소|고소|고발|압수수색|소송|과징금|제재|처분|영업정지|행정처분"
+    - "(?i)개인정보|유출|해킹|랜섬|정보노출|시스템\\s?장애|먹통|결제\\s?오류"
+    - "(?i)환불|보상|분쟁|민원|항의|불만|예약\\s?대란|예약\\s?오류|오버부킹"
+  targeted_window: "same_field"
+
+# -----------------------------
+# Sentiment (Rule-Based, 4-state)
+# POSITIVE / NEUTRAL / NEGATIVE_CANDIDATE / NEGATIVE_CONFIRMED
+# -----------------------------
+sentiment:
+  values: ["POSITIVE", "NEUTRAL", "NEGATIVE_CANDIDATE", "NEGATIVE_CONFIRMED"]
+
+  # Resolution priority if multiple match:
+  priority_order:
+    - "POSITIVE"
+    - "NEGATIVE_CONFIRMED"
+    - "NEGATIVE_CANDIDATE"
+    - "NEUTRAL"
+
+  positive_triggers_regex:
+    - "(?i)수상|선정|1위|최고|호평|극찬|추천|만족|인기|매진|기록"
+    - "(?i)awards?|won|winner|ranked|top\\s?\\d+|highly\\s+rated|recommended"
+
+  negative_confirmed_triggers:
+    complaint_claim_regex:
+      - "(?i)불만|항의|민원|환불|보상|분쟁|피해|사기|바가지|불친절|차별|갑질"
+      - "(?i)complaint|refund|compensation|dispute|scam|overcharge|discrimination|abuse"
+    incident_regex:
+      - "(?i)사고|화재|붕괴|대피|정전|부상|사망|응급|이송|구급대|병원"
+      - "(?i)accident|fire|collapse|evacuation|blackout|injur(y|ies)|death|ambulance"
+    legal_reg_regex:
+      - "(?i)수사|기소|고소|고발|압수수색|재판|소송|과징금|제재|처분|영업정지"
+      - "(?i)investigation|indictment|lawsuit|penalt(y|ies)|fine|sanction|suspension"
+    security_it_regex:
+      - "(?i)개인정보|유출|해킹|랜섬|정보노출|시스템\\s?장애|먹통|결제\\s?오류"
+      - "(?i)data\\s?breach|leak|hacking|ransomware|outage|system\\s?down|payment\\s?error"
+    hygiene_food_regex:
+      - "(?i)식중독|위생|오염|이물질|세균|식품\\s?안전"
+      - "(?i)food\\s+poison|hygiene|contamination"
+
+  negative_candidate_triggers:
+    allegation_suspicion_regex:
+      - "(?i)의혹|폭로|제보|주장|논란\\s?제기|진정|청원"
+      - "(?i)allegation|suspected|whistleblow|claimed|petition"
+    controversy_framing_regex:
+      - "(?i)논란|파장|여론|공분|비판|갑론을박|불매"
+      - "(?i)controversy|backlash|outrage|boycott"
+    early_regulatory_attention_regex:
+      - "(?i)점검|조사\\s?착수|조사\\s?예정|감사|지도\\s?점검|시정\\s?요구"
+      - "(?i)inspection|audit|probe|regulator"
+    operational_disruption_regex:
+      - "(?i)예약\\s?대란|오버부킹|접속\\s?장애|시스템\\s?불안|서비스\\s?중단|지연"
+      - "(?i)overbooking|booking\\s?error|service\\s?disruption|downtime|delay"
+
+# -----------------------------
+# Danger (Rule-Based) — only if BRAND_TARGETED + NEGATIVE_*
+# D3: statement likely needed
+# D2: continuous monitoring
+# D1: minor
+# -----------------------------
+danger:
+  enabled: true
+  apply_when:
+    brand_scope: ["BRAND_TARGETED"]
+    sentiment: ["NEGATIVE_CANDIDATE", "NEGATIVE_CONFIRMED"]
+
+  thresholds:
+    D3:
+      score_min: 50
+      hard_trigger_override: true
+    D2:
+      score_min: 20
+    D1:
+      score_min: 0
+
+  score_components:
+    hard_trigger:
+      points: 50
+      regex:
+        - "(?i)사망|중상|대형\\s?사고|대피|대형\\s?화재|붕괴|집단\\s?식중독"
+        - "(?i)대규모\\s?(개인정보\\s?유출|해킹|랜섬웨어)|개인정보\\s?유출"
+        - "(?i)기소|압수수색|영업정지|과징금|행정처분"
+        - "(?i)fatalit(y|ies)|major\\s+accident|evacuation|major\\s+fire|collapse|mass\\s+food\\s+poisoning"
+        - "(?i)large\\s+scale\\s+(data\\s+breach|hacking|ransomware)|data\\s+breach"
+        - "(?i)indict(ed|ment)|raid|business\\s+suspension|major\\s+fine"
+
+    high_risk_category:
+      points: 20
+      match_any_trigger_families:
+        - "incident_regex"
+        - "legal_reg_regex"
+        - "security_it_regex"
+        - "hygiene_food_regex"
+
+    attribution:
+      points: 15
+      regex:
+        - "(?i)책임|원인|과실|부실|관리\\s?소홀|은폐|축소|거짓\\s?해명|재발|또"
+        - "(?i)responsib(le|ility)|fault|negligence|cover\\-?up|mismanagement|recurrence"
+
+    source_weight:
+      points: 10
+      publishers: []
+
+    momentum:
+      points: 10
+      enabled: false
+      rule: ">=3 similar articles within 3 hours"
+
+    amplification_terms:
+      points: 5
+      regex:
+        - "(?i)확산|파장|공분|불매|SNS|커뮤니티|대란"
+        - "(?i)viral|backlash|outrage|boycott"
+
+# -----------------------------
+# Dual-track categorization (Rule-Based)
+# -----------------------------
+categorization:
+  issue_category:
+    top_k: 1
+    tie_break_prefer_order:
+      - "Security / Privacy / IT"
+      - "Legal / Regulation"
+      - "Safety / Incident"
+      - "Hygiene / Food"
+      - "Customer Dispute (Refund/Complaints)"
+      - "Reputation / PR"
+    categories:
+      "Safety / Incident":
+        score: 30
+        regex: ["(?i)사고|화재|붕괴|대피|정전|부상|사망|응급|이송|구급대"]
+      "Hygiene / Food":
+        score: 30
+        regex: ["(?i)위생|식중독|이물질|세균|오염|식품\\s?안전"]
+      "Customer Dispute (Refund/Complaints)":
+        score: 25
+        regex: ["(?i)불만|항의|민원|환불|보상|분쟁|피해|불친절|차별"]
+      "Service Quality / Operations":
+        score: 20
+        regex: ["(?i)서비스|응대|운영\\s?미흡|관리\\s?부실|지연|혼선"]
+      "Pricing / Commercial":
+        score: 20
+        regex: ["(?i)요금|가격|바가지|과금|추가\\s?요금|수수료|프로모션\\s?논란"]
+      "Legal / Regulation":
+        score: 30
+        regex: ["(?i)수사|기소|고소|고발|소송|과징금|제재|처분|영업정지|행정처분"]
+      "Security / Privacy / IT":
+        score: 30
+        regex: ["(?i)개인정보|유출|해킹|랜섬|정보노출|시스템\\s?장애|먹통|결제\\s?오류"]
+      "Labor / HR":
+        score: 20
+        regex: ["(?i)노조|파업|임금|해고|채용|직원\\s?처우|인사\\s?논란|갑질"]
+      "Governance / Ethics":
+        score: 25
+        regex: ["(?i)비리|횡령|배임|로비|부패|윤리|내부\\s?고발|은폐"]
+      "Reputation / PR":
+        score: 15
+        regex: ["(?i)논란|파장|여론|공분|불매|이미지\\s?타격|브랜드\\s?훼손"]
+
+  coverage_theme:
+    top_k: 2
+    categories:
+      "Business / Performance":
+        score: 15
+        regex: ["(?i)실적|매출|영업이익|투자|확장|전략|인수|합병|MOU|협약"]
+      "Brand / Marketing":
+        score: 15
+        regex: ["(?i)캠페인|광고|모델|홍보|브랜딩|수상|선정|랭킹|1위"]
+      "Product / Offering":
+        score: 12
+        regex: ["(?i)패키지|프로모션|신메뉴|F&B|뷔페|룸|객실|시설|스파"]
+      "Customer Experience":
+        score: 12
+        regex: ["(?i)만족|후기|리뷰|추천|불만|체험|방문|투숙"]
+      "Operations / Technology":
+        score: 12
+        regex: ["(?i)AI|디지털|시스템|자동화|운영|효율|리노베이션|공사"]
+      "People / Organization":
+        score: 10
+        regex: ["(?i)대표|임원|선임|조직개편|채용|노사|인사"]
+      "Risk / Crisis":
+        score: 18
+        regex: ["(?i)사고|논란|수사|기소|유출|해킹|과징금|제재|불매|파장"]
+      "ESG / Social":
+        score: 10
+        regex: ["(?i)ESG|환경|탄소|기부|사회공헌|지역\\s?상생|친환경"]
+
+# -----------------------------
+# reason codes (Rule-Based)
+# -----------------------------
+reason_codes:
+  mappings:
+    DATA_BREACH: "(?i)개인정보|유출|정보노출|data\\s?breach|leak"
+    INVESTIGATION: "(?i)수사|조사\\s?착수|압수수색|investigation|probe|raid"
+    FIRE: "(?i)화재|fire"
+    INJURY_DEATH: "(?i)부상|사망|injur(y|ies)|death|fatal"
+    FOOD_POISONING: "(?i)식중독|food\\s+poison"
+    OUTAGE: "(?i)시스템\\s?장애|먹통|outage|system\\s?down|downtime"
+    REFUND_DISPUTE: "(?i)환불|보상|분쟁|refund|compensation|dispute"
+    BOYCOTT_BACKLASH: "(?i)불매|공분|파장|backlash|outrage|boycott"
+
+output:
+  fields:
+    - "brand_mentions"
+    - "brand_scope_rb"
+    - "sentiment_rb"
+    - "danger_rb"
+    - "risk_score_rb"
+    - "issue_category_rb"
+    - "coverage_themes_rb"
+    - "reason_codes_rb"
+    - "matched_rules_rb"

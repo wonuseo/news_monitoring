@@ -2,7 +2,7 @@ certifi==2026.1.4
 charset-normalizer==3.4.4
 et_xmlfile==2.0.0
 idna==3.11
-numpy==2.0.2
+numpy>=1.21.6,<2.0
 openpyxl==3.1.5
 pandas==2.3.3
 python-dateutil==2.9.0.post0
@@ -13,9 +13,8 @@ six==1.17.0
 tzdata==2025.3
 urllib3==2.6.3
 
-# Web scraping
-beautifulsoup4==4.12.3
-lxml==5.1.0
+# Web scraping with browser automation
+playwright==1.40.0
 
 # Article text extraction
 newspaper3k==0.2.8
@@ -25,3 +24,13 @@ gspread==6.0.2
 google-auth==2.27.0
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
+
+# Content similarity detection
+scikit-learn==1.3.2
+scipy==1.11.4
+
+# LLM analysis
+PyYAML==6.0.1
+
+# Progress bar
+tqdm==4.66.1

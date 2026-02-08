@@ -5,10 +5,9 @@ media_classify 모듈 테스트
 """
 
 import pandas as pd
-from src.modules.enhancement.media_classify import (
+from src.modules.processing.media_classify import (
     extract_domain_safe,
     _fallback_classification,
-    classify_media_outlets_batch,
 )
 
 def test_extract_domain():
@@ -123,7 +122,7 @@ def test_module_imports():
     print("=" * 80)
 
     try:
-        from src.modules.enhancement.media_classify import add_media_columns
+        from src.modules.processing.media_classify import add_media_columns
         print("✅ add_media_columns imported successfully")
     except ImportError as e:
         print(f"❌ Failed to import add_media_columns: {e}")

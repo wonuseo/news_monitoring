@@ -4,10 +4,13 @@ process.py - Data Processing Module
 """
 
 import re
+import json
+import time
+import requests
 from html import unescape
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 import pandas as pd
 
 
@@ -47,10 +50,11 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     print("🔧 데이터 정규화 중...")
     df = df.copy()
-    
-    df["title"] = df["title"].apply(strip_html)
-    df["description"] = df["description"].apply(strip_html)
-    df["pub_datetime"] = df["pubDate"].apply(parse_pubdate)
+
+    # NaN 값을 빈 문자열로 변환 후 strip_html 적용
+    df["title"] = df["title"].fillna("").apply(strip_html)
+    df["description"] = df["description"].fillna("").apply(strip_html)
+    df["pub_datetime"] = df["pubDate"].fillna("").apply(parse_pubdate)
     
     print(f"✅ {len(df)}개 기사 정규화 완료")
     return df
@@ -87,7 +91,8 @@ def dedupe_df(df: pd.DataFrame) -> pd.DataFrame:
 def enrich_with_media_info(
     df: pd.DataFrame,
     spreadsheet=None,
-    openai_key: str = None
+    openai_key: str = None,
+    csv_path: Path = None
 ) -> pd.DataFrame:
     """
     DataFrame에 언론사 정보 추가 (wrapper for media_classify.add_media_columns)
@@ -96,13 +101,14 @@ def enrich_with_media_info(
         df: 처리된 DataFrame
         spreadsheet: gspread Spreadsheet 객체 (선택사항)
         openai_key: OpenAI API 키 (선택사항)
+        csv_path: media_directory CSV 경로 (선택사항)
 
     Returns:
         언론사 정보 컬럼이 추가된 DataFrame
     """
     try:
-        from src.modules.enhancement.media_classify import add_media_columns
-        return add_media_columns(df, spreadsheet, openai_key)
+        from src.modules.processing.media_classify import add_media_columns
+        return add_media_columns(df, spreadsheet, openai_key, csv_path)
     except ImportError:
         print("⚠️  media_classify 모듈을 로드할 수 없습니다.")
         return df
@@ -120,6 +126,7 @@ def detect_similar_articles(
     내용 기반 유사도 검사로 보도자료 식별
     - TF-IDF + 코사인 유사도로 중복 기사 감지
     - 유사도 >= threshold인 기사들을 '보도자료'로 표시
+    - Union-Find로 그룹화
     - 모든 기사 유지 (비파괴적 라벨링만 수행)
 
     Args:
@@ -128,13 +135,14 @@ def detect_similar_articles(
         min_text_length: 최소 텍스트 길이 (기본값: 10자)
 
     Returns:
-        'source' 컬럼이 추가된 DataFrame
+        'source', 'group_id' 컬럼이 추가된 DataFrame
     """
     print("🔍 유사 기사 검색 중...")
     df = df.copy()
 
-    # source 컬럼 초기화 (모두 빈 문자열)
-    df["source"] = ""
+    # 컬럼 초기화
+    df["source"] = "일반기사"
+    df["group_id"] = ""
 
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
@@ -177,25 +185,51 @@ def detect_similar_articles(
         # 코사인 유사도 계산 (희소 행렬 사용)
         similarity_matrix = cosine_similarity(tfidf_matrix)
 
-        # 유사 기사 그룹 식별
-        similar_groups = set()
+        # Union-Find로 유사 기사 그룹화
+        parent = {i: i for i in range(len(valid_indices))}
+
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        # 유사한 기사들을 같은 그룹으로 묶기
         for i in range(len(valid_indices)):
             for j in range(i + 1, len(valid_indices)):
                 if similarity_matrix[i, j] >= similarity_threshold:
-                    # 유사한 쌍 발견 - 두 기사 모두 '보도자료'로 표시
-                    idx_i = valid_indices[i]
-                    idx_j = valid_indices[j]
-                    similar_groups.add(idx_i)
-                    similar_groups.add(idx_j)
+                    union(i, j)
 
-        # source 컬럼 업데이트
-        for idx in similar_groups:
-            df.at[idx, "source"] = "보도자료"
+        # 그룹별 기사 수집
+        groups = {}
+        for i in range(len(valid_indices)):
+            root = find(i)
+            if root not in groups:
+                groups[root] = []
+            groups[root].append(i)
 
-        similar_count = len(similar_groups)
+        # source, group_id 컬럼 업데이트
+        # 2개 이상의 기사가 있는 그룹만 필터링하고 정렬
+        sorted_groups = sorted(
+            [(gid, indices) for gid, indices in groups.items() if len(indices) > 1],
+            key=lambda x: min(x[1])  # 첫 번째 기사의 인덱스 기준 정렬
+        )
+
+        # 1부터 순차적으로 그룹 ID 할당
+        for new_id, (old_id, indices) in enumerate(sorted_groups, start=1):
+            for i in indices:
+                idx = valid_indices[i]
+                df.at[idx, "source"] = "보도자료"
+                df.at[idx, "group_id"] = f"group_{new_id}"
+
+        similar_count = sum(len(indices) for indices in groups.values() if len(indices) > 1)
         unique_count = len(valid_indices) - similar_count
 
-        print(f"✅ {similar_count}개 기사를 '보도자료'로 표시, {unique_count}개 기사는 독립 기사")
+        print(f"✅ {similar_count}개 기사를 '보도자료'로 표시 ({len(groups)}개 그룹), {unique_count}개 기사는 독립 기사")
 
     except MemoryError:
         print("⚠️  메모리 부족으로 유사도 검사를 건너뜁니다.")
@@ -205,6 +239,135 @@ def detect_similar_articles(
     # 임시 컬럼 제거
     df = df.drop(columns=["search_text"])
     return df
+
+
+def save_csv(df: pd.DataFrame, filepath: Path) -> None:
+    """CSV 파일로 저장 (UTF-8 BOM 인코딩)"""
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        print(f"💾 저장: {filepath}")
+    except Exception as e:
+        print(f"❌ CSV 저장 실패 ({filepath}): {e}")
+        print("  → 디스크 공간 또는 권한을 확인하세요.")
+
+
+def _call_openai_summarize_batch(
+    articles: List[Dict],
+    openai_key: str,
+    retry: bool = True
+) -> Dict[str, str]:
+    """OpenAI API로 기사 배치 요약"""
+    articles_text = "\n".join([
+        f"[{a['group_id']}]\n제목: {a['title']}\n설명: {a['description'][:200]}"
+        for a in articles
+    ])
+
+    prompt = f"""각 기사를 3단어 내외로 요약하세요.
+
+기사:
+{articles_text}
+
+JSON 배열 형식으로만 응답:
+[{{"group_id":"group_0","summary":"요약"}},...]
+
+규칙:
+- 3단어 이내
+- 명사형 위주
+- JSON만 출력"""
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": min(len(articles) * 30, 4096)  # 최소 30토큰/항목, 최대 4096
+            },
+            timeout=60
+        )
+
+        if response.status_code == 429 and retry:
+            print("  (Rate limit, 5초 대기 후 재시도)")
+            time.sleep(5)
+            return _call_openai_summarize_batch(articles, openai_key, retry=False)
+
+        if response.status_code != 200:
+            print(f"  (API 오류 {response.status_code}, 기본값 사용)")
+            return {a["group_id"]: a["title"][:15] for a in articles}
+
+        result = response.json()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        try:
+            summaries = json.loads(content)
+            return {item["group_id"]: item["summary"] for item in summaries}
+        except json.JSONDecodeError:
+            if retry:
+                print("  (JSON 파싱 실패, 재시도)")
+                time.sleep(2)
+                return _call_openai_summarize_batch(articles, openai_key, retry=False)
+            return {a["group_id"]: a["title"][:15] for a in articles}
+
+    except Exception as e:
+        print(f"  (오류: {e}, 기본값 사용)")
+        return {a["group_id"]: a["title"][:15] for a in articles}
+
+
+def summarize_press_release_groups(
+    df: pd.DataFrame,
+    openai_key: str
+) -> pd.DataFrame:
+    """
+    보도자료 그룹별로 가장 이른 기사를 OpenAI로 요약
+
+    Args:
+        df: group_id, pub_datetime, title, description 컬럼 포함
+        openai_key: OpenAI API 키
+
+    Returns:
+        press_release_group 컬럼이 추가된 DataFrame
+    """
+    print("📝 보도자료 그룹 요약 생성 중...")
+    df = df.copy()
+    df["press_release_group"] = ""
+
+    press_release_mask = (df["source"] == "보도자료") & (df["group_id"] != "")
+    if press_release_mask.sum() == 0:
+        print("  ℹ️  보도자료 그룹이 없습니다.")
+        return df
+
+    try:
+        # 그룹별 가장 이른 기사 선택
+        pr_df = df[press_release_mask].copy()
+        pr_df["pub_datetime_parsed"] = pd.to_datetime(pr_df["pub_datetime"], errors="coerce")
+        earliest_articles = pr_df.sort_values("pub_datetime_parsed").groupby("group_id").first().reset_index()
+
+        # OpenAI 배치 요약 (100개씩)
+        articles_to_summarize = [
+            {"group_id": row["group_id"], "title": row["title"], "description": row["description"]}
+            for _, row in earliest_articles.iterrows()
+        ]
+
+        group_summaries = {}
+        for i in range(0, len(articles_to_summarize), 100):
+            batch = articles_to_summarize[i:i+100]
+            batch_summaries = _call_openai_summarize_batch(batch, openai_key)
+            group_summaries.update(batch_summaries)
+
+        # press_release_group 업데이트
+        for idx, row in df[press_release_mask].iterrows():
+            group_id = row["group_id"]
+            if group_id in group_summaries:
+                df.at[idx, "press_release_group"] = group_summaries[group_id]
+
+        print(f"✅ {len(group_summaries)}개 보도자료 그룹 요약 완료")
+        return df
+
+    except Exception as e:
+        print(f"⚠️  보도자료 그룹 요약 중 오류: {e}")
+        return df
 
 
 def save_excel(df: pd.DataFrame, filepath: Path, sheet_name: str = "data") -> None:

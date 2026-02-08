@@ -138,7 +138,6 @@ JSON 배열만 출력하세요."""
             {"role": "system", "content": "당신은 정확한 JSON 응답만 제공하는 어시스턴트입니다."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.2,
         "max_tokens": max_tokens
     }
     
