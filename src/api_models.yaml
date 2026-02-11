@@ -1,0 +1,19 @@
+# OpenAI API 모델 설정
+# 각 기능별로 사용할 모델을 지정합니다.
+
+models:
+  # 기사 분류 (감정/위험도/카테고리 분석)
+  article_classification: "gpt-4o-mini"
+
+  # 언론사 분류 (도메인 → 언론사명/그룹/타입)
+  media_classification: "gpt-4o-mini"
+
+  # 보도자료 요약 (클러스터별 5단어 요약)
+  press_release_summary: "gpt-4o-mini"
+
+# 사용 가능한 모델 예시:
+# - gpt-4o
+# - gpt-4o-mini
+# - gpt-4o-mini-nano
+# - gpt-4-turbo
+# - gpt-3.5-turbo

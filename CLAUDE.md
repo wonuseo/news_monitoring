@@ -1,0 +1,364 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**News Monitoring System** - Automated pipeline for hotel brand news monitoring that collects articles from Naver API, performs hybrid LLM+rule-based analysis for sentiment/risk/categorization, and outputs results to Google Sheets + CSV + Word reports.
+
+**Core Flow**: Collection → Processing → LLM Classification → Reporting → Sheets Sync
+
+**Key Features**:
+- LLM-only classification (OpenAI GPT with structured output via prompts.yaml)
+- TF-IDF similarity detection for press release grouping
+- OpenAI-powered media outlet classification
+- Automatic Google Sheets sync (primary data store)
+- CSV backups for troubleshooting
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure .env with API keys (required)
+# NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, OPENAI_API_KEY
+# GOOGLE_SHEETS_CREDENTIALS_PATH, GOOGLE_SHEET_ID (recommended)
+
+# Run full pipeline (default: 100 articles/brand)
+python main.py
+
+# Recommended: API pagination (Sheets sync is automatic if configured)
+python main.py --max_api_pages 9
+
+# Test run without AI costs
+python main.py --dry_run --display 10
+```
+
+## Architecture
+
+Linear 5-step pipeline:
+
+```
+STEP 1: Collection
+├─ Naver API (pagination: 9 pages × 100 = 900 articles/brand)
+├─ Load existing links from Google Sheets (skip duplicates)
+└─ Save to raw.csv + append to Sheets
+
+STEP 2: Processing
+├─ Normalize (HTML strip, ISO dates, article_id, article_no)
+├─ Deduplicate by link
+├─ TF-IDF similarity (detect press releases, cosine ≥ 0.8)
+├─ OpenAI group summarization (press_release_group)
+└─ Media classification (domain → name/group/type via OpenAI batch)
+
+STEP 3: LLM Classification
+├─ Press release preset (skip LLM for cost savings)
+├─ LLM Analysis (OpenAI gpt-4o-mini, selective: 우리 브랜드 all + 경쟁사 all)
+│   └─ Outputs: brand_relevance, sentiment_stage, danger_level,
+│       issue_category, news_category, news_keyword_summary
+└─ Structured output via prompts.yaml (no retraining needed)
+
+STEP 4: Reporting
+├─ Console report (summary statistics)
+└─ Keyword extraction (optional, saved to Google Sheets)
+
+STEP 5: Sheets Sync
+└─ Incremental upload to 2 tabs (raw_data, result)
+```
+
+## Module Structure
+
+```
+src/modules/
+├── collection/
+│   ├── collect.py       # Naver API pagination
+│   └── scrape.py        # Browser automation (optional)
+├── processing/
+│   ├── process.py       # Normalize, dedupe, CSV I/O
+│   ├── press_release_detector.py # Press release detection & summarization
+│   ├── media_classify.py # OpenAI media outlet classification
+│   ├── fulltext.py      # Full-text extraction (optional)
+│   └── looker_prep.py   # Time-series columns (optional)
+├── analysis/
+│   ├── classify_llm.py  # LLM-only classifier (current)
+│   ├── llm_engine.py    # OpenAI Structured Output engine
+│   ├── preset_pr.py     # Press release preset values
+│   ├── keyword_extractor.py # Category-specific keyword extraction (kiwipiepy + Log-odds)
+│   └── prompts.yaml     # LLM prompts & schemas
+├── monitoring/
+│   └── logger.py        # Run metrics logging (CSV + Google Sheets)
+└── export/
+    ├── report.py        # CSV + Word generation
+    └── sheets.py        # Google Sheets sync
+```
+
+**Note**: System uses LLM-only classification. Legacy files (`hybrid.py`, `rule_engine.py`, `rules.yaml`) have been removed. The file `classify.py` still exists but is not used in the current pipeline (legacy code).
+
+## Key Configuration Files
+
+**Brand Definitions** (`src/modules/collection/collect.py:14-15`):
+```python
+OUR_BRANDS = ["롯데호텔", "호텔롯데", "L7", "시그니엘"]
+COMPETITORS = ["신라호텔", "조선호텔"]
+```
+
+**LLM Prompts** (`src/modules/analysis/prompts.yaml`):
+- System prompt for classification
+- Output schema (JSON)
+- Decision rules for sentiment, danger, issue categories
+- No retraining needed - edit YAML to change logic
+
+**Environment** (`.env`):
+```bash
+# Required
+NAVER_CLIENT_ID=your_id
+NAVER_CLIENT_SECRET=your_secret
+OPENAI_API_KEY=sk-your_key
+
+# Recommended (primary data store)
+GOOGLE_SHEETS_CREDENTIALS_PATH=.secrets/service-account.json
+GOOGLE_SHEET_ID=your_sheet_id
+```
+
+## Common Commands
+
+```bash
+# Standard run (API only, 100 articles/brand)
+python main.py
+
+# With pagination (900 articles/brand, recommended)
+python main.py --max_api_pages 9
+
+# Raw collection only (no classification/reporting, auto-syncs to Sheets)
+python main.py --raw_only
+
+# Preprocess only (no classification, but with Sheets sync)
+python main.py --preprocess_only
+
+# Reduce chunk size if timeouts occur
+python main.py --chunk_size 50
+
+# Limit competitor analysis (default is unlimited)
+python main.py --max_competitor_classify 20
+
+# Extract category-specific keywords (kiwipiepy + Log-odds → Google Sheets)
+python main.py --extract_keywords --keyword_top_k 20
+
+# Browser scraping with date range
+python main.py --scrape --start_date 2026-01-01 --end_date 2026-02-08
+
+# Full-text extraction (high/medium risk only)
+python main.py --fulltext --fulltext_risk_levels 상,중
+
+# Custom output directory
+python main.py --outdir reports
+
+# Parallel processing (adjust workers)
+python main.py --max_workers 10
+```
+
+## Data Flow & Key Columns
+
+**Collection (raw.csv)**:
+- From API: `title`, `description`, `link`, `originallink`, `pubDate`
+- Added: `query` (brand, 복수 브랜드 수집 시 파이프 구분 예: "롯데호텔|호텔롯데"), `group` (OUR/COMPETITOR)
+
+**Processing (intermediate)**:
+- `pub_datetime` (ISO 8601)
+- `article_id` (MD5 hash, 12-char, 영구 식별자, 시스템용)
+- `article_no` (순차 번호, 사람이 읽는 번호, 검토용)
+- `source` ("보도자료" if similar, else "일반기사")
+- `cluster_id` (press release cluster ID)
+- `press_release_group` (OpenAI 3-word summary)
+- `media_domain`, `media_name`, `media_group`, `media_type`
+
+**LLM Classification (result.csv)**:
+- `brand_relevance`: "관련" / "언급" / "무관" / "판단 필요"
+- `brand_relevance_query_keywords`: [array of keywords]
+- `sentiment_stage`: "긍정" / "중립" / "부정 후보" / "부정 확정"
+- `danger_level`: "상" / "중" / "하" / null (only if brand_relevance + negative)
+- `issue_category`: One of 11 Korean categories (안전/사고, 법무/규제, etc.) or null
+- `news_category`: One of 9 Korean categories (사업/실적, 브랜드/마케팅, etc.)
+- `news_keyword_summary`: 5-word Korean summary
+- `classified_at`: ISO timestamp
+
+**Google Sheets** (primary data store):
+- `raw_data` tab: Raw collected articles
+- `result` tab: Classified articles with all LLM columns
+- `logs` tab: Run history with metrics (CSV backup: `data/logs/run_history.csv`)
+- Incremental append (deduplicates by link)
+
+## Critical Implementation Details
+
+### Press Release Detection & Summarization
+- **Detection**: Character-level n-grams (3-5) TF-IDF + Cosine + Jaccard similarity
+- **Date-based rules**: Δdays ≤ 3 (standard) vs Δdays ≥ 4 (super-similar)
+- **Clustering**: Query-specific BFS Connected Components
+- **Summarization**: OpenAI 3-word summaries per cluster
+- **Non-destructive**: Preserves all articles, labels as "보도자료"
+- **Module**: `press_release_detector.py` (all-in-one: detection + summarization)
+
+### Deduplication with Query Merging
+- Duplicate links merged by `originallink` or `link`
+- Query field merged with pipe separator (e.g., "롯데호텔|호텔롯데")
+- Preserves multi-brand collection information
+- Function: `dedupe_df()` in `process.py`
+
+### Media Classification (OpenAI Batch)
+- Extracts domains from URLs
+- Batch classifies unknown domains (1 API call for all)
+- Persistent CSV directory (`media_directory.csv`)
+- Cost: ~$0.001 per 100 domains
+
+### LLM Classification Strategy
+- **Model**: OpenAI gpt-4o-mini (as configured in prompts.yaml)
+- **Full analysis by default**: OUR_BRANDS (all) + COMPETITORS (all)
+  - Use `--max_competitor_classify N` to limit competitor analysis
+- **Press releases**: Preset values via `preset_pr.py`, skip LLM (save cost)
+- **Chunking**: Default 100 articles/chunk (reduce for timeouts)
+- **Parallel**: ThreadPoolExecutor with max_workers (default 10)
+- **Incremental save**: Appends to result.csv after each successful chunk
+- **Configuration**: All prompts and rules in `prompts.yaml` - no code changes needed
+
+### Keyword Extraction (Optional)
+- **Method**: kiwipiepy (Korean morphological analysis) + Log-odds ratio with Laplace smoothing
+- **POS tags**: NNG (common noun), NNP (proper noun), VV (verb), VA (adjective)
+- **Statistics**: Log-odds ratio = log(P(word|category)) - log(P(word|other categories))
+- **Output**: Top-K keywords per category (default: 20)
+- **Categories**: sentiment_stage, danger_level, issue_category, news_category, brand_relevance
+- **Usage**: `--extract_keywords --keyword_top_k 20`
+- **Storage**:
+  - Primary: Google Sheets `keywords` tab
+  - Backup: `data/keywords/keywords_{category}.csv`
+
+### Google Sheets Integration
+- **Primary data store** (CSV = backup for troubleshooting)
+- **Automatic sync**: No `--sheets` flag needed - syncs automatically if credentials configured
+- **Incremental collection**: Loads existing links at start, skips duplicates
+- **Sync function**: `sync_raw_and_processed()` in `sheets.py`
+- **Graceful fallback**: Continues with CSV-only mode if credentials missing
+- **Configuration**: Set `GOOGLE_SHEETS_CREDENTIALS_PATH` and `GOOGLE_SHEET_ID` in `.env`
+
+### Error Handling
+- All steps non-blocking (pipeline always completes)
+- API failures: retry with exponential backoff
+- Sheets failures: continues with CSV-only mode
+- LLM failures: records error, continues with remaining articles
+
+## Logging System
+
+The system automatically tracks all pipeline metrics and saves them to CSV + Google Sheets.
+
+**Tracked Metrics** (34 columns):
+- **Basic**: run_id, timestamp, duration_total, cli_args
+- **Collection**: articles_collected_total, articles_collected_per_query, existing_links_skipped, duration_collection
+- **Processing**: duplicates_removed, articles_processed, press_releases_detected, press_release_groups, duration_processing
+- **Media**: media_domains_total, media_domains_new, media_domains_cached
+- **Classification**: articles_classified_llm, llm_api_calls, llm_cost_estimated, press_releases_skipped, classification_errors, duration_classification
+- **Results**: our_brands_relevant, our_brands_negative, danger_high, danger_medium, competitor_articles
+- **Sheets**: sheets_sync_enabled, sheets_rows_uploaded_raw, sheets_rows_uploaded_result, sheets_logs_uploaded, duration_sheets_sync
+
+**Log Storage**:
+- CSV: `data/logs/run_history.csv` (append mode, persistent)
+- Google Sheets: `logs` tab (full replace on each sync)
+
+**Usage**:
+- Automatic: No configuration needed, logs saved after every run
+- View logs: `cat data/logs/run_history.csv` or open Google Sheets
+- Monitor costs: Check `llm_cost_estimated` column (USD)
+- Track performance: Compare `duration_*` columns across runs
+
+## Output Files
+
+**Location**: `data/` directory (or `--outdir`)
+
+- `raw.csv` - Raw API collection (UTF-8 BOM, troubleshooting backup)
+- `result.csv` - LLM classified results (UTF-8 BOM, troubleshooting backup)
+- `media_directory.csv` - Media outlet directory (persistent)
+- `keywords/` - Category-specific keyword CSV files (if `--extract_keywords`, troubleshooting backup)
+- `logs/run_history.csv` - Run metrics history (persistent, append mode)
+
+**Google Sheets** (primary data store, if configured):
+- `raw_data` tab: Raw collected articles
+- `result` tab: Classified articles with all LLM columns
+- `logs` tab: Run history with metrics
+- `keywords` tab: Category-specific keywords (if `--extract_keywords`)
+- Auto-deduplication by link
+- CSV files are backups for troubleshooting
+
+## Debugging & Troubleshooting
+
+**Common Issues**:
+
+| Problem | Solution |
+|---------|----------|
+| `401 Unauthorized` | Check API keys in `.env` |
+| No articles collected | Verify brand names (Korean), try `--display 200` |
+| Timeout during classification | Reduce `--chunk_size` (try 50 or 30) |
+| Rate limit (429) | Built-in retry; reduce `--chunk_size` if persistent |
+| Sheets sync fails | Check credentials path and Sheet ID in `.env` |
+| Playwright errors | Run `playwright install` |
+
+**Test Commands**:
+```bash
+# Quick test (10 articles, no AI)
+python main.py --dry_run --display 10
+
+# Test Sheets integration (auto-syncs if credentials configured)
+python main.py --display 10 --raw_only
+
+# Debug classification
+python main.py --display 20 --chunk_size 5 --max_workers 1
+```
+
+**Incremental Processing**:
+- System checks `result.csv` for processed links
+- Finds unprocessed rows (new articles)
+- Finds rows with missing analysis fields (failed previous runs)
+- Processes both categories automatically
+
+## Development Notes
+
+**Code Style**:
+- DataFrame naming: `df_raw`, `df_normalized`, `df_processed`, `df_result`
+- Use f-strings for formatting
+- Keep functions under 50 lines
+- No strict linting enforced
+
+**Testing Strategy**:
+- `--dry_run` for pipeline testing without AI costs
+- `--raw_only` for collection testing
+- `--display 10` for small dataset tests
+- `--chunk_size 5` for debugging classification
+- Tests directory (`tests/`) exists for unit tests (in development)
+
+**Important Functions**:
+- Collection: `collect_all_news()` in `collect.py`
+- Processing: `normalize_df()`, `dedupe_df()`, `detect_similar_articles()` in `process.py`
+- Classification: `classify_llm()` in `classify_llm.py`
+- Reporting: `create_word_report()` in `report.py`
+- Sheets: `sync_raw_and_processed()` in `sheets.py`
+
+**Documentation Notes**:
+- ⚠️ README.md is outdated - describes removed hybrid system (rules.yaml, hybrid.py)
+- ✅ CLAUDE.md (this file) reflects current LLM-only architecture
+- Use this file (CLAUDE.md) as the authoritative reference for architecture
+
+## Architecture Changes (Recent)
+
+**Phase 9 (CSV Migration)**:
+- Migrated from Excel to CSV (8.3x faster I/O)
+- Replaced TF-IDF keywords with OpenAI group summaries
+- Added CSV-based media directory with Sheets sync
+
+**Phase 10 (Current - LLM-Only)**:
+- **Removed hybrid system**: Deleted `rule_engine.py`, `hybrid.py`, `rules.yaml`
+- **LLM-only classification**: Uses OpenAI structured output
+- **Configuration-driven**: All logic in `prompts.yaml` (no retraining needed)
+- **Cleaner architecture**: Single classification path via `classify_llm.py`
+
+**Google Sheets as Primary Store**:
+- CSV files are backups for troubleshooting
+- Sheets provides real-time collaboration
+- Incremental sync prevents duplicate processing
