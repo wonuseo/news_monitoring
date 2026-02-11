@@ -5,11 +5,25 @@ media_classify.py - Media Outlet Classification Module
 
 import json
 import time
+import yaml
 import requests
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 from pathlib import Path
 import pandas as pd
+
+OPENAI_API_URL = "https://api.openai.com/v1/responses"
+
+
+def load_api_models() -> dict:
+    """api_models.yaml에서 모델 설정 로드"""
+    yaml_path = Path(__file__).parent.parent.parent / "api_models.yaml"
+    try:
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+            return config.get("models", {})
+    except FileNotFoundError:
+        return {"media_classification": "gpt-5-nano"}
 
 
 def extract_domain_safe(url: str) -> str:
@@ -119,7 +133,7 @@ def classify_media_outlets_batch(
 {domain_list}
 
 JSON만 반환:
-[{{"domain":"example.com","media_name":"예시언론","media_group":"예시그룹","media_type":"종합지"}},...]
+{{"classifications":[{{"domain":"example.com","media_name":"예시언론","media_group":"예시그룹","media_type":"종합지"}}]}}
 
 분류:
 - 종합지/경제지/IT전문지/방송사/통신사/인터넷신문/기타
@@ -131,18 +145,53 @@ JSON만 반환:
         "Content-Type": "application/json"
     }
 
+    # api_models.yaml에서 모델 로드
+    api_models = load_api_models()
+    model = api_models.get("media_classification", "gpt-5-nano")
+
     data = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "user", "content": prompt}
+        "model": model,
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
         ],
-        "max_tokens": min(len(domains) * 100, 8000)  # 최소 100토큰/도메인, 최대 8000
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "media_classification_batch",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["classifications"],
+                    "properties": {
+                        "classifications": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["domain", "media_name", "media_group", "media_type"],
+                                "properties": {
+                                    "domain": {"type": "string"},
+                                    "media_name": {"type": "string"},
+                                    "media_group": {"type": "string"},
+                                    "media_type": {
+                                        "type": "string",
+                                        "enum": ["종합지", "경제지", "IT전문지", "방송사", "통신사", "인터넷신문", "기타"]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "max_output_tokens": min(len(domains) * 100, 8000)  # 최소 100토큰/도메인, 최대 8000
     }
 
     try:
         print(f"  🤖 OpenAI 분류: {len(domains)}개 신규 도메인", end="", flush=True)
         response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            OPENAI_API_URL,
             headers=headers,
             json=data,
             timeout=60
@@ -162,24 +211,19 @@ JSON만 반환:
             return _fallback_classification(domains)
 
         result = response.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        content = result.get("output_text", "").strip()
+        if not content:
+            output = result.get("output", [])
+            if output:
+                contents = output[0].get("content", [])
+                for item in contents:
+                    if item.get("type") == "output_text" and item.get("text"):
+                        content = item["text"].strip()
+                        break
 
-        # JSON 추출 및 정제
         try:
-            # 1. 마크다운 코드 블록 제거
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            # 2. JSON 배열 패턴 추출 ([...])
-            import re
-            json_match = re.search(r'\[.*\]', content, re.DOTALL)
-            if json_match:
-                content = json_match.group(0)
-
-            # 3. JSON 파싱
-            classifications = json.loads(content)
+            parsed = json.loads(content)
+            classifications = parsed.get("classifications", [])
         except json.JSONDecodeError as e:
             if retry:
                 print(f" (JSON 파싱 실패: {str(e)[:50]}, 2초 대기 후 재시도)")

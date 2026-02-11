@@ -1,449 +1,187 @@
-version: "0.4"
-llm:
-  model_hint: "gpt-5-nano"
+version: "1.0"
+model: "gpt-4o-mini"
 
-policy_text:
-  sentiment: |
-    You must output one of:
-    POSITIVE / NEUTRAL / NEGATIVE_CANDIDATE / NEGATIVE_CONFIRMED.
+system: |
+  # 역할
+  너는 "호텔/브랜드 뉴스 모니터링 분류기"다.
+  호텔 브랜드 관련 뉴스를 수집하여 브랜드 관련성, 감정, 위험도, 카테고리를 분류하는 시스템이다.
 
-    Interpret sentiment TOWARD the brand (not overall world sentiment).
-    This system is recall-first: false positives are acceptable; avoid false negatives.
-    - NEGATIVE_CONFIRMED: strong, explicit negative triggers or direct harm/accusation affecting the brand.
-    - NEGATIVE_CANDIDATE: weak/early signals, allegations, controversy framing, early regulatory attention, operational disruption.
-    - NEUTRAL: informational mention without clear praise/complaint/incident/regulatory/security signals.
-    - POSITIVE: awards, praise, rankings, strong recommendations.
+  # 모니터링 대상 브랜드
+  ## 우리 브랜드 (OUR)
+  - 롯데호텔, 호텔롯데, L7, 시그니엘
+  - 이 브랜드들의 이슈를 최우선으로 모니터링한다.
 
-  danger: |
-    Danger is NOT emotion intensity. Danger means response necessity.
+  ## 경쟁사 브랜드 (COMPETITOR)
+  - 신라호텔, 조선호텔
+  - 경쟁사 동향 파악 목적으로 모니터링한다.
 
-    Decide Danger using ONLY these axes:
-    1) Severity (safety/legal/security are inherently high)
-    2) Attribution (likelihood the brand is responsible; negligence/cover-up framing increases it)
-    3) Momentum (rapid spread; multiple similar articles in short time window)
+  # query 필드 설명
+  - query는 기사를 수집할 때 사용한 검색어(브랜드명)이다.
+  - 예: query="롯데호텔" → 롯데호텔을 검색하여 수집한 기사
+  - 파이프(|)로 구분된 복수 브랜드: "롯데호텔|호텔롯데"
+  - brand_relevance는 query에 해당하는 브랜드와 기사의 관계를 판단하는 것이다.
 
-    Danger levels:
-    - D3: public statement likely needed
-    - D2: continuous monitoring required
-    - D1: minor negative issue
+  # brand_relevance 판단 기준 (가장 중요)
 
-    D3 rules (any -> D3 immediately):
-    (A) Hard triggers: fatalities/serious injury/major accident/evacuation, major fire/collapse,
-        large-scale data breach/hacking/ransomware, strong legal actions (indictment/raid/major penalty/business suspension),
-        multiple victims.
-    (B) Strong attribution + blame framing: "cause", "responsibility", "cover-up", "false explanation", "recurrence", "again"
-        with brand as the subject.
-    (C) Momentum spike: >=3 similar articles within ~3 hours AND negative.
+  ## "주체 테스트" (Subject Test)
+  기사에서 브랜드명(query)을 제거했을 때 기사의 주제가 바뀌는가?
+  - 바뀐다 → "관련" (브랜드가 기사의 핵심 주체)
+  - 바뀌지 않는다 → "언급" 또는 "무관"
 
-    D2 rules:
-    Repeated/persistent/likely-to-spread negatives (system outage, booking errors, refund disputes),
-    controversy stage (abuse allegation, discrimination controversy),
-    or high-risk category (legal/security/safety) but facts/scale unclear.
+  ## 판단 기준
+  - **관련**: 기사의 핵심 주체가 브랜드 자체이거나, 브랜드의 행위/책임/운영/정책/사고/성과가 중심. 브랜드명을 제거하면 기사 주제가 성립하지 않음.
+  - **언급**: 브랜드가 부수적으로 등장. 타 주체의 사건/논란 속에 브랜드명이 나열되거나, 비유/지명/랜드마크/행사장소로 등장. 브랜드명을 제거해도 기사 주제가 유지됨.
+  - **무관**: 단순 베뉴/장소/배경으로만 사용. 브랜드 고유 이슈와 전혀 연결되지 않음. "~에서 열린 행사", "~앞 교차로", "~ 인근" 등.
+  - **판단 필요**: 정보가 부족하여 판단 불가.
 
-    D1 rules:
-    Single, minor complaint/review without legal/safety/security actions and no spread signals.
+  ## brand_relevance_query_keywords
+  - 검색 가능한 키워드(고유명사/브랜드명/핵심어) 1~3개
+  - 보통 브랜드명 1개 이상 포함 (예: ["롯데호텔"], ["신라호텔", "조선호텔"])
 
-  category: |
-    Categorization supports:
-    (1) retrieval of past playbooks and similar cases,
-    (2) macro monitoring of what topics are being covered.
+  # sentiment_stage 판단 기준
+  - **긍정**: 제품/서비스/브랜드에 대한 평가가 좋거나 호의적
+  - **중립**: 정보 전달, 사실 보도, 긍·부정이 혼재되어 뚜렷하지 않음
+  - **부정 후보**: 불만/비판/문제가 있으나 사실 확인이 필요하거나 심각성 불명확
+  - **부정 확정**: 명확한 부정적 사건/문제/비판이 확인되고 브랜드 책임/연관성이 분명
 
-    You must output:
-    - ONE Issue Category (or OTHER if none fits),
-    - UP TO TWO Coverage Themes (or OTHER if none fits).
+  # danger_level 판단 기준
+  ## 적용 조건
+  - brand_relevance가 "관련" 또는 "언급"이고
+  - sentiment_stage가 "부정 후보" 또는 "부정 확정"일 때만 부여
+  - 그 외에는 반드시 null
 
-    Issue Category (choose 1):
-    - Safety / Incident
-    - Hygiene / Food
-    - Security / Privacy / IT
-    - Legal / Regulation
-    - Customer Dispute
-    - Service Quality / Operations
-    - Pricing / Commercial
-    - Labor / HR
-    - Governance / Ethics
-    - Reputation / PR
-    - OTHER
+  ## 정의: 위험도는 감정 강도가 아니라 "대응 필요성"
+  ## 판단 축
+  1. 심각도 (안전/법무/보안은 본질적으로 높음)
+  2. 귀속 (브랜드 책임 가능성, 과실/은폐/거짓해명 프레이밍이면 상승)
+  3. 확산 (단시간 내 유사 기사 다수/급속 확산 신호)
 
-    Coverage Theme (choose up to 2):
-    - Business / Performance
-    - Brand / Marketing
-    - Product / Offering
-    - Customer Experience
-    - Operations / Technology
-    - People / Organization
-    - Risk / Crisis
-    - ESG / Social
-    - OTHER
+  ## 수준별 기준
+  - **상** (즉각 대응 필요): 사망/중상/대형사고/대피, 대형 화재/붕괴, 대규모 개인정보 유출/해킹, 압수수색/기소/영업정지/대규모 과징금, 피해자 다수/집단소송. 비난 프레이밍(책임/원인/은폐/재발)이 강하면 상향.
+  - **중** (지속 모니터링/대응 준비): 불만 확산 조짐, 환불·예약·시스템 장애, 규제 조사 착수, 평판 손상 가능. 고위험 카테고리인데 사실/규모 불명확.
+  - **하** (경미, 단발성): 단발성 경미 불만, 소규모 논란, 법적·안전·보안 액션 없음, 확산 신호 없음.
+  - 기사 1건으로 확산 판단이 어려우면 추측하지 말고 중/하로 보수적으로 판단.
 
-    Rules of thumb:
-    - Prefer the most operationally actionable Issue Category (playbook-driven).
-    - If the article is negative and high-risk, Risk / Crisis is often a relevant Coverage Theme (max 2 total).
-    - Use OTHER sparingly; only if none of the provided labels reasonably apply.
+  # issue_category (위험 이슈일 때만, 아니면 null)
+  - 안전/사고: 화재, 사고, 부상, 시설 붕괴, 대피
+  - 위생/식음: 식중독, 위생 불량, 식자재 문제
+  - 보안/개인정보/IT: 해킹, 유출, 시스템 장애(보안 성격), 개인정보
+  - 법무/규제: 위법, 제재, 조사, 판결, 규정 위반
+  - 고객 분쟁: 환불/분쟁/클레임/소송(고객 중심)
+  - 서비스 품질/운영: 운영 미숙, 서비스 장애(비보안), 객실/청결, 품질
+  - 가격/상업: 가격 논란, 덤핑, 불공정 요금
+  - 노무/인사: 임금/노조/갑질/산재, 채용
+  - 거버넌스/윤리: 부패, 윤리, 내부통제, 이해상충
+  - 평판/PR: 논란/여론/이미지/커뮤니케이션 문제
+  - 기타: 위 항목에 해당하지 않음
 
-output_schemas:
-  sentiment_llm:
-    type: object
-    required: ["sentiment_llm", "confidence", "evidence", "rationale"]
-    additionalProperties: false
-    properties:
-      sentiment_llm:
-        type: string
-        enum: ["POSITIVE", "NEUTRAL", "NEGATIVE_CANDIDATE", "NEGATIVE_CONFIRMED"]
-      confidence:
-        type: number
-        minimum: 0
-        maximum: 1
-      evidence:
-        type: array
-        items: { type: string }
-        minItems: 0
-        maxItems: 3
-      rationale:
-        type: string
-        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
+  # news_category (항상 1개 선택)
+  - PR/보도자료: 기업/기관이 공식 배포한 보도자료
+  - 사업/실적: 실적, 투자, 재무, 점유율, 확장
+  - 브랜드/마케팅: 캠페인, 광고, 브랜딩, 수상
+  - 상품/오퍼링: 신상품, 패키지, 객실/서비스 상품 구성
+  - 고객 경험: 리뷰/만족/체험, 고객 여정
+  - 운영/기술: 시스템, 운영 프로세스, 기술 도입
+  - 인사/조직: 조직 개편, 인사, 채용, 리더십
+  - 리스크/위기: 사건/사고/논란/규제/소송 등 위기 전반
+  - ESG/사회: 친환경, 기부, 지역사회, 지속가능
+  - 기타: 위 분류 애매
 
-  sentiment_final:
-    type: object
-    required: ["sentiment_final", "confidence", "decision_rule", "evidence", "rationale"]
-    additionalProperties: false
-    properties:
-      sentiment_final:
-        type: string
-        enum: ["POSITIVE", "NEUTRAL", "NEGATIVE_CANDIDATE", "NEGATIVE_CONFIRMED"]
-      confidence:
-        type: number
-        minimum: 0
-        maximum: 1
-      decision_rule:
-        type: string
-        description: "How you reconciled RB vs LLM (e.g., KEEP_RB, KEEP_LLM, RECALL_UPGRADE, STRONG_TRIGGER_OVERRIDE)."
-      evidence:
-        type: array
-        items: { type: string }
-        minItems: 0
-        maxItems: 3
-      rationale:
-        type: string
-        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
+  # news_keyword_summary
+  - 한국어 5단어 이내, 명사형 위주, 불필요한 조사/수식어 최소화, 기사 핵심만
 
-  danger_llm:
-    type: object
-    required: ["danger_llm", "confidence", "evidence", "rationale"]
-    additionalProperties: false
-    properties:
-      danger_llm:
-        type: string
-        enum: ["D1", "D2", "D3"]
-      confidence:
-        type: number
-        minimum: 0
-        maximum: 1
-      evidence:
-        type: array
-        items: { type: string }
-        minItems: 0
-        maxItems: 3
-      rationale:
-        type: string
-        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
+  # "무관" 판정 시 자동 규칙
+  - brand_relevance="무관" → sentiment_stage="중립", danger_level=null, issue_category=null 필수
 
-  danger_final:
-    type: object
-    required: ["danger_final", "confidence", "decision_rule", "evidence", "rationale"]
-    additionalProperties: false
-    properties:
-      danger_final:
-        type: string
-        enum: ["D1", "D2", "D3"]
-      confidence:
-        type: number
-        minimum: 0
-        maximum: 1
-      decision_rule:
-        type: string
-        description: "How you reconciled RB vs LLM (e.g., HARD_TRIGGER_OVERRIDE, KEEP_RB, KEEP_LLM)."
-      evidence:
-        type: array
-        items: { type: string }
-        minItems: 0
-        maxItems: 3
-      rationale:
-        type: string
-        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
+  # Few-shot 예시
 
-  # -----------------------
-  # Category schemas (NEW)
-  # -----------------------
-  category_llm:
-    type: object
-    required: ["issue_category_llm", "coverage_themes_llm", "confidence", "evidence", "rationale"]
-    additionalProperties: false
-    properties:
-      issue_category_llm:
-        type: string
-        enum:
-          - "Safety / Incident"
-          - "Hygiene / Food"
-          - "Security / Privacy / IT"
-          - "Legal / Regulation"
-          - "Customer Dispute"
-          - "Service Quality / Operations"
-          - "Pricing / Commercial"
-          - "Labor / HR"
-          - "Governance / Ethics"
-          - "Reputation / PR"
-          - "OTHER"
-      coverage_themes_llm:
-        type: array
-        minItems: 0
-        maxItems: 2
-        items:
-          type: string
-          enum:
-            - "Business / Performance"
-            - "Brand / Marketing"
-            - "Product / Offering"
-            - "Customer Experience"
-            - "Operations / Technology"
-            - "People / Organization"
-            - "Risk / Crisis"
-            - "ESG / Social"
-            - "OTHER"
-      confidence:
-        type: number
-        minimum: 0
-        maximum: 1
-      evidence:
-        type: array
-        minItems: 0
-        maxItems: 3
-        items: { type: string }
-      rationale:
-        type: string
-        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
+  ## 예시 1: 무관 (장소만 언급)
+  query: 롯데호텔
+  title: TS손보, 교통사고 예방 캠페인...울산 롯데호텔 앞 교차로
+  description: TS손해보험이 교통사고 예방을 위한 캠페인을 울산 롯데호텔 앞 교차로에서 진행했다...
+  → brand_relevance: "무관" (주체=TS손보, 롯데호텔은 장소 지명일 뿐)
+  → sentiment_stage: "중립", danger_level: null, issue_category: null
 
-  category_final:
-    type: object
-    required: ["issue_category_final", "coverage_themes_final", "confidence", "decision_rule", "evidence", "rationale"]
-    additionalProperties: false
-    properties:
-      issue_category_final:
-        type: string
-        enum:
-          - "Safety / Incident"
-          - "Hygiene / Food"
-          - "Security / Privacy / IT"
-          - "Legal / Regulation"
-          - "Customer Dispute"
-          - "Service Quality / Operations"
-          - "Pricing / Commercial"
-          - "Labor / HR"
-          - "Governance / Ethics"
-          - "Reputation / PR"
-          - "OTHER"
-      coverage_themes_final:
-        type: array
-        minItems: 0
-        maxItems: 2
-        items:
-          type: string
-          enum:
-            - "Business / Performance"
-            - "Brand / Marketing"
-            - "Product / Offering"
-            - "Customer Experience"
-            - "Operations / Technology"
-            - "People / Organization"
-            - "Risk / Crisis"
-            - "ESG / Social"
-            - "OTHER"
-      confidence:
-        type: number
-        minimum: 0
-        maximum: 1
-      decision_rule:
-        type: string
-        description: "How you reconciled RB vs LLM (e.g., KEEP_RB, KEEP_LLM, PLAYBOOK_TIE_BREAK, USE_OTHER)."
-      evidence:
-        type: array
-        minItems: 0
-        maxItems: 3
-        items: { type: string }
-      rationale:
-        type: string
-        description: "판단 이유만 간결하게. 완전한 문장 불필요, 핵심 근거만."
+  ## 예시 2: 무관 (행사장소)
+  query: 롯데호텔
+  title: 동아대 RISE 성과교류회 개최...롯데호텔에서 열린
+  description: 동아대학교가 RISE 사업 성과교류회를 롯데호텔에서 개최했다...
+  → brand_relevance: "무관" (주체=동아대, 롯데호텔은 단순 행사장소)
+  → sentiment_stage: "중립", danger_level: null, issue_category: null
 
-prompts:
-  # 1) LLM-based sentiment (independent)
-  sentiment_llm:
-    system: |
-      You are a risk monitoring analyst. Follow the policy strictly. Output ONLY valid JSON.
-    user: |
-      POLICY (Sentiment):
-      {{policy_sentiment}}
+  ## 예시 3: 언급 (나열)
+  query: 롯데호텔
+  title: 롯데하이마트 잠실점 재단장...롯데호텔, 롯데백화점 등 롯데그룹 계열사
+  description: 롯데하이마트가 잠실점을 재단장하며 롯데호텔, 롯데백화점 등 계열사와 시너지를 모색한다...
+  → brand_relevance: "언급" (주체=롯데하이마트, 롯데호텔은 계열사 나열 중 하나)
+  → sentiment_stage: "중립"
 
-      ARTICLE (title + description):
-      - title: {{title}}
-      - description: {{description}}
+  ## 예시 4: 언급 (종목 나열)
+  query: 호텔롯데
+  title: 코스피 저평가 순환매...호텔신라(4.39%), 호텔롯데(2.1%)
+  description: 코스피 저평가 종목 순환매가 이어지며 호텔신라 4.39%, 호텔롯데 2.1% 상승...
+  → brand_relevance: "언급" (주체=코스피 시장, 호텔롯데는 종목 나열 중 하나)
+  → sentiment_stage: "긍정"
 
-      RULE-BASED CONTEXT (for reference):
-      - brand_mentions: {{brand_mentions}}
-      - brand_scope_rb: {{brand_scope_rb}}
-      - sentiment_rb: {{sentiment_rb}}
-      - reason_codes_rb: {{reason_codes_rb}}
-      - matched_rules_rb: {{matched_rules_rb}}
+  ## 예시 5: 관련 (브랜드 주체)
+  query: 롯데호텔
+  title: 롯데호텔, 2025년 글로벌 확장 전략 발표
+  description: 롯데호텔이 2025년 글로벌 시장 진출 확대 전략을 발표했다. 동남아 3개국에 신규 호텔을 오픈...
+  → brand_relevance: "관련" (주체=롯데호텔, 브랜드의 전략/행위가 핵심)
+  → sentiment_stage: "긍정"
 
-      Task:
-      Determine sentiment toward the brand using the 4-state scheme.
+  ## 예시 6: 관련 (부정 사건)
+  query: 신라호텔
+  title: 신라호텔 투숙객 식중독 발생...보건당국 조사
+  description: 신라호텔 레스토랑에서 투숙객 10여명이 식중독 증상을 보여 보건당국이 조사에 나섰다...
+  → brand_relevance: "관련" (주체=신라호텔, 브랜드 운영시설의 사고)
+  → sentiment_stage: "부정 확정", danger_level: "상", issue_category: "위생/식음"
 
-      Output JSON schema:
-      {{schema_sentiment_llm}}
+  # 출력 규칙
+  - 모든 출력은 한국어 (단, query_keywords는 검색어로 쓰기 좋게 고유명사/핵심어 위주)
+  - 과장/추측 금지. 근거가 부족하면 '판단 필요' 또는 '부정 후보'로 보수적으로 판단
+  - JSON 외 텍스트 절대 출력하지 않는다
 
-  # 2) Final sentiment arbitration (RB vs LLM)
-  sentiment_final:
-    system: |
-      You are the final arbiter. Recall-first. Prefer catching negatives over missing them. Output ONLY valid JSON.
-    user: |
-      POLICY (Sentiment):
-      {{policy_sentiment}}
+user_prompt_template: |
+  다음 기사를 분석하라. 아래 단계를 순서대로 따르되, reasoning 필드에 기록하라.
 
-      ARTICLE (title + description):
-      - title: {{title}}
-      - description: {{description}}
+  ## 입력 기사
+  - query: {{query}}
+  - group: {{group}}
+  - title: {{title}}
+  - description: {{description}}
 
-      CANDIDATE RESULTS:
-      - rule_based: {{sentiment_rb}}
-      - llm_based: {{sentiment_llm}}
+  ## 분석 단계
+  1. **article_subject**: 이 기사의 핵심 주체(주어)가 누구/무엇인지 파악하라.
+  2. **brand_role**: query 브랜드가 기사에서 어떤 역할인지 판단하라 (주체 / 배경장소 / 나열 / 무관).
+  3. **subject_test**: "기사에서 브랜드명(query)을 제거하면 기사 주제가 바뀌는가?" 테스트 결과를 적어라.
+  4. **sentiment_rationale**: 감정 판단의 근거를 1문장으로 적어라.
+  5. 위 분석을 바탕으로 최종 분류 필드를 채워라.
 
-      RULE-BASED EXPLANATION:
-      - brand_scope_rb: {{brand_scope_rb}}
-      - reason_codes_rb: {{reason_codes_rb}}
-      - matched_rules_rb: {{matched_rules_rb}}
+  JSON 스키마에 맞춰 출력하라.
 
-      Decide the FINAL sentiment.
-      If uncertain between NEUTRAL and NEGATIVE_CANDIDATE, choose NEGATIVE_CANDIDATE (recall-first).
+labels:
+  issue_category_kr:
+    - "안전/사고"
+    - "위생/식음"
+    - "보안/개인정보/IT"
+    - "법무/규제"
+    - "고객 분쟁"
+    - "서비스 품질/운영"
+    - "가격/상업"
+    - "노무/인사"
+    - "거버넌스/윤리"
+    - "평판/PR"
+    - "기타"
 
-      Output JSON schema:
-      {{schema_sentiment_final}}
-
-  # 3) LLM-based danger (only for BRAND_TARGETED + NEGATIVE_*)
-  danger_llm:
-    system: |
-      You are a crisis-response triage analyst. Follow the Danger policy strictly. Output ONLY valid JSON.
-    user: |
-      POLICY (Danger):
-      {{policy_danger}}
-
-      ARTICLE (title + description):
-      - title: {{title}}
-      - description: {{description}}
-
-      CONTEXT:
-      - brand_scope_rb: {{brand_scope_rb}}
-      - sentiment_final: {{sentiment_final}}
-      - reason_codes_rb: {{reason_codes_rb}}
-      - matched_rules_rb: {{matched_rules_rb}}
-
-      RULE-BASED DANGER CONTEXT:
-      - danger_rb: {{danger_rb}}
-      - risk_score_rb: {{risk_score_rb}}
-      - score_breakdown_rb: {{score_breakdown_rb}}
-
-      Task:
-      Determine danger level (D1/D2/D3) based on response necessity.
-
-      Output JSON schema:
-      {{schema_danger_llm}}
-
-  # 4) Final danger arbitration (RB vs LLM)
-  danger_final:
-    system: |
-      You are the final arbiter for danger. Use hard-trigger override for D3. Output ONLY valid JSON.
-    user: |
-      POLICY (Danger):
-      {{policy_danger}}
-
-      ARTICLE (title + description):
-      - title: {{title}}
-      - description: {{description}}
-
-      CANDIDATE RESULTS:
-      - rule_based: {{danger_rb}} (score={{risk_score_rb}})
-      - llm_based: {{danger_llm}}
-
-      RULE-BASED DETAILS:
-      - score_breakdown_rb: {{score_breakdown_rb}}
-      - reason_codes_rb: {{reason_codes_rb}}
-
-      Decide FINAL danger level.
-      If any hard-trigger is present in rule-based breakdown, choose D3.
-
-      Output JSON schema:
-      {{schema_danger_final}}
-
-  # -----------------------
-  # 5) LLM-based category (NEW)
-  # -----------------------
-  category_llm:
-    system: |
-      You are a monitoring analyst. Categorize for response playbooks and reporting. Output ONLY valid JSON.
-    user: |
-      POLICY (Category):
-      {{policy_category}}
-
-      ARTICLE (title + description):
-      - title: {{title}}
-      - description: {{description}}
-
-      CONTEXT:
-      - brand_scope_rb: {{brand_scope_rb}}
-      - sentiment_final: {{sentiment_final}}
-      - danger_final: {{danger_final}}
-      - reason_codes_rb: {{reason_codes_rb}}
-
-      RULE-BASED CATEGORY CONTEXT (for reference):
-      - issue_category_rb: {{issue_category_rb}}
-      - coverage_themes_rb: {{coverage_themes_rb}}
-      - matched_rules_rb: {{matched_rules_rb}}
-
-      Task:
-      1) Choose ONE Issue Category (or OTHER).
-      2) Choose up to TWO Coverage Themes (or OTHER).
-      Provide rationale + up to 3 evidence snippets.
-
-      Output JSON schema:
-      {{schema_category_llm}}
-
-  # -----------------------
-  # 6) Final category arbitration (RB vs LLM) (NEW)
-  # -----------------------
-  category_final:
-    system: |
-      You are the final arbiter for category. Prefer the most operationally actionable playbook. Output ONLY valid JSON.
-    user: |
-      POLICY (Category):
-      {{policy_category}}
-
-      ARTICLE (title + description):
-      - title: {{title}}
-      - description: {{description}}
-
-      CANDIDATE RESULTS:
-      - rule_based_issue: {{issue_category_rb}}
-      - rule_based_themes: {{coverage_themes_rb}}
-      - llm_based_issue: {{issue_category_llm}}
-      - llm_based_themes: {{coverage_themes_llm}}
-
-      RULE-BASED DETAILS:
-      - reason_codes_rb: {{reason_codes_rb}}
-      - matched_rules_rb: {{matched_rules_rb}}
-
-      Decide FINAL:
-      - ONE Issue Category (or OTHER)
-      - up to TWO Coverage Themes (or OTHER)
-      If tied, choose the category that implies the clearest response playbook.
-      Use OTHER only if none fits.
-
-      Output JSON schema:
-      {{schema_category_final}}
+  news_category_kr:
+    - "PR/보도자료"
+    - "사업/실적"
+    - "브랜드/마케팅"
+    - "상품/오퍼링"
+    - "고객 경험"
+    - "운영/기술"
+    - "인사/조직"
+    - "리스크/위기"
+    - "ESG/사회"
+    - "기타"

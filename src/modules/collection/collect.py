@@ -68,6 +68,9 @@ def fetch_naver_paginated(query: str, display: int, max_pages: int, sort: str,
     """
     페이지네이션을 통해 여러 페이지의 기사 수집
 
+    중복 링크는 skip하고 페이지 끝까지 검사
+    페이지네이션 중단: (A) 해당 페이지 새 기사 0개 또는 (B) 연속 N페이지 새 기사 0개
+
     Args:
         query: 검색어
         display: 한 페이지당 가져올 개수 (기본: 100)
@@ -82,6 +85,8 @@ def fetch_naver_paginated(query: str, display: int, max_pages: int, sort: str,
     """
     all_items = []
     existing_links = existing_links or set()
+    consecutive_empty_pages = 0  # 연속 빈 페이지 카운터
+    max_consecutive_empty = 3  # 연속 빈 페이지 허용 한계
 
     for page in range(1, max_pages + 1):
         start = (page - 1) * display + 1
@@ -93,25 +98,35 @@ def fetch_naver_paginated(query: str, display: int, max_pages: int, sort: str,
             print(" (no more articles)")
             break
 
-        # 중복 체크: 기존 링크와 중복되는 article이 발견되면 조기 종료
-        duplicate_found = False
+        # 중복 체크: 중복은 skip, 새 기사만 수집
         new_items = []
+        dup_count = 0
         for item in items:
             item_link = item.get("link", "")
             if item_link in existing_links:
-                duplicate_found = True
-                break
+                dup_count += 1
+                continue  # 중복은 skip, 다음 기사 검사
             new_items.append(item)
             existing_links.add(item_link)
 
         all_items.extend(new_items)
-        print(f" {len(new_items)} articles", end="")
+        new_count = len(new_items)
 
-        if duplicate_found:
-            print(" (중복 발견, 수집 중단)")
-            break
+        # 로그 출력
+        print(f" {new_count} new, {dup_count} dup", end="")
 
-        print()
+        # 중단 조건 A: 해당 페이지에서 새 기사 0개
+        if new_count == 0:
+            consecutive_empty_pages += 1
+            print(f" (새 기사 0개, 연속 {consecutive_empty_pages}/{max_consecutive_empty})")
+
+            # 중단 조건 B: 연속 N페이지 새 기사 0개
+            if consecutive_empty_pages >= max_consecutive_empty:
+                print(f"    ⚠️  연속 {consecutive_empty_pages}페이지 새 기사 없음 → 수집 중단")
+                break
+        else:
+            consecutive_empty_pages = 0  # 새 기사 있으면 카운터 리셋
+            print()
 
         # 페이지 간 요청 사이에 딜레이 (Rate limiting)
         if page < max_pages:
@@ -123,12 +138,14 @@ def fetch_naver_paginated(query: str, display: int, max_pages: int, sort: str,
 def collect_all_news(brands: List[str], competitors: List[str],
                      display: int, max_pages: int, sort: str,
                      naver_id: str, naver_secret: str,
-                     raw_csv_path: str = None) -> pd.DataFrame:
+                     raw_csv_path: str = None,
+                     spreadsheet = None) -> pd.DataFrame:
     """
-    모든 브랜드와 경쟁사 뉴스 수집
+    모든 브랜드와 경쟁사 뉴스 수집 (각 브랜드마다 즉시 저장)
 
     Args:
         raw_csv_path: raw.csv 파일 경로 (중복 체크용, 선택사항)
+        spreadsheet: Google Sheets 객체 (즉시 동기화용, 선택사항)
 
     Returns:
         DataFrame with columns: query, group, title, description, pubDate, originallink, link
@@ -151,8 +168,9 @@ def collect_all_news(brands: List[str], competitors: List[str],
     for query in brands:
         print(f"  → {query}")
         items = fetch_naver_paginated(query, display, max_pages, sort, naver_id, naver_secret, existing_links)
+        brand_rows = []
         for item in items:
-            all_rows.append({
+            brand_rows.append({
                 "query": query,
                 "group": "OUR",
                 "title": item.get("title", ""),
@@ -161,6 +179,12 @@ def collect_all_news(brands: List[str], competitors: List[str],
                 "originallink": item.get("originallink", ""),
                 "link": item.get("link", "")
             })
+        all_rows.extend(brand_rows)
+
+        # 각 브랜드 수집 완료 시 즉시 저장
+        if brand_rows:
+            _save_immediately(brand_rows, raw_csv_path, spreadsheet)
+
         time.sleep(0.1)  # Rate limit 방지
 
     # 경쟁사 수집
@@ -168,8 +192,9 @@ def collect_all_news(brands: List[str], competitors: List[str],
     for query in competitors:
         print(f"  → {query}")
         items = fetch_naver_paginated(query, display, max_pages, sort, naver_id, naver_secret, existing_links)
+        competitor_rows = []
         for item in items:
-            all_rows.append({
+            competitor_rows.append({
                 "query": query,
                 "group": "COMPETITOR",
                 "title": item.get("title", ""),
@@ -178,8 +203,60 @@ def collect_all_news(brands: List[str], competitors: List[str],
                 "originallink": item.get("originallink", ""),
                 "link": item.get("link", "")
             })
+        all_rows.extend(competitor_rows)
+
+        # 각 경쟁사 수집 완료 시 즉시 저장
+        if competitor_rows:
+            _save_immediately(competitor_rows, raw_csv_path, spreadsheet)
+
         time.sleep(0.1)
 
     df = pd.DataFrame(all_rows)
     print(f"\n✅ 총 {len(df)}개 기사 수집 완료")
     return df
+
+
+def _save_immediately(rows: List[Dict], raw_csv_path: str = None, spreadsheet = None):
+    """
+    수집한 기사를 즉시 CSV와 Google Sheets에 저장
+
+    Args:
+        rows: 저장할 기사 리스트
+        raw_csv_path: CSV 파일 경로
+        spreadsheet: Google Sheets 객체
+    """
+    if not rows:
+        return
+
+    df_new = pd.DataFrame(rows)
+    query = rows[0].get("query", "")
+
+    # CSV 저장
+    if raw_csv_path:
+        try:
+            file_exists = Path(raw_csv_path).exists()
+            df_new.to_csv(
+                raw_csv_path,
+                mode='a' if file_exists else 'w',
+                header=not file_exists,
+                index=False,
+                encoding='utf-8-sig'
+            )
+            print(f"    💾 CSV 저장: {len(rows)}개 기사")
+        except Exception as e:
+            print(f"    ⚠️  CSV 저장 실패: {e}")
+
+    # Google Sheets 동기화
+    if spreadsheet:
+        try:
+            # sync_to_sheets를 동적으로 임포트 (순환 참조 방지)
+            from src.modules.export.sheets import sync_to_sheets
+
+            # 전체 raw.csv를 다시 읽어서 동기화 (중복 체크 자동)
+            if raw_csv_path and Path(raw_csv_path).exists():
+                df_all = pd.read_csv(raw_csv_path, encoding='utf-8-sig')
+                sync_result = sync_to_sheets(df_all, spreadsheet, "raw_data")
+                if sync_result['added'] > 0:
+                    print(f"    ☁️  Sheets 동기화: {sync_result['added']}개 추가")
+        except Exception as e:
+            print(f"    ⚠️  Sheets 동기화 실패: {e}")

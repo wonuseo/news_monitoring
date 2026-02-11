@@ -8,14 +8,13 @@ AI를 통한 카테고리화 및 위험도 판단
 
 import json
 import time
-import re
 import requests
 from datetime import datetime
 from typing import Dict, List, Tuple
 import pandas as pd
 
 
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_API_URL = "https://api.openai.com/v1/responses"
 
 # 한국어 카테고리
 CATEGORIES = [
@@ -53,21 +52,40 @@ def call_openai_batch(articles: List[Dict], task_type: str, openai_key: str,
 
 기사 목록:{articles_text}
 
-JSON 배열만 반환하세요:
-[
-  {{"id": 0, "sentiment": "긍정"}},
-  {{"id": 1, "sentiment": "부정"}},
-  ...
-]
+JSON 객체만 반환하세요:
+{{
+  "results": [
+    {{"id": 0, "sentiment": "긍정"}},
+    {{"id": 1, "sentiment": "부정"}}
+  ]
+}}
 
 감정 분류 기준:
 - 긍정: 좋은 소식, 성과, 수상, 성장 등
 - 중립: 일반 소식, 사실 전달
 - 부정: 사고, 논란, 비판, 손실 등
 
-JSON 배열만 출력하세요."""
+JSON 객체만 출력하세요."""
         
-        max_tokens = len(articles) * 20
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["results"],
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["id", "sentiment"],
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "sentiment": {"type": "string", "enum": ["긍정", "중립", "부정"]}
+                        }
+                    }
+                }
+            }
+        }
     
     elif task_type == "categorize":
         # 2단계: 카테고리 분류
@@ -79,12 +97,13 @@ JSON 배열만 출력하세요."""
 
 기사 목록:{articles_text}
 
-JSON 배열만 반환하세요:
-[
-  {{"id": 0, "category": "제품/서비스"}},
-  {{"id": 1, "category": "안전/사고"}},
-  ...
-]
+JSON 객체만 반환하세요:
+{{
+  "results": [
+    {{"id": 0, "category": "제품/서비스"}},
+    {{"id": 1, "category": "안전/사고"}}
+  ]
+}}
 
 카테고리 (하나만 선택):
 - 법률/규제: 법적 문제, 규제, 소송, 조사
@@ -95,9 +114,27 @@ JSON 배열만 반환하세요:
 - 평판/SNS: 여론, SNS 이슈, 불매운동, 고객 불만
 - 운영/기타: 일반 운영, 인사, 기타
 
-JSON 배열만 출력하세요."""
+JSON 객체만 출력하세요."""
         
-        max_tokens = len(articles) * 25
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["results"],
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["id", "category"],
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "category": {"type": "string", "enum": CATEGORIES}
+                        }
+                    }
+                }
+            }
+        }
     
     else:  # risk_assess
         # 3단계: 위험도 평가 (부정 기사만)
@@ -109,12 +146,13 @@ JSON 배열만 출력하세요."""
 
 부정 기사 목록:{articles_text}
 
-JSON 배열만 반환하세요:
-[
-  {{"id": 0, "risk_level": "상", "reason": "화재 사고"}},
-  {{"id": 1, "risk_level": "중", "reason": "고객 불만"}},
-  ...
-]
+JSON 객체만 반환하세요:
+{{
+  "results": [
+    {{"id": 0, "risk_level": "상", "reason": "화재 사고"}},
+    {{"id": 1, "risk_level": "중", "reason": "고객 불만"}}
+  ]
+}}
 
 위험도 기준:
 - 상: 즉각 대응 필요. 사망/화재/대규모 유출/영업정지/집단소송 등
@@ -123,9 +161,28 @@ JSON 배열만 반환하세요:
 
 이유(reason)는 3-5단어로 간결하게 작성하세요.
 
-JSON 배열만 출력하세요."""
+JSON 객체만 출력하세요."""
         
-        max_tokens = len(articles) * 35
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["results"],
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["id", "risk_level", "reason"],
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "risk_level": {"type": "string", "enum": ["상", "중", "하"]},
+                            "reason": {"type": "string", "maxLength": 30}
+                        }
+                    }
+                }
+            }
+        }
     
     headers = {
         "Content-Type": "application/json",
@@ -133,12 +190,19 @@ JSON 배열만 출력하세요."""
     }
     
     payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": "당신은 정확한 JSON 응답만 제공하는 어시스턴트입니다."},
-            {"role": "user", "content": prompt}
+        "model": "gpt-5-nano",
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": "당신은 정확한 JSON 응답만 제공하는 어시스턴트입니다."}]},
+            {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
         ],
-        "max_tokens": max_tokens
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": f"classify_{task_type}",
+                "strict": True,
+                "schema": schema
+            }
+        },
     }
     
     try:
@@ -158,15 +222,21 @@ JSON 배열만 출력하세요."""
         
         response.raise_for_status()
         data = response.json()
-        
-        content = data["choices"][0]["message"]["content"].strip()
-        
-        # Markdown 코드 블록 제거
-        if content.startswith("```"):
-            content = re.sub(r'^```json?\s*', '', content)
-            content = re.sub(r'\s*```$', '', content)
-        
-        results = json.loads(content)
+        content = data.get("output_text", "").strip()
+        if not content:
+            output = data.get("output", [])
+            if output:
+                contents = output[0].get("content", [])
+                for item in contents:
+                    if item.get("type") == "output_text" and item.get("text"):
+                        content = item["text"].strip()
+                        break
+
+        if not content:
+            raise KeyError("Responses API 응답에서 output_text를 찾을 수 없습니다.")
+
+        parsed = json.loads(content)
+        results = parsed.get("results", [])
         
         # 리스트를 딕셔너리로 변환 {id: result}
         result_dict = {}

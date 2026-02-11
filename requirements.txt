@@ -13,12 +13,6 @@ six==1.17.0
 tzdata==2025.3
 urllib3==2.6.3
 
-# Web scraping with browser automation
-playwright==1.40.0
-
-# Article text extraction
-newspaper3k==0.2.8
-
 # Google Sheets integration
 gspread==6.0.2
 google-auth==2.27.0
@@ -34,3 +28,6 @@ PyYAML==6.0.1
 
 # Progress bar
 tqdm==4.66.1
+
+# Korean morphological analysis for keyword extraction
+kiwipiepy==0.17.0

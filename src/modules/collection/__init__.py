@@ -1,3 +1,2 @@
-"""STEP 1: Data Collection from APIs and Web Scraping"""
+"""STEP 1: Data Collection from APIs"""
 from .collect import *
-from .scrape import *

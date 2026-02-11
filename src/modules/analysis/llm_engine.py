@@ -1,18 +1,43 @@
 """
-llm_engine.py - LLM-Based Analysis Engine
-prompts.yaml 기반 OpenAI Structured Output 호출
+llm_engine.py - LLM-Based Analysis Engine (Simplified)
+prompts.yaml 기반 단일 OpenAI 호출로 전체 분류 수행
 """
 
 import json
 import time
-import re
 import yaml
 import requests
 from pathlib import Path
 from typing import Dict, List, Optional
 
 
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_API_URL = "https://api.openai.com/v1/responses"
+
+
+def load_api_models(yaml_path: Path = None) -> dict:
+    """
+    api_models.yaml 로드
+
+    Args:
+        yaml_path: api_models.yaml 경로 (기본값: src/api_models.yaml)
+
+    Returns:
+        models 딕셔너리
+    """
+    if yaml_path is None:
+        yaml_path = Path(__file__).parent.parent.parent / "api_models.yaml"
+
+    try:
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+            return config.get("models", {})
+    except FileNotFoundError:
+        print(f"⚠️  {yaml_path} 파일을 찾을 수 없습니다. 기본 모델(gpt-5-nano) 사용")
+        return {
+            "article_classification": "gpt-5-nano",
+            "media_classification": "gpt-5-nano",
+            "press_release_summary": "gpt-5-nano"
+        }
 
 
 def load_prompts(yaml_path: Path = None) -> dict:
@@ -34,7 +59,7 @@ def load_prompts(yaml_path: Path = None) -> dict:
 
 def render_prompt(template: str, context: Dict) -> str:
     """
-    Jinja2-style 템플릿 렌더링 (간단한 {{variable}} 치환)
+    간단한 {{variable}} 치환 렌더링
 
     Args:
         template: 프롬프트 템플릿
@@ -46,12 +71,7 @@ def render_prompt(template: str, context: Dict) -> str:
     result = template
     for key, value in context.items():
         placeholder = f"{{{{{key}}}}}"
-        # Convert lists/dicts to JSON string
-        if isinstance(value, (list, dict)):
-            value_str = json.dumps(value, ensure_ascii=False, indent=2)
-        else:
-            value_str = str(value)
-        result = result.replace(placeholder, value_str)
+        result = result.replace(placeholder, str(value))
     return result
 
 
@@ -60,23 +80,27 @@ def call_openai_structured(
     user_prompt: str,
     response_schema: dict,
     openai_key: str,
-    model: str = "gpt-4o-mini",
-    retry: bool = True
+    model: str = None,
+    max_retries: int = 5
 ) -> Optional[Dict]:
     """
-    OpenAI Structured Output 호출
+    OpenAI Structured Output 호출 (5회 max retry 지원)
 
     Args:
         system_prompt: 시스템 프롬프트
         user_prompt: 유저 프롬프트
         response_schema: JSON schema for response format
         openai_key: OpenAI API 키
-        model: 모델명
-        retry: 재시도 여부
+        model: 모델명 (None이면 api_models.yaml에서 로드)
+        max_retries: 최대 재시도 횟수 (기본: 5)
 
     Returns:
         파싱된 JSON 응답 또는 None (실패시)
     """
+    if model is None:
+        api_models = load_api_models()
+        model = api_models.get("article_classification", "gpt-5-nano")
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {openai_key}"
@@ -84,13 +108,13 @@ def call_openai_structured(
 
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
+        "text": {
+            "format": {
+                "type": "json_schema",
                 "name": "analysis_result",
                 "strict": True,
                 "schema": response_schema
@@ -98,612 +122,295 @@ def call_openai_structured(
         }
     }
 
-    try:
-        response = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=60)
+    last_error = None
 
-        if response.status_code == 401:
-            raise RuntimeError("OpenAI API 인증 실패 (401). API 키를 확인하세요.")
-        elif response.status_code == 429:
-            try:
-                error_detail = response.json()
-                print(f"⚠️  OpenAI 요청 한도 초과 (429): {error_detail}")
-            except:
-                print(f"⚠️  OpenAI 요청 한도 초과 (429). 응답: {response.text[:200]}")
-            print("5초 대기 중...")
-            time.sleep(5)
-            if retry:
-                return call_openai_structured(
-                    system_prompt, user_prompt, response_schema,
-                    openai_key, model, retry=False
-                )
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=60)
+
+            if response.status_code == 401:
+                raise RuntimeError("OpenAI API 인증 실패 (401). API 키를 확인하세요.")
+            elif response.status_code == 429:
+                print(f"⚠️  OpenAI 요청 한도 초과 (429) - 시도 {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 5초 → 10초 → 20초 → 40초 → 80초
+                    wait_time = 5 * (2 ** attempt)
+                    print(f"   {wait_time}초 대기 후 재시도...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise RuntimeError("OpenAI 요청 한도 초과 (5회 재시도 후에도 실패)")
+            elif response.status_code == 400:
+                try:
+                    error_detail = response.json()
+                    raise RuntimeError(f"OpenAI 요청 오류 (400): {error_detail}")
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"OpenAI 요청 오류 (400): {response.text[:200]}")
+            elif response.status_code >= 500:
+                print(f"⚠️  OpenAI 서버 오류 ({response.status_code}) - 시도 {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (2 ** attempt)
+                    print(f"   {wait_time}초 대기 후 재시도...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise RuntimeError(f"OpenAI 서버 오류 ({response.status_code}, 5회 재시도 후에도 실패)")
+
+            response.raise_for_status()
+            data = response.json()
+
+            content = data.get("output_text", "").strip()
+            if not content:
+                output = data.get("output", [])
+                if output:
+                    contents = output[0].get("content", [])
+                    for item in contents:
+                        if item.get("type") == "output_text" and item.get("text"):
+                            content = item["text"].strip()
+                            break
+
+            if not content:
+                raise KeyError("Responses API 응답에서 output_text를 찾을 수 없습니다.")
+
+            result = json.loads(content)
+
+            return result
+
+        except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException) as e:
+            last_error = e
+            print(f"⚠️  OpenAI 호출 오류 - 시도 {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                wait_time = 2 * (2 ** attempt)
+                print(f"   {wait_time}초 대기 후 재시도...")
+                time.sleep(wait_time)
+                continue
             else:
-                raise RuntimeError("OpenAI 요청 한도 초과 (재시도 후에도 실패)")
-        elif response.status_code == 400:
-            # Bad request - 보통 잘못된 모델명이나 파라미터
-            try:
-                error_detail = response.json()
-                raise RuntimeError(f"OpenAI 요청 오류 (400): {error_detail}")
-            except json.JSONDecodeError:
-                raise RuntimeError(f"OpenAI 요청 오류 (400): {response.text[:200]}")
-        elif response.status_code >= 500:
-            raise RuntimeError(f"OpenAI 서버 오류 ({response.status_code})")
+                print(f"❌ 5회 재시도 후에도 실패: {last_error}")
+                return None
 
-        response.raise_for_status()
-        data = response.json()
+    return None
 
-        content = data["choices"][0]["message"]["content"].strip()
-        result = json.loads(content)
 
+def build_response_schema() -> dict:
+    """
+    JSON Schema 생성 (reasoning 필드를 첫 번째로 배치하여 CoT 유도)
+
+    OpenAI Structured Output은 스키마 순서대로 생성하므로,
+    reasoning을 먼저 생성하게 하여 분류 품질을 향상시킨다.
+
+    Returns:
+        JSON Schema 딕셔너리
+    """
+    return {
+        "type": "object",
+        "required": [
+            "reasoning",
+            "brand_relevance",
+            "brand_relevance_query_keywords",
+            "sentiment_stage",
+            "danger_level",
+            "issue_category",
+            "news_category",
+            "news_keyword_summary"
+        ],
+        "additionalProperties": False,
+        "properties": {
+            "reasoning": {
+                "type": "object",
+                "description": "분석 추론 과정 (내부용, 저장하지 않음)",
+                "required": [
+                    "article_subject",
+                    "brand_role",
+                    "subject_test",
+                    "sentiment_rationale"
+                ],
+                "additionalProperties": False,
+                "properties": {
+                    "article_subject": {
+                        "type": "string",
+                        "description": "기사의 핵심 주체 (예: 'TS손해보험', '롯데호텔')"
+                    },
+                    "brand_role": {
+                        "type": "string",
+                        "enum": ["주체", "배경장소", "나열", "무관"],
+                        "description": "query 브랜드의 기사 내 역할"
+                    },
+                    "subject_test": {
+                        "type": "string",
+                        "description": "주체 테스트 결과: 브랜드명 제거 시 기사 주제 변화 여부"
+                    },
+                    "sentiment_rationale": {
+                        "type": "string",
+                        "description": "감정 판단 근거 1문장"
+                    }
+                }
+            },
+            "brand_relevance": {
+                "type": "string",
+                "enum": ["관련", "언급", "무관", "판단 필요"]
+            },
+            "brand_relevance_query_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 0,
+                "maxItems": 3
+            },
+            "sentiment_stage": {
+                "type": "string",
+                "enum": ["긍정", "중립", "부정 후보", "부정 확정"]
+            },
+            "danger_level": {
+                "type": ["string", "null"],
+                "enum": ["상", "중", "하", None]
+            },
+            "issue_category": {
+                "type": ["string", "null"],
+                "enum": [
+                    "안전/사고",
+                    "위생/식음",
+                    "보안/개인정보/IT",
+                    "법무/규제",
+                    "고객 분쟁",
+                    "서비스 품질/운영",
+                    "가격/상업",
+                    "노무/인사",
+                    "거버넌스/윤리",
+                    "평판/PR",
+                    "기타",
+                    None
+                ]
+            },
+            "news_category": {
+                "type": "string",
+                "enum": [
+                    "사업/실적",
+                    "브랜드/마케팅",
+                    "상품/오퍼링",
+                    "고객 경험",
+                    "운영/기술",
+                    "인사/조직",
+                    "리스크/위기",
+                    "ESG/사회",
+                    "기타"
+                ]
+            },
+            "news_keyword_summary": {
+                "type": "string",
+                "maxLength": 50
+            }
+        }
+    }
+
+
+def _post_process_result(result: Dict) -> Dict:
+    """
+    LLM 출력의 논리적 일관성 보장을 위한 후처리
+
+    규칙:
+    1. brand_relevance="무관" → sentiment="중립", danger=null, issue=null
+    2. danger_level은 (관련/언급) + (부정 후보/부정 확정)일 때만 유효
+    3. reasoning 필드 제거
+
+    Args:
+        result: LLM 원본 응답 딕셔너리
+
+    Returns:
+        후처리된 결과 (reasoning 제거됨)
+    """
+    if not result:
         return result
 
-    except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException) as e:
-        print(f"⚠️  OpenAI 호출 오류: {e}")
-        if retry:
-            print("재시도 중...")
-            time.sleep(2)
-            return call_openai_structured(
-                system_prompt, user_prompt, response_schema,
-                openai_key, model, retry=False
-            )
-        else:
-            return None
+    # reasoning 필드 제거 (LLM 내부 추론용으로만 사용)
+    result.pop("reasoning", None)
 
+    brand_rel = result.get("brand_relevance", "")
+    sentiment = result.get("sentiment_stage", "")
 
-def analyze_sentiment_llm(
-    article: Dict,
-    rb_result: Dict,
-    prompts_config: dict,
-    openai_key: str
-) -> Optional[Dict]:
-    """
-    LLM 기반 감정 분석 (독립 판단)
+    # 규칙 1: 무관 → 중립, danger/issue null
+    if brand_rel == "무관":
+        result["sentiment_stage"] = "중립"
+        result["danger_level"] = None
+        result["issue_category"] = None
 
-    Model: gpt-5-nano (1차 판단용)
-
-    Args:
-        article: {"title": ..., "description": ...}
-        rb_result: Rule-Based 결과
-        prompts_config: prompts.yaml 딕셔너리
-        openai_key: OpenAI API 키
-
-    Returns:
-        {
-            "sentiment_llm": "NEGATIVE_CONFIRMED",
-            "confidence": 0.95,
-            "evidence": [...],
-            "rationale": "..."
-        }
-    """
-    prompt_config = prompts_config["prompts"]["sentiment_llm"]
-    system_prompt = prompt_config["system"]
-
-    # User prompt context
-    context = {
-        "policy_sentiment": prompts_config["policy_text"]["sentiment"],
-        "title": article.get("title", ""),
-        "description": article.get("description", ""),
-        "brand_mentions": rb_result.get("brand_mentions", {}),
-        "brand_scope_rb": rb_result.get("brand_scope_rb", ""),
-        "sentiment_rb": rb_result.get("sentiment_rb", ""),
-        "reason_codes_rb": rb_result.get("reason_codes_rb", []),
-        "matched_rules_rb": rb_result.get("matched_rules_rb", []),
-        "schema_sentiment_llm": prompts_config["output_schemas"]["sentiment_llm"]
-    }
-
-    user_prompt = render_prompt(prompt_config["user"], context)
-
-    # Call OpenAI (1차 판단 - gpt-5-nano)
-    response_schema = prompts_config["output_schemas"]["sentiment_llm"]
-    result = call_openai_structured(
-        system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-5-nano"
-    )
-
-    return result
-
-
-def analyze_sentiment_final(
-    article: Dict,
-    rb_result: Dict,
-    llm_result: Dict,
-    prompts_config: dict,
-    openai_key: str
-) -> Optional[Dict]:
-    """
-    LLM 기반 최종 감정 판단 (RB vs LLM 조정)
-
-    Model: gpt-5-mini (Final 판단용 - RB≠LLM일 때만 호출)
-
-    Args:
-        article: {"title": ..., "description": ...}
-        rb_result: Rule-Based 결과
-        llm_result: LLM 결과
-        prompts_config: prompts.yaml 딕셔너리
-        openai_key: OpenAI API 키
-
-    Returns:
-        {
-            "sentiment_final": "NEGATIVE_CONFIRMED",
-            "confidence": 0.95,
-            "decision_rule": "...",
-            "evidence": [...],
-            "rationale": "..."
-        }
-    """
-    prompt_config = prompts_config["prompts"]["sentiment_final"]
-    system_prompt = prompt_config["system"]
-
-    # User prompt context
-    context = {
-        "policy_sentiment": prompts_config["policy_text"]["sentiment"],
-        "title": article.get("title", ""),
-        "description": article.get("description", ""),
-        "sentiment_rb": rb_result.get("sentiment_rb", ""),
-        "sentiment_llm": llm_result.get("sentiment_llm", "") if llm_result else "",
-        "brand_scope_rb": rb_result.get("brand_scope_rb", ""),
-        "reason_codes_rb": rb_result.get("reason_codes_rb", []),
-        "matched_rules_rb": rb_result.get("matched_rules_rb", []),
-        "schema_sentiment_final": prompts_config["output_schemas"]["sentiment_final"]
-    }
-
-    user_prompt = render_prompt(prompt_config["user"], context)
-
-    # Call OpenAI (Final 판단 - gpt-5-mini)
-    response_schema = prompts_config["output_schemas"]["sentiment_final"]
-    result = call_openai_structured(
-        system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-5-mini"
-    )
-
-    return result
-
-
-def analyze_danger_llm(
-    article: Dict,
-    rb_result: Dict,
-    sentiment_final: str,
-    prompts_config: dict,
-    openai_key: str
-) -> Optional[Dict]:
-    """
-    LLM 기반 위험도 분석 (독립 판단)
-
-    Model: gpt-5-nano (1차 판단용)
-
-    Args:
-        article: {"title": ..., "description": ...}
-        rb_result: Rule-Based 결과
-        sentiment_final: 최종 감정 결과
-        prompts_config: prompts.yaml 딕셔너리
-        openai_key: OpenAI API 키
-
-    Returns:
-        {
-            "danger_llm": "D3",
-            "confidence": 0.9,
-            "evidence": [...],
-            "rationale": "..."
-        }
-    """
-    # Danger는 BRAND_TARGETED + NEGATIVE_* 조건에서만 실행
-    brand_scope = rb_result.get("brand_scope_rb", "")
-    if brand_scope != "BRAND_TARGETED":
-        return None
-
-    if sentiment_final not in ["NEGATIVE_CANDIDATE", "NEGATIVE_CONFIRMED"]:
-        return None
-
-    prompt_config = prompts_config["prompts"]["danger_llm"]
-    system_prompt = prompt_config["system"]
-
-    # User prompt context
-    context = {
-        "policy_danger": prompts_config["policy_text"]["danger"],
-        "title": article.get("title", ""),
-        "description": article.get("description", ""),
-        "brand_scope_rb": brand_scope,
-        "sentiment_final": sentiment_final,
-        "reason_codes_rb": rb_result.get("reason_codes_rb", []),
-        "matched_rules_rb": rb_result.get("matched_rules_rb", []),
-        "danger_rb": rb_result.get("danger_rb", ""),
-        "risk_score_rb": rb_result.get("risk_score_rb", 0),
-        "score_breakdown_rb": rb_result.get("score_breakdown_rb", {}),
-        "schema_danger_llm": prompts_config["output_schemas"]["danger_llm"]
-    }
-
-    user_prompt = render_prompt(prompt_config["user"], context)
-
-    # Call OpenAI (1차 판단 - gpt-5-nano)
-    response_schema = prompts_config["output_schemas"]["danger_llm"]
-    result = call_openai_structured(
-        system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-5-nano"
-    )
-
-    return result
-
-
-def analyze_danger_final(
-    article: Dict,
-    rb_result: Dict,
-    llm_result: Dict,
-    prompts_config: dict,
-    openai_key: str
-) -> Optional[Dict]:
-    """
-    LLM 기반 최종 위험도 판단 (RB vs LLM 조정)
-
-    Model: gpt-5-mini (Final 판단용 - RB≠LLM일 때만 호출)
-
-    Args:
-        article: {"title": ..., "description": ...}
-        rb_result: Rule-Based 결과
-        llm_result: LLM 결과 (danger_llm)
-        prompts_config: prompts.yaml 딕셔너리
-        openai_key: OpenAI API 키
-
-    Returns:
-        {
-            "danger_final": "D3",
-            "confidence": 0.95,
-            "decision_rule": "...",
-            "evidence": [...],
-            "rationale": "..."
-        }
-    """
-    if llm_result is None:
-        return None
-
-    prompt_config = prompts_config["prompts"]["danger_final"]
-    system_prompt = prompt_config["system"]
-
-    # User prompt context
-    context = {
-        "policy_danger": prompts_config["policy_text"]["danger"],
-        "title": article.get("title", ""),
-        "description": article.get("description", ""),
-        "danger_rb": rb_result.get("danger_rb", ""),
-        "risk_score_rb": rb_result.get("risk_score_rb", 0),
-        "danger_llm": llm_result.get("danger_llm", "") if llm_result else "",
-        "score_breakdown_rb": rb_result.get("score_breakdown_rb", {}),
-        "reason_codes_rb": rb_result.get("reason_codes_rb", []),
-        "schema_danger_final": prompts_config["output_schemas"]["danger_final"]
-    }
-
-    user_prompt = render_prompt(prompt_config["user"], context)
-
-    # Call OpenAI (Final 판단 - gpt-5-mini)
-    response_schema = prompts_config["output_schemas"]["danger_final"]
-    result = call_openai_structured(
-        system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-5-mini"
-    )
-
-    return result
-
-
-def analyze_category_llm(
-    article: Dict,
-    rb_result: Dict,
-    sentiment_final: str,
-    danger_final: str,
-    prompts_config: dict,
-    openai_key: str
-) -> Optional[Dict]:
-    """
-    LLM 기반 카테고리 분석 (독립 판단)
-
-    Model: gpt-5-nano (1차 판단용)
-
-    Args:
-        article: {"title": ..., "description": ...}
-        rb_result: Rule-Based 결과
-        sentiment_final: 최종 감정 결과
-        danger_final: 최종 위험도 결과
-        prompts_config: prompts.yaml 딕셔너리
-        openai_key: OpenAI API 키
-
-    Returns:
-        {
-            "issue_category_llm": "Safety / Incident",
-            "coverage_themes_llm": ["Risk / Crisis", "Operations / Technology"],
-            "confidence": 0.9,
-            "evidence": [...],
-            "rationale": "..."
-        }
-    """
-    prompt_config = prompts_config["prompts"]["category_llm"]
-    system_prompt = prompt_config["system"]
-
-    # User prompt context
-    context = {
-        "policy_category": prompts_config["policy_text"]["category"],
-        "title": article.get("title", ""),
-        "description": article.get("description", ""),
-        "brand_scope_rb": rb_result.get("brand_scope_rb", ""),
-        "sentiment_final": sentiment_final,
-        "danger_final": danger_final,
-        "reason_codes_rb": rb_result.get("reason_codes_rb", []),
-        "issue_category_rb": rb_result.get("issue_category_rb", ""),
-        "coverage_themes_rb": rb_result.get("coverage_themes_rb", []),
-        "matched_rules_rb": rb_result.get("matched_rules_rb", []),
-        "schema_category_llm": prompts_config["output_schemas"]["category_llm"]
-    }
-
-    user_prompt = render_prompt(prompt_config["user"], context)
-
-    # Call OpenAI (1차 판단 - gpt-5-nano)
-    response_schema = prompts_config["output_schemas"]["category_llm"]
-    result = call_openai_structured(
-        system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-5-nano"
-    )
-
-    return result
-
-
-def analyze_category_final(
-    article: Dict,
-    rb_result: Dict,
-    llm_result: Dict,
-    prompts_config: dict,
-    openai_key: str
-) -> Optional[Dict]:
-    """
-    LLM 기반 최종 카테고리 판단 (RB vs LLM 조정)
-
-    Model: gpt-5-mini (Final 판단용 - RB≠LLM일 때만 호출)
-
-    Args:
-        article: {"title": ..., "description": ...}
-        rb_result: Rule-Based 결과
-        llm_result: LLM 결과 (category_llm)
-        prompts_config: prompts.yaml 딕셔너리
-        openai_key: OpenAI API 키
-
-    Returns:
-        {
-            "issue_category_final": "Safety / Incident",
-            "coverage_themes_final": ["Risk / Crisis"],
-            "confidence": 0.95,
-            "decision_rule": "...",
-            "evidence": [...],
-            "rationale": "..."
-        }
-    """
-    if llm_result is None:
-        return None
-
-    prompt_config = prompts_config["prompts"]["category_final"]
-    system_prompt = prompt_config["system"]
-
-    # User prompt context
-    context = {
-        "policy_category": prompts_config["policy_text"]["category"],
-        "title": article.get("title", ""),
-        "description": article.get("description", ""),
-        "issue_category_rb": rb_result.get("issue_category_rb", ""),
-        "coverage_themes_rb": rb_result.get("coverage_themes_rb", []),
-        "issue_category_llm": llm_result.get("issue_category_llm", "") if llm_result else "",
-        "coverage_themes_llm": llm_result.get("coverage_themes_llm", []) if llm_result else [],
-        "reason_codes_rb": rb_result.get("reason_codes_rb", []),
-        "matched_rules_rb": rb_result.get("matched_rules_rb", []),
-        "schema_category_final": prompts_config["output_schemas"]["category_final"]
-    }
-
-    user_prompt = render_prompt(prompt_config["user"], context)
-
-    # Call OpenAI (Final 판단 - gpt-5-mini)
-    response_schema = prompts_config["output_schemas"]["category_final"]
-    result = call_openai_structured(
-        system_prompt, user_prompt, response_schema,
-        openai_key, model="gpt-5-mini"
-    )
+    # 규칙 2: danger_level은 (관련/언급) + (부정 후보/부정 확정)일 때만
+    if brand_rel not in ("관련", "언급") or sentiment not in ("부정 후보", "부정 확정"):
+        result["danger_level"] = None
+        result["issue_category"] = None
 
     return result
 
 
 def analyze_article_llm(
     article: Dict,
-    rb_result: Dict,
     prompts_config: dict,
     openai_key: str
-) -> Dict:
+) -> Optional[Dict]:
     """
-    단일 기사 LLM 분석 (메인 함수)
-
-    5단계 프로세스:
-    1. sentiment_llm (독립 판단)
-    2. sentiment_final (RB vs LLM 조정)
-    3. danger_llm → danger_final (조건부)
-    4. category_llm (독립 판단)
-    5. category_final (RB vs LLM 조정)
+    단일 기사 LLM 분석 (단일 API 호출, CoT reasoning + 후처리)
 
     Args:
-        article: {"title": ..., "description": ...}
-        rb_result: Rule-Based 결과
+        article: {"title": ..., "description": ..., "query": ..., "group": ...}
         prompts_config: prompts.yaml 딕셔너리
         openai_key: OpenAI API 키
 
     Returns:
         {
-            "sentiment_llm": "...",
-            "sentiment_llm_confidence": 0.95,
-            "sentiment_llm_evidence": [...],
-            "sentiment_llm_rationale": "...",
-            "sentiment_final": "...",
-            "sentiment_final_confidence": 0.95,
-            "sentiment_final_decision_rule": "...",
-            "sentiment_final_evidence": [...],
-            "sentiment_final_rationale": "...",
-            "danger_llm": "...",
-            "danger_llm_confidence": 0.9,
-            "danger_llm_evidence": [...],
-            "danger_llm_rationale": "...",
-            "danger_final": "...",
-            "danger_final_confidence": 0.95,
-            "danger_final_decision_rule": "...",
-            "danger_final_evidence": [...],
-            "danger_final_rationale": "...",
-            "issue_category_llm": "...",
-            "coverage_themes_llm": [...],
-            "category_llm_confidence": 0.9,
-            "category_llm_evidence": [...],
-            "category_llm_rationale": "...",
-            "issue_category_final": "...",
-            "coverage_themes_final": [...],
-            "category_final_confidence": 0.95,
-            "category_final_decision_rule": "...",
-            "category_final_evidence": [...],
-            "category_final_rationale": "..."
+            "brand_relevance": "관련",
+            "brand_relevance_query_keywords": ["롯데호텔"],
+            "sentiment_stage": "부정 확정",
+            "danger_level": "상",
+            "issue_category": "안전/사고",
+            "news_category": "리스크/위기",
+            "news_keyword_summary": "화재 사고 대피"
         }
     """
-    result = {}
+    system_prompt = prompts_config.get("system", "")
+    user_template = prompts_config.get("user_prompt_template", "")
 
-    # Step 1: Sentiment LLM
-    sentiment_llm = analyze_sentiment_llm(article, rb_result, prompts_config, openai_key)
-    if sentiment_llm:
-        result["sentiment_llm"] = sentiment_llm.get("sentiment_llm", "")
-        result["sentiment_llm_confidence"] = sentiment_llm.get("confidence", 0.0)
-        result["sentiment_llm_evidence"] = sentiment_llm.get("evidence", [])
-        result["sentiment_llm_rationale"] = sentiment_llm.get("rationale", "")
-    else:
-        result["sentiment_llm"] = ""
-        result["sentiment_llm_confidence"] = 0.0
-        result["sentiment_llm_evidence"] = []
-        result["sentiment_llm_rationale"] = ""
+    # User prompt context (group 포함)
+    context = {
+        "query": article.get("query", ""),
+        "group": article.get("group", ""),
+        "title": article.get("title", ""),
+        "description": article.get("description", "")
+    }
 
-    # Step 2: Sentiment Final (RB=LLM이면 스킵)
-    sentiment_rb = rb_result.get("sentiment_rb", "")
-    sentiment_llm_val = result.get("sentiment_llm", "")
+    user_prompt = render_prompt(user_template, context)
 
-    if sentiment_rb == sentiment_llm_val and sentiment_rb:
-        # RB = LLM이면 Final API 호출 생략, 바로 사용
-        result["sentiment_final"] = sentiment_rb
-        result["sentiment_final_confidence"] = result.get("sentiment_llm_confidence", 0.0)
-        result["sentiment_final_decision_rule"] = "KEEP_RB=LLM"
-        result["sentiment_final_evidence"] = result.get("sentiment_llm_evidence", [])
-        result["sentiment_final_rationale"] = "RB와 LLM 일치"
-    else:
-        # RB ≠ LLM이면 Final 조정 호출
-        sentiment_final = analyze_sentiment_final(article, rb_result, sentiment_llm, prompts_config, openai_key)
-        if sentiment_final:
-            result["sentiment_final"] = sentiment_final.get("sentiment_final", "")
-            result["sentiment_final_confidence"] = sentiment_final.get("confidence", 0.0)
-            result["sentiment_final_decision_rule"] = sentiment_final.get("decision_rule", "")
-            result["sentiment_final_evidence"] = sentiment_final.get("evidence", [])
-            result["sentiment_final_rationale"] = sentiment_final.get("rationale", "")
-        else:
-            result["sentiment_final"] = rb_result.get("sentiment_rb", "")  # Fallback to RB
-            result["sentiment_final_confidence"] = 0.0
-            result["sentiment_final_decision_rule"] = "LLM failed, used RB"
-            result["sentiment_final_evidence"] = []
-            result["sentiment_final_rationale"] = ""
+    # Call OpenAI
+    model = prompts_config.get("model", None)
+    response_schema = build_response_schema()
 
-    # Step 3: Danger LLM (conditional)
-    danger_llm = analyze_danger_llm(
-        article, rb_result, result["sentiment_final"], prompts_config, openai_key
-    )
-    if danger_llm:
-        result["danger_llm"] = danger_llm.get("danger_llm", "")
-        result["danger_llm_confidence"] = danger_llm.get("confidence", 0.0)
-        result["danger_llm_evidence"] = danger_llm.get("evidence", [])
-        result["danger_llm_rationale"] = danger_llm.get("rationale", "")
-    else:
-        result["danger_llm"] = ""
-        result["danger_llm_confidence"] = 0.0
-        result["danger_llm_evidence"] = []
-        result["danger_llm_rationale"] = ""
-
-    # Step 4: Danger Final (conditional, RB=LLM이면 스킵)
-    if danger_llm:
-        danger_rb = rb_result.get("danger_rb", "")
-        danger_llm_val = result.get("danger_llm", "")
-
-        if danger_rb == danger_llm_val and danger_rb:
-            # RB = LLM이면 Final API 호출 생략
-            result["danger_final"] = danger_rb
-            result["danger_final_confidence"] = result.get("danger_llm_confidence", 0.0)
-            result["danger_final_decision_rule"] = "KEEP_RB=LLM"
-            result["danger_final_evidence"] = result.get("danger_llm_evidence", [])
-            result["danger_final_rationale"] = "RB와 LLM 일치"
-        else:
-            # RB ≠ LLM이면 Final 조정 호출
-            danger_final = analyze_danger_final(article, rb_result, danger_llm, prompts_config, openai_key)
-            if danger_final:
-                result["danger_final"] = danger_final.get("danger_final", "")
-                result["danger_final_confidence"] = danger_final.get("confidence", 0.0)
-                result["danger_final_decision_rule"] = danger_final.get("decision_rule", "")
-                result["danger_final_evidence"] = danger_final.get("evidence", [])
-                result["danger_final_rationale"] = danger_final.get("rationale", "")
-            else:
-                result["danger_final"] = rb_result.get("danger_rb", "")  # Fallback to RB
-                result["danger_final_confidence"] = 0.0
-                result["danger_final_decision_rule"] = "LLM failed, used RB"
-                result["danger_final_evidence"] = []
-                result["danger_final_rationale"] = ""
-    else:
-        result["danger_final"] = ""
-        result["danger_final_confidence"] = 0.0
-        result["danger_final_decision_rule"] = ""
-        result["danger_final_evidence"] = []
-        result["danger_final_rationale"] = ""
-
-    # Step 5: Category LLM
-    category_llm = analyze_category_llm(
-        article, rb_result, result["sentiment_final"], result["danger_final"],
-        prompts_config, openai_key
-    )
-    if category_llm:
-        result["issue_category_llm"] = category_llm.get("issue_category_llm", "")
-        result["coverage_themes_llm"] = category_llm.get("coverage_themes_llm", [])
-        result["category_llm_confidence"] = category_llm.get("confidence", 0.0)
-        result["category_llm_evidence"] = category_llm.get("evidence", [])
-        result["category_llm_rationale"] = category_llm.get("rationale", "")
-    else:
-        result["issue_category_llm"] = ""
-        result["coverage_themes_llm"] = []
-        result["category_llm_confidence"] = 0.0
-        result["category_llm_evidence"] = []
-        result["category_llm_rationale"] = ""
-
-    # Step 6: Category Final (RB=LLM이면 스킵)
-    issue_category_rb = rb_result.get("issue_category_rb", "")
-    coverage_themes_rb = rb_result.get("coverage_themes_rb", [])
-    issue_category_llm_val = result.get("issue_category_llm", "")
-    coverage_themes_llm_val = result.get("coverage_themes_llm", [])
-
-    # 리스트 비교 (순서 무관)
-    themes_match = (
-        sorted(coverage_themes_rb) == sorted(coverage_themes_llm_val)
-        if isinstance(coverage_themes_rb, list) and isinstance(coverage_themes_llm_val, list)
-        else coverage_themes_rb == coverage_themes_llm_val
+    result = call_openai_structured(
+        system_prompt, user_prompt, response_schema,
+        openai_key, model=model
     )
 
-    if issue_category_rb == issue_category_llm_val and themes_match and issue_category_rb:
-        # RB = LLM이면 Final API 호출 생략
-        result["issue_category_final"] = issue_category_rb
-        result["coverage_themes_final"] = coverage_themes_rb
-        result["category_final_confidence"] = result.get("category_llm_confidence", 0.0)
-        result["category_final_decision_rule"] = "KEEP_RB=LLM"
-        result["category_final_evidence"] = result.get("category_llm_evidence", [])
-        result["category_final_rationale"] = "RB와 LLM 일치"
-    else:
-        # RB ≠ LLM이면 Final 조정 호출
-        category_final = analyze_category_final(article, rb_result, category_llm, prompts_config, openai_key)
-        if category_final:
-            result["issue_category_final"] = category_final.get("issue_category_final", "")
-            result["coverage_themes_final"] = category_final.get("coverage_themes_final", [])
-            result["category_final_confidence"] = category_final.get("confidence", 0.0)
-            result["category_final_decision_rule"] = category_final.get("decision_rule", "")
-            result["category_final_evidence"] = category_final.get("evidence", [])
-            result["category_final_rationale"] = category_final.get("rationale", "")
-        else:
-            result["issue_category_final"] = rb_result.get("issue_category_rb", "")  # Fallback to RB
-        result["coverage_themes_final"] = rb_result.get("coverage_themes_rb", [])
-        result["category_final_confidence"] = 0.0
-        result["category_final_decision_rule"] = "LLM failed, used RB"
-        result["category_final_evidence"] = []
-        result["category_final_rationale"] = ""
+    # 후처리: reasoning 제거 + 논리적 일관성 보장
+    result = _post_process_result(result)
 
     return result
+
+
+def analyze_batch_llm(
+    articles: List[Dict],
+    prompts_config: dict,
+    openai_key: str
+) -> List[Dict]:
+    """
+    배치 LLM 분석 (단순 순차 처리)
+
+    Args:
+        articles: [{"title": ..., "description": ..., "query": ...}, ...]
+        prompts_config: prompts.yaml 딕셔너리
+        openai_key: OpenAI API 키
+
+    Returns:
+        [분석 결과 딕셔너리, ...]
+    """
+    results = []
+    for article in articles:
+        result = analyze_article_llm(article, prompts_config, openai_key)
+        results.append(result if result else {})
+
+    return results

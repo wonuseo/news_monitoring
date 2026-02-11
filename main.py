@@ -16,18 +16,19 @@ pd.set_option('future.no_silent_downcasting', True)
 # 모듈 임포트
 from src.modules.collection.collect import OUR_BRANDS, COMPETITORS, collect_all_news
 from src.modules.processing.process import (
-    normalize_df, dedupe_df, detect_similar_articles,
-    enrich_with_media_info, save_csv, summarize_press_release_groups
+    normalize_df, dedupe_df,
+    enrich_with_media_info, save_csv
 )
-from src.modules.analysis.classify import classify_all
-from src.modules.analysis.hybrid import classify_hybrid, get_classification_stats, print_classification_stats
-from src.modules.export.report import generate_console_report, create_word_report
-from src.modules.collection.scrape import collect_with_scraping, merge_api_and_scrape
-from src.modules.processing.fulltext import batch_fetch_full_text
+from src.modules.processing.press_release_detector import detect_similar_articles, summarize_press_release_groups
 from src.modules.processing.looker_prep import add_time_series_columns
+from src.modules.analysis.classify_llm import classify_llm, get_classification_stats, print_classification_stats
+from src.modules.analysis.preset_pr import preset_press_release_values
+from src.modules.analysis.keyword_extractor import extract_all_categories
+from src.modules.export.report import generate_console_report
 from src.modules.export.sheets import (
     connect_sheets, sync_raw_and_processed, load_existing_links_from_sheets, filter_new_articles_from_sheets
 )
+from src.modules.monitoring.logger import RunLogger, sync_logs_to_sheets
 
 
 def load_env():
@@ -51,15 +52,19 @@ def load_env():
 
 
 def main():
+    # RunLogger 초기화
+    logger = RunLogger()
+    logger.start_stage("total")
+
     parser = argparse.ArgumentParser(
         description="뉴스 모니터링 시스템",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용 예시:
-  python main.py                                    # 전체 파이프라인 실행 (Sheets 자동 동기화)
+  python main.py                                    # 전체 파이프라인 실행 (자사+경쟁사 전체 분석)
   python main.py --display 200                      # API 결과 개수 지정
-  python main.py --scrape --start_date 2026-01-01   # 날짜 범위 스크래핑
-  python main.py --fulltext --fulltext_risk_levels 상,중  # 전문 스크래핑
+  python main.py --extract_keywords                 # 카테고리별 키워드 추출
+  python main.py --max_competitor_classify 20       # 경쟁사 분석 개수 제한
   python main.py --sheets_id YOUR_SHEET_ID          # Google Sheets ID 지정
   python main.py --raw_only                         # 수집만 (Sheets 자동 동기화)
 
@@ -78,36 +83,14 @@ def main():
                         help="정렬 방식: date(최신순) 또는 sim(관련도순) (기본: date)")
     parser.add_argument("--outdir", type=str, default="data",
                         help="출력 디렉토리 (기본: data)")
-    parser.add_argument("--max_competitor_classify", type=int, default=20,
-                        help="경쟁사별 분류할 최대 기사 수 (기본: 20)")
+    parser.add_argument("--max_competitor_classify", type=int, default=0,
+                        help="경쟁사별 분류할 최대 기사 수 (기본: 0=무제한, 전체 분석)")
     parser.add_argument("--chunk_size", type=int, default=100,
                         help="AI 처리 시 청크 크기 (기본: 100)")
     parser.add_argument("--max_workers", type=int, default=10,
                         help="병렬 처리 워커 수 (기본: 10, 권장: 5-15)")
     parser.add_argument("--dry_run", action="store_true",
                         help="AI 분류 없이 테스트 실행")
-
-    # 스크래핑 옵션
-    parser.add_argument("--scrape", action="store_true",
-                        help="Naver 뉴스 스크래핑 (날짜 범위 기반)")
-    parser.add_argument("--start_date", type=str, default="2026-01-01",
-                        help="스크래핑 시작 날짜 (YYYY-MM-DD, 기본: 2026-01-01)")
-    parser.add_argument("--end_date", type=str, default="2026-02-07",
-                        help="스크래핑 종료 날짜 (YYYY-MM-DD, 기본: 2026-02-07)")
-    parser.add_argument("--max_scrape_pages", type=int, default=10,
-                        help="스크래핑 최대 페이지 수 (기본: 10)")
-
-    # 전문 스크래핑 옵션
-    parser.add_argument("--fulltext", action="store_true",
-                        help="기사 전문 스크래핑")
-    parser.add_argument("--fulltext_risk_levels", type=str, default="상,중",
-                        help="전문을 스크래핑할 위험도 (기본: 상,중)")
-    parser.add_argument("--fulltext_max_articles", type=int, default=None,
-                        help="최대 전문 스크래핑 기사 수 (기본: 무제한)")
-
-    # Looker 준비 옵션
-    parser.add_argument("--looker_prep", action="store_true",
-                        help="Looker Studio용 시계열 컬럼 추가")
 
     # Google Sheets 옵션 (항상 활성화됨)
     parser.add_argument("--sheets_id", type=str, default=None,
@@ -125,11 +108,16 @@ def main():
     parser.add_argument("--preprocess_only", action="store_true",
                         help="수집 + 전처리까지만 실행 (AI 분류, 리포트 생략, Sheets 업로드는 실행)")
 
-    # Legacy classify 옵션
-    parser.add_argument("--legacy_classify", action="store_true",
-                        help="레거시 분류 시스템 사용 (기본: 하이브리드 시스템)")
+    # Keyword extraction 옵션
+    parser.add_argument("--extract_keywords", action="store_true",
+                        help="카테고리별 특징 키워드 추출 (kiwipiepy 형태소 분석 + Log-odds ratio)")
+    parser.add_argument("--keyword_top_k", type=int, default=20,
+                        help="키워드 추출 시 상위 K개 선택 (기본: 20)")
 
     args = parser.parse_args()
+
+    # CLI args 로깅
+    logger.log("cli_args", vars(args))
 
     print("=" * 80)
     print("🚀 뉴스 모니터링 시스템 시작")
@@ -137,18 +125,17 @@ def main():
     print(f"\n설정:")
     print(f"  - 우리 브랜드: {', '.join(OUR_BRANDS)}")
     print(f"  - 경쟁사: {', '.join(COMPETITORS)}")
-    if args.scrape:
-        print(f"  - 수집 모드: API + 스크래핑 ({args.start_date} ~ {args.end_date})")
-    else:
-        print(f"  - 수집 모드: API만")
-        print(f"  - 기사 수: {args.display}개/브랜드 (최대 {args.max_api_pages} 페이지)")
+    print(f"  - 수집 모드: Naver API")
+    print(f"  - 기사 수: {args.display}개/브랜드 (최대 {args.max_api_pages} 페이지)")
     print(f"  - 출력 디렉토리: {args.outdir}/")
+    if args.max_competitor_classify == 0:
+        print(f"  - 분류 모드: 자사+경쟁사 전체 분석")
+    else:
+        print(f"  - 분류 모드: 자사 전체 + 경쟁사 최대 {args.max_competitor_classify}개/브랜드")
     print(f"  - AI 청크 크기: {args.chunk_size}")
     print(f"  - 병렬 처리 워커: {args.max_workers}개")
-    if args.fulltext:
-        print(f"  - 전문 스크래핑: {args.fulltext_risk_levels} (위험도)")
-    if args.looker_prep:
-        print(f"  - Looker 준비: 활성화")
+    if args.extract_keywords:
+        print(f"  - 키워드 추출: 활성화 (상위 {args.keyword_top_k}개)")
     if args.dry_run:
         print(f"  - 모드: DRY RUN (AI 분류 생략)")
     if args.raw_only:
@@ -164,6 +151,7 @@ def main():
     media_csv_path = outdir / "media_directory.csv"
 
     # Step 1: 수집
+    logger.start_stage("collection")
     print("\n" + "=" * 80)
     print("STEP 1: 뉴스 수집")
     print("=" * 80)
@@ -201,29 +189,14 @@ def main():
 
     raw_csv_path = outdir / "raw.csv"
 
-    if args.scrape:
-        # 스크래핑 방식
-        df_scrape = collect_with_scraping(
-            OUR_BRANDS, COMPETITORS,
-            args.start_date, args.end_date,
-            args.max_scrape_pages
-        )
-        # API 방식도 동시에 수집 후 병합 (raw.csv 기반 중복 체크)
-        df_api = collect_all_news(
-            OUR_BRANDS, COMPETITORS,
-            args.display, args.max_api_pages, args.sort,
-            env["naver_id"], env["naver_secret"],
-            raw_csv_path=str(raw_csv_path)
-        )
-        df_raw_new = merge_api_and_scrape(df_api, df_scrape)
-    else:
-        # API 방식만 (raw.csv 기반 중복 체크)
-        df_raw_new = collect_all_news(
-            OUR_BRANDS, COMPETITORS,
-            args.display, args.max_api_pages, args.sort,
-            env["naver_id"], env["naver_secret"],
-            raw_csv_path=str(raw_csv_path)
-        )
+    # API 방식 수집 (raw.csv 기반 중복 체크)
+    df_raw_new = collect_all_news(
+        OUR_BRANDS, COMPETITORS,
+        args.display, args.max_api_pages, args.sort,
+        env["naver_id"], env["naver_secret"],
+        raw_csv_path=str(raw_csv_path),
+        spreadsheet=spreadsheet
+    )
 
     # API 수집 결과 확인
     if len(df_raw_new) == 0:
@@ -232,8 +205,11 @@ def main():
         print(f"\n✅ API에서 {len(df_raw_new)}개 기사 수집 완료")
 
     # Filter new articles (skip duplicates from Google Sheets)
+    existing_links_skipped = 0
     if len(existing_links) > 0 and len(df_raw_new) > 0:
+        before_filter = len(df_raw_new)
         df_raw_new = filter_new_articles_from_sheets(df_raw_new, existing_links)
+        existing_links_skipped = before_filter - len(df_raw_new)
 
     # raw.csv 업데이트 (append)
     if raw_csv_path.exists():
@@ -245,6 +221,25 @@ def main():
         df_raw = df_raw_new
 
     save_csv(df_raw, raw_csv_path)
+
+    # Google Sheets 즉시 동기화 (수집 직후)
+    if spreadsheet and len(df_raw_new) > 0:
+        print("\n📊 Google Sheets 즉시 동기화 중 (raw_data)...")
+        try:
+            from src.modules.export.sheets import sync_to_sheets
+            sync_result = sync_to_sheets(df_raw, spreadsheet, "raw_data")
+            print(f"✅ raw_data 시트 동기화 완료: {sync_result['added']}개 추가, {sync_result['skipped']}개 건너뜀")
+        except Exception as e:
+            print(f"⚠️  raw_data 시트 동기화 실패: {e}")
+
+    # 수집 단계 메트릭
+    articles_per_query = df_raw_new.groupby('query').size().to_dict() if 'query' in df_raw_new.columns else {}
+    logger.log_dict({
+        "articles_collected_total": len(df_raw_new),
+        "articles_collected_per_query": articles_per_query,
+        "existing_links_skipped": existing_links_skipped
+    })
+    logger.end_stage("collection")
 
     # STEP 1.5: 미처리/미분석 행 필터링 (result.csv 기준)
     result_csv_path = outdir / "result.csv"
@@ -308,15 +303,36 @@ def main():
 
         # 기존 데이터가 있으면 Google Sheets 동기화 시도
         if spreadsheet and result_csv_path.exists():
+            logger.start_stage("sheets_sync")
             print("\n" + "=" * 80)
             print("STEP 5: Google Sheets 업로드 (기존 데이터)")
             print("=" * 80)
             try:
                 df_result_existing = pd.read_csv(result_csv_path, encoding='utf-8-sig')
-                sync_raw_and_processed(df_raw, df_result_existing, spreadsheet)
+                sync_results = sync_raw_and_processed(df_raw, df_result_existing, spreadsheet)
                 print("✅ Google Sheets 동기화 완료")
+
+                # Sheets 메트릭 수집
+                logger.log_dict({
+                    "sheets_sync_enabled": True,
+                    "sheets_rows_uploaded_raw": sync_results.get("raw_data", {}).get("added", 0),
+                    "sheets_rows_uploaded_result": sync_results.get("result", {}).get("added", 0)
+                })
             except Exception as e:
                 print(f"⚠️  Google Sheets 업로드 실패: {e}")
+                logger.log("sheets_sync_enabled", False)
+            logger.end_stage("sheets_sync")
+
+        # 로그 저장
+        logger.finalize()
+        logs_csv_path = outdir / "logs" / "run_history.csv"
+        logger.save_csv(str(logs_csv_path))
+
+        # Sheets 로그 동기화
+        if spreadsheet:
+            sync_logs_to_sheets(str(logs_csv_path), spreadsheet)
+
+        logger.print_summary()
 
         print("\n" + "=" * 80)
         print("✅ 작업 완료 (신규 처리 없음)")
@@ -326,20 +342,53 @@ def main():
     # --raw_only 모드인 경우 처리/분류/리포트 스킵
     if args.raw_only:
         df_result = df_raw
+        logger.log_dict({
+            "articles_processed": 0,
+            "duplicates_removed": 0,
+            "press_releases_detected": 0,
+            "press_release_groups": 0
+        })
     # --preprocess_only 모드인 경우 분류 스킵, 처리+리포트는 실행
     elif args.preprocess_only:
         # Step 2: 처리 (미처리 행만)
+        logger.start_stage("processing")
         print("\n" + "=" * 80)
         print("STEP 2: 데이터 처리 (미처리 행만)")
         print("=" * 80)
+        # Step 2-1: Normalize
         df_normalized = normalize_df(df_to_process)
-        df_processed = dedupe_df(df_normalized)
-        df_processed = detect_similar_articles(df_processed, similarity_threshold=0.8)
+        before_dedupe = len(df_normalized)
 
-        # 보도자료 그룹 요약 생성 (OpenAI)
+        # Step 2-2: Deduplicate
+        df_processed = dedupe_df(df_normalized)
+        duplicates_removed = before_dedupe - len(df_processed)
+
+        # Step 2-3: Detect similar articles (Press Release)
+        df_processed = detect_similar_articles(df_processed)
+        press_releases = len(df_processed[df_processed['source'] == '보도자료']) if 'source' in df_processed.columns else 0
+
+        # Step 2-4: Summarize press release groups (OpenAI)
+        print("\n📝 보도자료 그룹 요약 생성 중...")
         df_processed = summarize_press_release_groups(df_processed, env["openai_key"])
 
-        # 언론사 정보 추가 (spreadsheet 있으면 자동 사용)
+        # 중간 저장 (보도자료 요약 완료 후)
+        print("💾 중간 저장 중 (보도자료 요약 완료)...")
+        if result_csv_path.exists():
+            df_result_temp = pd.read_csv(result_csv_path, encoding='utf-8-sig')
+            df_temp = pd.concat([df_result_temp, df_processed], ignore_index=True)
+            df_temp = df_temp.drop_duplicates(subset=['link'], keep='last')
+        else:
+            df_temp = df_processed
+        save_csv(df_temp, result_csv_path)
+        if spreadsheet:
+            try:
+                sync_raw_and_processed(df_raw, df_temp, spreadsheet)
+                print("✅ Google Sheets 중간 동기화 완료")
+            except Exception as e:
+                print(f"⚠️  Sheets 동기화 실패: {e}")
+
+        # Step 2-5: Media classification (OpenAI)
+        print("\n🏢 언론사 정보 추가 중...")
         media_csv_path = outdir / "media_directory.csv"
         df_processed = enrich_with_media_info(
             df_processed,
@@ -348,12 +397,38 @@ def main():
             csv_path=media_csv_path
         )
 
+        # 중간 저장 (언론사 정보 완료 후)
+        print("💾 중간 저장 중 (언론사 정보 완료)...")
+        if result_csv_path.exists():
+            df_result_temp = pd.read_csv(result_csv_path, encoding='utf-8-sig')
+            df_temp = pd.concat([df_result_temp, df_processed], ignore_index=True)
+            df_temp = df_temp.drop_duplicates(subset=['link'], keep='last')
+        else:
+            df_temp = df_processed
+        save_csv(df_temp, result_csv_path)
+        if spreadsheet:
+            try:
+                sync_raw_and_processed(df_raw, df_temp, spreadsheet)
+                print("✅ Google Sheets 중간 동기화 완료")
+            except Exception as e:
+                print(f"⚠️  Sheets 동기화 실패: {e}")
+
         # 나머지 NaN → 공란 변환
         df_processed = df_processed.fillna("")
 
-        # Looker Studio 준비 (항상 실행)
+        # Step 2-6: Looker Studio time-series columns
         print("\n🕒 Looker Studio 시계열 컬럼 추가 중...")
         df_processed = add_time_series_columns(df_processed)
+
+        # 전처리 메트릭
+        press_release_groups = df_processed['group_id'].nunique() if 'group_id' in df_processed.columns else 0
+        logger.log_dict({
+            "articles_processed": len(df_processed),
+            "duplicates_removed": duplicates_removed,
+            "press_releases_detected": press_releases,
+            "press_release_groups": press_release_groups
+        })
+        logger.end_stage("processing")
 
         # 기존 result.csv와 병합
         if result_csv_path.exists():
@@ -366,19 +441,56 @@ def main():
 
         # 결과 저장
         save_csv(df_result, result_csv_path)
+
+        # Google Sheets 즉시 동기화 (전처리 완료 직후)
+        if spreadsheet:
+            print("\n📊 Google Sheets 즉시 동기화 중 (전처리 결과)...")
+            try:
+                sync_results = sync_raw_and_processed(df_raw, df_result, spreadsheet)
+                print("✅ 전처리 결과 Sheets 동기화 완료")
+            except Exception as e:
+                print(f"⚠️  전처리 결과 Sheets 동기화 실패: {e}")
     else:
         # Step 2: 처리 (미처리 행만)
+        logger.start_stage("processing")
         print("\n" + "=" * 80)
         print("STEP 2: 데이터 처리 (미처리 행만)")
         print("=" * 80)
-        df_normalized = normalize_df(df_to_process)
-        df_processed = dedupe_df(df_normalized)
-        df_processed = detect_similar_articles(df_processed, similarity_threshold=0.8)
 
-        # 보도자료 그룹 요약 생성 (OpenAI)
+        # Step 2-1: Normalize
+        df_normalized = normalize_df(df_to_process)
+        before_dedupe = len(df_normalized)
+
+        # Step 2-2: Deduplicate
+        df_processed = dedupe_df(df_normalized)
+        duplicates_removed = before_dedupe - len(df_processed)
+
+        # Step 2-3: Detect similar articles (Press Release)
+        df_processed = detect_similar_articles(df_processed)
+        press_releases = len(df_processed[df_processed['source'] == '보도자료']) if 'source' in df_processed.columns else 0
+
+        # Step 2-4: Summarize press release groups (OpenAI)
+        print("\n📝 보도자료 그룹 요약 생성 중...")
         df_processed = summarize_press_release_groups(df_processed, env["openai_key"])
 
-        # 언론사 정보 추가 (spreadsheet 있으면 자동 사용)
+        # 중간 저장 (보도자료 요약 완료 후)
+        print("💾 중간 저장 중 (보도자료 요약 완료)...")
+        if result_csv_path.exists():
+            df_result_temp = pd.read_csv(result_csv_path, encoding='utf-8-sig')
+            df_temp = pd.concat([df_result_temp, df_processed], ignore_index=True)
+            df_temp = df_temp.drop_duplicates(subset=['link'], keep='last')
+        else:
+            df_temp = df_processed
+        save_csv(df_temp, result_csv_path)
+        if spreadsheet:
+            try:
+                sync_raw_and_processed(df_raw, df_temp, spreadsheet)
+                print("✅ Google Sheets 중간 동기화 완료")
+            except Exception as e:
+                print(f"⚠️  Sheets 동기화 실패: {e}")
+
+        # Step 2-5: Media classification (OpenAI)
+        print("\n🏢 언론사 정보 추가 중...")
         media_csv_path = outdir / "media_directory.csv"
         df_processed = enrich_with_media_info(
             df_processed,
@@ -387,38 +499,63 @@ def main():
             csv_path=media_csv_path
         )
 
+        # 중간 저장 (언론사 정보 완료 후)
+        print("💾 중간 저장 중 (언론사 정보 완료)...")
+        if result_csv_path.exists():
+            df_result_temp = pd.read_csv(result_csv_path, encoding='utf-8-sig')
+            df_temp = pd.concat([df_result_temp, df_processed], ignore_index=True)
+            df_temp = df_temp.drop_duplicates(subset=['link'], keep='last')
+        else:
+            df_temp = df_processed
+        save_csv(df_temp, result_csv_path)
+        if spreadsheet:
+            try:
+                sync_raw_and_processed(df_raw, df_temp, spreadsheet)
+                print("✅ Google Sheets 중간 동기화 완료")
+            except Exception as e:
+                print(f"⚠️  Sheets 동기화 실패: {e}")
+
+        # 전처리 메트릭
+        press_release_groups = df_processed['group_id'].nunique() if 'group_id' in df_processed.columns else 0
+        logger.log_dict({
+            "articles_processed": len(df_processed),
+            "duplicates_removed": duplicates_removed,
+            "press_releases_detected": press_releases,
+            "press_release_groups": press_release_groups
+        })
+        logger.end_stage("processing")
+
         # Step 3: 분류 (미처리 행만)
+        logger.start_stage("classification")
         print("\n" + "=" * 80)
-        print("STEP 3: AI 분류")
+        print("STEP 3: 분류")
         print("=" * 80)
 
-        if args.legacy_classify:
-            print("📚 레거시 분류 시스템 사용 중...")
-            df_classified = classify_all(
-                df_processed,
-                env["openai_key"],
-                args.max_competitor_classify,
-                args.chunk_size,
-                args.dry_run
-            )
-        else:
-            print("🔬 하이브리드 분류 시스템 사용 중...")
-            df_classified = classify_hybrid(
-                df_processed,
-                env["openai_key"],
-                chunk_size=args.chunk_size,
-                dry_run=args.dry_run,
-                max_competitor_classify=args.max_competitor_classify,
-                max_workers=args.max_workers,
-                result_csv_path=str(result_csv_path)
-            )
+        # Step 3-1: 보도자료 전처리 (LLM 스킵용 고정값 설정)
+        df_processed = preset_press_release_values(df_processed)
 
-            # 통계 출력
-            stats = get_classification_stats(df_classified)
-            print_classification_stats(stats)
+        # Step 3-2: LLM 분류 (보도자료는 스킵)
+        df_classified, llm_metrics = classify_llm(
+            df_processed,
+            env["openai_key"],
+            chunk_size=args.chunk_size,
+            dry_run=args.dry_run,
+            max_competitor_classify=args.max_competitor_classify,
+            max_workers=args.max_workers,
+            result_csv_path=str(result_csv_path),
+            spreadsheet=spreadsheet,
+            raw_df=df_raw
+        )
+
+        # LLM 메트릭 로깅
+        logger.log_dict(llm_metrics)
+
+        # 통계 출력
+        stats = get_classification_stats(df_classified)
+        print_classification_stats(stats)
 
         # 보도자료 정보 및 언론사 정보 병합
-        source_cols = ['link', 'source', 'group_id', 'press_release_group', 'media_domain', 'media_name', 'media_group',
+        source_cols = ['link', 'source', 'cluster_id', 'press_release_group', 'media_domain', 'media_name', 'media_group',
                        'media_type']
         source_data = df_processed[source_cols].copy()
 
@@ -432,25 +569,15 @@ def main():
         # 나머지 NaN → 공란 변환 (FutureWarning 방지)
         df_classified = df_classified.fillna("").infer_objects(copy=False)
 
-        # Step 3.5: 전문 스크래핑 (선택적)
-        if args.fulltext:
-            print("\n" + "=" * 80)
-            print("STEP 3.5: 기사 전문 스크래핑")
-            print("=" * 80)
-            risk_levels = [r.strip() for r in args.fulltext_risk_levels.split(",")]
-            df_classified = batch_fetch_full_text(
-                df_classified,
-                risk_levels=risk_levels,
-                max_articles=args.fulltext_max_articles
-            )
-
         # Step 3.7: Looker Studio 준비 (항상 실행)
         print("\n🕒 Looker Studio 시계열 컬럼 추가 중...")
         df_classified = add_time_series_columns(df_classified)
 
+        logger.end_stage("classification")
+
         # 기존 result.csv와 병합
         if result_csv_path.exists():
-            df_result_existing = pd.read_csv(result_csv_path, encoding='utf-8-sig')
+            df_result_existing = pd.read_csv(result_csv_path, encoding='utf-8-sig', on_bad_lines='skip', engine='python')
             df_result = pd.concat([df_result_existing, df_classified], ignore_index=True)
             df_result = df_result.drop_duplicates(subset=['link'], keep='last')
             print(f"\n📂 기존 result.csv 업데이트: {len(df_result_existing)} + {len(df_classified)} = {len(df_result)}개 기사 (중복 제거 후)")
@@ -464,6 +591,15 @@ def main():
         # 결과 저장 (단일 CSV 파일)
         save_csv(df_result, result_csv_path)
 
+        # Google Sheets 즉시 동기화 (분류 완료 직후)
+        if spreadsheet:
+            print("\n📊 Google Sheets 즉시 동기화 중 (분류 결과)...")
+            try:
+                sync_results = sync_raw_and_processed(df_raw, df_result, spreadsheet)
+                print("✅ 분류 결과 Sheets 동기화 완료")
+            except Exception as e:
+                print(f"⚠️  분류 결과 Sheets 동기화 실패: {e}")
+
         # Step 4: 리포트 생성
         print("\n" + "=" * 80)
         print("STEP 4: 리포트 생성")
@@ -472,28 +608,82 @@ def main():
         # 콘솔 리포트
         generate_console_report(df_result)
 
-        # Word 리포트
-        word_path = outdir / "report.docx"
-        create_word_report(df_result, word_path)
+        # 분류 결과 메트릭
+        our_brands_relevant = len(df_result[(df_result['group'] == 'OUR') & (df_result['brand_relevance'].isin(['관련', '언급']))]) if 'brand_relevance' in df_result.columns else 0
+        our_brands_negative = len(df_result[(df_result['group'] == 'OUR') & (df_result['sentiment_stage'].isin(['부정 후보', '부정 확정']))]) if 'sentiment_stage' in df_result.columns else 0
+        danger_high = len(df_result[df_result['danger_level'] == '상']) if 'danger_level' in df_result.columns else 0
+        danger_medium = len(df_result[df_result['danger_level'] == '중']) if 'danger_level' in df_result.columns else 0
+        competitor_articles = len(df_result[df_result['group'] == 'COMPETITOR']) if 'group' in df_result.columns else 0
+
+        logger.log_dict({
+            "our_brands_relevant": our_brands_relevant,
+            "our_brands_negative": our_brands_negative,
+            "danger_high": danger_high,
+            "danger_medium": danger_medium,
+            "competitor_articles": competitor_articles
+        })
+
+        # 키워드 추출 (옵션)
+        if args.extract_keywords:
+            print("\n" + "=" * 80)
+            print("STEP 4.5: 카테고리별 키워드 추출")
+            print("=" * 80)
+            extract_all_categories(
+                df=df_result,
+                output_dir=outdir / "keywords",
+                top_k=args.keyword_top_k,
+                max_display=10,
+                spreadsheet=spreadsheet  # Google Sheets 연결 전달
+            )
 
     # Step 5: Google Sheets 동기화 (주 저장소)
     if spreadsheet:
+        logger.start_stage("sheets_sync")
         print("\n" + "=" * 80)
         print("STEP 5: Google Sheets 동기화 (주 저장소)")
         print("=" * 80)
         try:
-            sync_raw_and_processed(df_raw, df_result, spreadsheet)
+            sync_results = sync_raw_and_processed(df_raw, df_result, spreadsheet)
             print("✅ Google Sheets 동기화 완료")
+
+            # Sheets 메트릭 수집
+            logger.log_dict({
+                "sheets_sync_enabled": True,
+                "sheets_rows_uploaded_raw": sync_results.get("raw_data", {}).get("added", 0),
+                "sheets_rows_uploaded_result": sync_results.get("result", {}).get("added", 0)
+            })
         except Exception as e:
             print(f"❌ Google Sheets 동기화 실패: {e}")
             print("   ⚠️  CSV 파일만 저장되었습니다 (troubleshooting 모드)")
+            logger.log("sheets_sync_enabled", False)
+        logger.end_stage("sheets_sync")
     else:
+        logger.log("sheets_sync_enabled", False)
         print("\n" + "=" * 80)
         print("⚠️  Google Sheets 연결 없음")
         print("=" * 80)
         print("  주 저장소인 Google Sheets에 동기화되지 않았습니다.")
         print("  CSV 파일만 저장되었습니다 (troubleshooting 모드)")
         print("  .env 파일에 GOOGLE_SHEETS_CREDENTIALS_PATH 및 GOOGLE_SHEET_ID 설정을 권장합니다.")
+
+    # 로그 저장
+    logger.end_stage("total")
+    logger.finalize()
+
+    logs_csv_path = outdir / "logs" / "run_history.csv"
+    logger.save_csv(str(logs_csv_path))
+
+    # Sheets 로그 동기화
+    if spreadsheet:
+        try:
+            sync_logs_to_sheets(str(logs_csv_path), spreadsheet)
+            logger.log("sheets_logs_uploaded", 1)
+        except Exception as e:
+            print(f"⚠️  로그 Sheets 동기화 실패: {e}")
+            logger.log("sheets_logs_uploaded", 0)
+
+    # 로그 요약 출력
+    logger.print_summary()
 
     # 완료
     print("\n" + "=" * 80)
@@ -505,7 +695,8 @@ def main():
     print(f"  📊 {outdir}/raw.csv - 원본 데이터 (troubleshooting)")
     if not args.raw_only:
         print(f"  📊 {outdir}/result.csv - AI 분류 결과 (troubleshooting)")
-        print(f"  📄 {outdir}/report.docx - Word 리포트")
+        if args.extract_keywords:
+            print(f"  📂 {outdir}/keywords/ - 카테고리별 키워드 CSV")
     if spreadsheet or not args.raw_only:
         print(f"  📂 {outdir}/media_directory.csv - 언론사 디렉토리")
     if not spreadsheet:

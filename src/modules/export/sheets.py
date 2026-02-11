@@ -275,7 +275,14 @@ def configure_sheet_schema(worksheet) -> None:
 
 def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spreadsheet) -> Dict[str, Dict]:
     """
-    원본 데이터와 분류 결과를 Google Sheets에 업로드 (2개 시트)
+    원본 데이터와 분류 결과를 Google Sheets에 업로드 (4개 시트)
+
+    시트 구조:
+    - raw_data: 원본 데이터 (수집된 그대로)
+    - total_result: 전체 분류 결과 (독립기사 + 보도자료)
+    - independent: source != "보도자료"인 기사만
+    - press_release: source == "보도자료"인 기사만
+    - media_directory: 언론사 정보 (별도 함수에서 관리)
 
     Args:
         df_raw: 원본 데이터 (수집된 그대로)
@@ -290,12 +297,22 @@ def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spread
     print("📊 Google Sheets 동기화 중...")
 
     # 1. raw_data - 원본 데이터
-    print("\n  [1/2] raw_data (원본 데이터)")
+    print("\n  [1/4] raw_data (원본 데이터)")
     results["raw_data"] = sync_to_sheets(df_raw, spreadsheet, "raw_data")
 
-    # 2. result - 분류 결과
-    print("  [2/2] result (분류 결과)")
-    results["result"] = sync_to_sheets(df_result, spreadsheet, "result")
+    # 2. total_result - 전체 분류 결과
+    print("  [2/4] total_result (전체 분류 결과)")
+    results["total_result"] = sync_to_sheets(df_result, spreadsheet, "total_result")
+
+    # 3. independent - source가 "보도자료"가 아닌 기사
+    print("  [3/4] independent (독립기사)")
+    df_independent = df_result[df_result["source"] != "보도자료"].copy()
+    results["independent"] = sync_to_sheets(df_independent, spreadsheet, "independent")
+
+    # 4. press_release - source가 "보도자료"인 기사
+    print("  [4/4] press_release (보도자료)")
+    df_press_release = df_result[df_result["source"] == "보도자료"].copy()
+    results["press_release"] = sync_to_sheets(df_press_release, spreadsheet, "press_release")
 
     # 통계
     print("\n✅ Google Sheets 동기화 완료")
@@ -306,6 +323,8 @@ def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spread
     print(f"  - 추가됨: {total_added}개")
     print(f"  - 건너뜀: {total_skipped}개")
     print(f"  - 오류: {total_errors}개")
+    print(f"  - 독립기사: {len(df_independent)}개")
+    print(f"  - 보도자료: {len(df_press_release)}개")
 
     return results
 
