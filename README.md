@@ -53,7 +53,7 @@
     ├── raw.csv
     ├── result.csv
     ├── media_directory.csv
-    ├── keywords/                # 카테고리별 키워드 (선택)
+    ├── keywords/                # 카테고리별 키워드 (자동)
     ├── logs/run_history.csv     # 실행 히스토리 (자동)
     └── report.docx
 ```
@@ -138,9 +138,9 @@ python main.py --raw_only
 python main.py --preprocess_only
 ```
 
-### 키워드 추출 (카테고리별 상위 20개)
+### 키워드 추출 개수 조정 (기본: 20개, 자동 실행)
 ```bash
-python main.py --extract_keywords --keyword_top_k 20
+python main.py --keyword_top_k 30
 ```
 
 ### 브라우저 스크래핑 (날짜 범위 지정)
@@ -267,7 +267,7 @@ python main.py \
 - **raw_data 탭**: 원본 데이터 (네이버 API 수집 결과)
 - **result 탭**: LLM 분류 결과 (모든 분석 컬럼 포함)
 - **logs 탭**: 실행 히스토리 (메트릭 추적)
-- **keywords 탭**: 카테고리별 키워드 (선택, `--extract_keywords` 사용 시)
+- **keywords 탭**: 카테고리별 키워드 (자동)
 - **증분 업로드**: 중복 자동 제거 (link 기준)
 - **실시간 협업**: 팀원과 공유 및 실시간 업데이트
 
@@ -282,7 +282,7 @@ python main.py \
    - LLM 컬럼: brand_relevance, brand_relevance_query_keywords, sentiment_stage, danger_level, issue_category, news_category, news_keyword_summary, classified_at
 3. **media_directory.csv**: 언론사 디렉토리 (자동 업데이트, 지속)
 4. **logs/run_history.csv**: 실행 히스토리 (자동, 34개 메트릭)
-5. **keywords/*.csv**: 카테고리별 키워드 (선택, `--extract_keywords` 사용 시)
+5. **keywords/*.csv**: 카테고리별 키워드 (자동)
 
 ### Word 문서 (report.docx)
 

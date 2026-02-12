@@ -8,13 +8,23 @@ AI를 통한 카테고리화 및 위험도 판단
 
 import json
 import time
+import random
 import requests
+import uuid
 from datetime import datetime
 from typing import Dict, List, Tuple
 import pandas as pd
 
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
+
+_error_callback = None
+
+
+def set_error_callback(callback):
+    """Register error logger callback: fn(message: str, data: dict)."""
+    global _error_callback
+    _error_callback = callback
 
 # 한국어 카테고리
 CATEGORIES = [
@@ -28,8 +38,10 @@ CATEGORIES = [
 ]
 
 
-def call_openai_batch(articles: List[Dict], task_type: str, openai_key: str, 
-                      retry: bool = True) -> Dict[int, Dict]:
+def call_openai_batch(articles: List[Dict], task_type: str, openai_key: str,
+                      retry: bool = True, retry_count: int = 0,
+                      max_retries: int = 5, base_wait: int = 15,
+                      request_id: str = None) -> Dict[int, Dict]:
     """
     OpenAI API 배치 호출
     
@@ -205,55 +217,106 @@ JSON 객체만 출력하세요."""
         },
     }
     
-    try:
-        response = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=60)
-        
-        if response.status_code == 401:
-            raise RuntimeError("OpenAI API 인증 실패 (401). API 키를 확인하세요.")
-        elif response.status_code == 429:
-            print("⚠️  OpenAI 요청 한도 초과 (429). 5초 대기 중...")
-            time.sleep(5)
-            if retry:
-                return call_openai_batch(articles, task_type, openai_key, retry=False)
-            else:
+    request_id = request_id or uuid.uuid4().hex[:8]
+    current_retry = retry_count
+
+    while True:
+        try:
+            response = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=60)
+
+            if response.status_code == 401:
+                raise RuntimeError("OpenAI API 인증 실패 (401). API 키를 확인하세요.")
+            elif response.status_code == 429:
+                if retry and current_retry < max_retries - 1:
+                    wait_time = base_wait * (2 ** current_retry)
+                    retry_after = response.headers.get("Retry-After")
+                    retry_after_seconds = None
+                    if retry_after:
+                        try:
+                            retry_after_seconds = float(retry_after)
+                        except ValueError:
+                            retry_after_seconds = None
+                    if retry_after_seconds is not None:
+                        wait_time = retry_after_seconds
+                    wait_time = max(wait_time, 10)
+                    jitter = random.uniform(0, 6)
+                    wait_time += jitter
+                    if _error_callback:
+                        _error_callback(
+                            "OpenAI 요청 한도 초과 (429)",
+                            {
+                                "request_id": request_id,
+                                "status": 429,
+                                "retry_after": retry_after_seconds,
+                                "wait_time": round(wait_time, 1),
+                                "attempt": current_retry + 1,
+                            }
+                        )
+                    if retry_after_seconds is not None:
+                        print(f"⚠️  OpenAI 요청 한도 초과 (429) [req:{request_id}] Retry-After={retry_after_seconds:.1f}s, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도... (retry {current_retry + 1}/{max_retries})")
+                    else:
+                        print(f"⚠️  OpenAI 요청 한도 초과 (429) [req:{request_id}] Retry-After 없음, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도... (retry {current_retry + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    current_retry += 1
+                    continue
+                if _error_callback:
+                    _error_callback(
+                        "OpenAI 요청 한도 초과 (429) - 재시도 실패",
+                        {"request_id": request_id, "status": 429, "attempts": max_retries}
+                    )
                 raise RuntimeError("OpenAI 요청 한도 초과 (재시도 후에도 실패)")
-        elif response.status_code >= 500:
-            raise RuntimeError(f"OpenAI 서버 오류 ({response.status_code})")
-        
-        response.raise_for_status()
-        data = response.json()
-        content = data.get("output_text", "").strip()
-        if not content:
-            output = data.get("output", [])
-            if output:
-                contents = output[0].get("content", [])
-                for item in contents:
-                    if item.get("type") == "output_text" and item.get("text"):
-                        content = item["text"].strip()
-                        break
+            elif response.status_code >= 500:
+                if _error_callback:
+                    _error_callback(
+                        "OpenAI 서버 오류",
+                        {"request_id": request_id, "status": response.status_code}
+                    )
+                raise RuntimeError(f"OpenAI 서버 오류 ({response.status_code})")
 
-        if not content:
-            raise KeyError("Responses API 응답에서 output_text를 찾을 수 없습니다.")
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("output_text", "").strip()
+            if not content:
+                output = data.get("output", [])
+                if output:
+                    contents = output[0].get("content", [])
+                    for item in contents:
+                        if item.get("type") == "output_text" and item.get("text"):
+                            content = item["text"].strip()
+                            break
 
-        parsed = json.loads(content)
-        results = parsed.get("results", [])
-        
-        # 리스트를 딕셔너리로 변환 {id: result}
-        result_dict = {}
-        for item in results:
-            idx = item.get("id")
-            if idx is not None:
-                result_dict[idx] = item
-        
-        return result_dict
-    
-    except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException) as e:
-        print(f"⚠️  배치 {task_type} 오류: {e}")
-        if retry:
-            print("재시도 중...")
-            time.sleep(2)
-            return call_openai_batch(articles, task_type, openai_key, retry=False)
-        else:
+            if not content:
+                raise KeyError("Responses API 응답에서 output_text를 찾을 수 없습니다.")
+
+            parsed = json.loads(content)
+            results = parsed.get("results", [])
+
+            # 리스트를 딕셔너리로 변환 {id: result}
+            result_dict = {}
+            for item in results:
+                idx = item.get("id")
+                if idx is not None:
+                    result_dict[idx] = item
+
+            return result_dict
+
+        except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException) as e:
+            print(f"⚠️  배치 {task_type} 오류 [req:{request_id}]: {e}")
+            if _error_callback:
+                _error_callback(
+                    f"OpenAI 배치 {task_type} 오류",
+                    {"request_id": request_id, "error": str(e), "attempt": current_retry + 1}
+                )
+            if retry and current_retry < max_retries - 1:
+                print(f"재시도 중... [req:{request_id} retry:{current_retry + 1}/{max_retries}]")
+                time.sleep(2)
+                current_retry += 1
+                continue
+            if _error_callback:
+                _error_callback(
+                    f"OpenAI 배치 {task_type} 실패",
+                    {"request_id": request_id, "error": str(e), "attempt": current_retry + 1}
+                )
             return {}
 
 

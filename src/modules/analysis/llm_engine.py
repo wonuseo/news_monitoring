@@ -5,6 +5,8 @@ prompts.yaml 기반 단일 OpenAI 호출로 전체 분류 수행
 
 import json
 import time
+import random
+import uuid
 import yaml
 import requests
 from pathlib import Path
@@ -12,6 +14,14 @@ from typing import Dict, List, Optional
 
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
+
+_error_callback = None
+
+
+def set_error_callback(callback):
+    """Register error logger callback: fn(message: str, data: dict)."""
+    global _error_callback
+    _error_callback = callback
 
 
 def load_api_models(yaml_path: Path = None) -> dict:
@@ -122,6 +132,7 @@ def call_openai_structured(
         }
     }
 
+    request_id = uuid.uuid4().hex[:8]
     last_error = None
 
     for attempt in range(max_retries):
@@ -131,29 +142,80 @@ def call_openai_structured(
             if response.status_code == 401:
                 raise RuntimeError("OpenAI API 인증 실패 (401). API 키를 확인하세요.")
             elif response.status_code == 429:
-                print(f"⚠️  OpenAI 요청 한도 초과 (429) - 시도 {attempt + 1}/{max_retries}")
+                print(f"⚠️  OpenAI 요청 한도 초과 (429) [req:{request_id}] - 시도 {attempt + 1}/{max_retries}")
                 if attempt < max_retries - 1:
-                    # Exponential backoff: 5초 → 10초 → 20초 → 40초 → 80초
-                    wait_time = 5 * (2 ** attempt)
-                    print(f"   {wait_time}초 대기 후 재시도...")
+                    # Retry-After + jitter (prefer server hint)
+                    wait_time = 15 * (2 ** attempt)
+                    retry_after = response.headers.get("Retry-After")
+                    retry_after_seconds = None
+                    if retry_after:
+                        try:
+                            retry_after_seconds = float(retry_after)
+                        except ValueError:
+                            retry_after_seconds = None
+                    if retry_after_seconds is not None:
+                        wait_time = retry_after_seconds
+                    wait_time = max(wait_time, 10)
+                    jitter = random.uniform(0, 6)
+                    wait_time += jitter
+                    if _error_callback:
+                        _error_callback(
+                            "OpenAI 요청 한도 초과 (429)",
+                            {
+                                "request_id": request_id,
+                                "status": 429,
+                                "retry_after": retry_after_seconds,
+                                "wait_time": round(wait_time, 1),
+                                "attempt": attempt + 1,
+                            }
+                        )
+                    if retry_after_seconds is not None:
+                        print(f"   Retry-After={retry_after_seconds:.1f}s, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도... [req:{request_id} retry:{attempt + 1}/{max_retries}]")
+                    else:
+                        print(f"   Retry-After 없음, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도... [req:{request_id} retry:{attempt + 1}/{max_retries}]")
                     time.sleep(wait_time)
                     continue
                 else:
+                    if _error_callback:
+                        _error_callback(
+                            "OpenAI 요청 한도 초과 (429) - 재시도 실패",
+                            {"request_id": request_id, "status": 429, "attempts": max_retries}
+                        )
                     raise RuntimeError("OpenAI 요청 한도 초과 (5회 재시도 후에도 실패)")
             elif response.status_code == 400:
                 try:
                     error_detail = response.json()
+                    if _error_callback:
+                        _error_callback(
+                            "OpenAI 요청 오류 (400)",
+                            {"request_id": request_id, "status": 400, "detail": error_detail, "attempt": attempt + 1}
+                        )
                     raise RuntimeError(f"OpenAI 요청 오류 (400): {error_detail}")
                 except json.JSONDecodeError:
+                    if _error_callback:
+                        _error_callback(
+                            "OpenAI 요청 오류 (400)",
+                            {"request_id": request_id, "status": 400, "detail": response.text[:200], "attempt": attempt + 1}
+                        )
                     raise RuntimeError(f"OpenAI 요청 오류 (400): {response.text[:200]}")
             elif response.status_code >= 500:
                 print(f"⚠️  OpenAI 서버 오류 ({response.status_code}) - 시도 {attempt + 1}/{max_retries}")
+                if _error_callback:
+                    _error_callback(
+                        "OpenAI 서버 오류",
+                        {"request_id": request_id, "status": response.status_code, "attempt": attempt + 1}
+                    )
                 if attempt < max_retries - 1:
-                    wait_time = 5 * (2 ** attempt)
+                    wait_time = 8 * (2 ** attempt)
                     print(f"   {wait_time}초 대기 후 재시도...")
                     time.sleep(wait_time)
                     continue
                 else:
+                    if _error_callback:
+                        _error_callback(
+                            "OpenAI 서버 오류 - 재시도 실패",
+                            {"request_id": request_id, "status": response.status_code, "attempts": max_retries}
+                        )
                     raise RuntimeError(f"OpenAI 서버 오류 ({response.status_code}, 5회 재시도 후에도 실패)")
 
             response.raise_for_status()
@@ -179,6 +241,11 @@ def call_openai_structured(
         except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException) as e:
             last_error = e
             print(f"⚠️  OpenAI 호출 오류 - 시도 {attempt + 1}/{max_retries}: {e}")
+            if _error_callback:
+                _error_callback(
+                    "OpenAI 호출 오류 (예외)",
+                    {"request_id": request_id, "error": str(e), "attempt": attempt + 1}
+                )
             if attempt < max_retries - 1:
                 wait_time = 2 * (2 ** attempt)
                 print(f"   {wait_time}초 대기 후 재시도...")
@@ -186,6 +253,11 @@ def call_openai_structured(
                 continue
             else:
                 print(f"❌ 5회 재시도 후에도 실패: {last_error}")
+                if _error_callback:
+                    _error_callback(
+                        "OpenAI 호출 실패 (예외)",
+                        {"request_id": request_id, "error": str(last_error)}
+                    )
                 return None
 
     return None

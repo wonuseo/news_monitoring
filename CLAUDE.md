@@ -61,7 +61,7 @@ STEP 3: LLM Classification
 
 STEP 4: Reporting
 ├─ Console report (summary statistics)
-└─ Keyword extraction (optional, saved to Google Sheets)
+└─ Keyword extraction (automatic, saved to Google Sheets + CSV)
 
 STEP 5: Sheets Sync
 └─ Incremental upload to 2 tabs (raw_data, result)
@@ -142,8 +142,8 @@ python main.py --chunk_size 50
 # Limit competitor analysis (default is unlimited)
 python main.py --max_competitor_classify 20
 
-# Extract category-specific keywords (kiwipiepy + Log-odds → Google Sheets)
-python main.py --extract_keywords --keyword_top_k 20
+# Adjust keyword extraction count (default: 20, auto-runs every time)
+python main.py --keyword_top_k 30
 
 # Browser scraping with date range
 python main.py --scrape --start_date 2026-01-01 --end_date 2026-02-08
@@ -221,13 +221,13 @@ python main.py --max_workers 10
 - **Incremental save**: Appends to result.csv after each successful chunk
 - **Configuration**: All prompts and rules in `prompts.yaml` - no code changes needed
 
-### Keyword Extraction (Optional)
+### Keyword Extraction (Automatic)
 - **Method**: kiwipiepy (Korean morphological analysis) + Log-odds ratio with Laplace smoothing
 - **POS tags**: NNG (common noun), NNP (proper noun), VV (verb), VA (adjective)
 - **Statistics**: Log-odds ratio = log(P(word|category)) - log(P(word|other categories))
 - **Output**: Top-K keywords per category (default: 20)
 - **Categories**: sentiment_stage, danger_level, issue_category, news_category, brand_relevance
-- **Usage**: `--extract_keywords --keyword_top_k 20`
+- **Usage**: Runs automatically after classification, adjust count with `--keyword_top_k 30`
 - **Storage**:
   - Primary: Google Sheets `keywords` tab
   - Backup: `data/keywords/keywords_{category}.csv`
@@ -276,14 +276,14 @@ The system automatically tracks all pipeline metrics and saves them to CSV + Goo
 - `raw.csv` - Raw API collection (UTF-8 BOM, troubleshooting backup)
 - `result.csv` - LLM classified results (UTF-8 BOM, troubleshooting backup)
 - `media_directory.csv` - Media outlet directory (persistent)
-- `keywords/` - Category-specific keyword CSV files (if `--extract_keywords`, troubleshooting backup)
+- `keywords/` - Category-specific keyword CSV files (automatic, troubleshooting backup)
 - `logs/run_history.csv` - Run metrics history (persistent, append mode)
 
 **Google Sheets** (primary data store, if configured):
 - `raw_data` tab: Raw collected articles
 - `result` tab: Classified articles with all LLM columns
 - `logs` tab: Run history with metrics
-- `keywords` tab: Category-specific keywords (if `--extract_keywords`)
+- `keywords` tab: Category-specific keywords (automatic)
 - Auto-deduplication by link
 - CSV files are backups for troubleshooting
 

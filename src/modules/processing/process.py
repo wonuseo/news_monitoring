@@ -147,11 +147,36 @@ def enrich_with_media_info(
 
 
 def save_csv(df: pd.DataFrame, filepath: Path) -> None:
-    """CSV 파일로 저장 (UTF-8 BOM 인코딩, 모든 필드 quoting)"""
+    """
+    CSV 파일로 저장 (UTF-8 BOM 인코딩, 모든 필드 quoting)
+    BOM 문자(\ufeff)를 데이터에서 제거
+    """
     import csv
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(filepath, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
+
+        # 모든 BOM 및 invisible 문자 제거 (데이터 내부)
+        df_clean = df.copy()
+
+        # 제거할 invisible 문자 리스트
+        invisible_chars = [
+            '\ufeff', '\ufffe',  # BOM
+            '\u200b', '\u200c', '\u200d', '\u2060',  # Zero Width
+            '\u180e', '\u2028', '\u2029'  # 기타
+        ]
+
+        for col in df_clean.columns:
+            if df_clean[col].dtype == 'object':  # 문자열 컬럼만
+                def clean_invisible(x):
+                    if pd.notna(x) and x != '':
+                        x_str = str(x)
+                        for char in invisible_chars:
+                            x_str = x_str.replace(char, '')
+                        return x_str.strip()
+                    return x
+                df_clean[col] = df_clean[col].apply(clean_invisible)
+
+        df_clean.to_csv(filepath, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
         print(f"💾 저장: {filepath}")
     except Exception as e:
         print(f"❌ CSV 저장 실패 ({filepath}): {e}")

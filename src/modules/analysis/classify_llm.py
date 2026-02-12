@@ -117,11 +117,13 @@ def classify_llm(
         "news_keyword_summary"
     ]
 
-    # 컬럼 초기화
+    # 컬럼 초기화 (이미 존재하는 값은 보존)
     for col in result_columns:
-        df[col] = None
+        if col not in df.columns:
+            df[col] = None
 
-    df["classified_at"] = ""
+    if "classified_at" not in df.columns:
+        df["classified_at"] = ""
 
     # Load prompts config
     print("\n🔧 LLM 분류 시작...")
@@ -244,6 +246,16 @@ def classify_llm(
                             # JSON serializable 타입으로 변환
                             if isinstance(value, (dict, list)):
                                 value = json.dumps(value, ensure_ascii=False)
+                            # 모든 BOM 및 invisible 문자 제거
+                            if isinstance(value, str):
+                                invisible_chars = [
+                                    '\ufeff', '\ufffe',  # BOM
+                                    '\u200b', '\u200c', '\u200d', '\u2060',  # Zero Width
+                                    '\u180e', '\u2028', '\u2029'  # 기타
+                                ]
+                                for char in invisible_chars:
+                                    value = value.replace(char, '')
+                                value = value.strip()
                             df.at[idx, col] = value
 
                     df.at[idx, "classified_at"] = timestamp
@@ -298,13 +310,19 @@ def classify_llm(
                 # sync_raw_and_processed를 동적으로 임포트
                 from src.modules.export.sheets import sync_raw_and_processed
 
-                # result.csv 전체를 다시 읽어서 동기화 (중복 체크 자동)
+                # result.csv 전체를 다시 읽어서 동기화 (중복 체크 자동, upsert 지원)
                 if os.path.exists(result_csv_path):
                     df_result_current = pd.read_csv(result_csv_path, encoding='utf-8-sig')
                     sync_results = sync_raw_and_processed(raw_df, df_result_current, spreadsheet)
                     added_count = sum(r.get('added', 0) for r in sync_results.values())
-                    if added_count > 0:
-                        print(f"    ☁️  Sheets 동기화: {added_count}개 추가")
+                    updated_count = sum(r.get('updated', 0) for r in sync_results.values())
+                    if added_count > 0 or updated_count > 0:
+                        msg_parts = []
+                        if added_count > 0:
+                            msg_parts.append(f"{added_count}개 추가")
+                        if updated_count > 0:
+                            msg_parts.append(f"{updated_count}개 업데이트")
+                        print(f"    ☁️  Sheets 동기화: {', '.join(msg_parts)}")
             except Exception as e:
                 print(f"    ⚠️  Sheets 동기화 실패: {e}")
 

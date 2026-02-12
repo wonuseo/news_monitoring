@@ -30,6 +30,10 @@ class RunLogger:
             "run_id": self.run_id,
             "timestamp": datetime.now().isoformat(),
         }
+        self.event_logs = []
+        self._events_flushed = 0
+        self.error_logs = []
+        self._errors_flushed = 0
         self.stage_start_times = {}
 
     def log(self, key: str, value: Any):
@@ -39,6 +43,34 @@ class RunLogger:
     def log_dict(self, metrics_dict: Dict[str, Any]):
         """Log multiple metrics at once"""
         self.metrics.update(metrics_dict)
+
+    def log_event(self, event: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Log a point-in-time event for Google Sheets logs.
+        """
+        payload = {
+            "run_id": self.run_id,
+            "timestamp": datetime.now().isoformat(),
+            "event": event,
+            "data_json": json.dumps(data, ensure_ascii=False) if data else ""
+        }
+        self.event_logs.append(payload)
+        return payload
+
+    def log_error(self, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Log an error event (also print to terminal).
+        """
+        print(f"❌ ERROR: {message}")
+        self.metrics["errors_total"] = self.metrics.get("errors_total", 0) + 1
+        payload = {
+            "run_id": self.run_id,
+            "timestamp": datetime.now().isoformat(),
+            "message": message,
+            "data_json": json.dumps(data, ensure_ascii=False) if data else ""
+        }
+        self.error_logs.append(payload)
+        return payload
 
     def start_stage(self, stage_name: str):
         """Mark the start of a pipeline stage (for duration tracking)"""
@@ -160,7 +192,9 @@ class RunLogger:
             print("☁️ Google Sheets 동기화")
             print(f"  - raw_data 업로드: {self.metrics.get('sheets_rows_uploaded_raw', 0)}행")
             print(f"  - result 업로드: {self.metrics.get('sheets_rows_uploaded_result', 0)}행")
-            print(f"  - logs 업로드: {self.metrics.get('sheets_logs_uploaded', 0)}행")
+            print(f"  - run_history 업로드: {self.metrics.get('sheets_logs_uploaded', 0)}행")
+            print(f"  - logs 이벤트 업로드: {self.metrics.get('sheets_event_logs_uploaded', 0)}행")
+            print(f"  - errors 업로드: {self.metrics.get('sheets_errors_uploaded', 0)}행")
             print(f"  - 소요 시간: {self.metrics.get('duration_sheets_sync', 0):.2f}초")
             print()
 
@@ -173,15 +207,90 @@ class RunLogger:
 
         print("="*60)
 
+    def _get_or_create_headers(self, worksheet, default_headers):
+        existing = worksheet.row_values(1)
+        if not existing:
+            worksheet.append_row(default_headers)
+            return default_headers
+        return existing
 
-def sync_logs_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "logs"):
+    def flush_events_to_sheets(self, spreadsheet, sheet_name: str = "logs") -> bool:
+        """
+        Append all buffered event logs to Google Sheets.
+        """
+        if self._events_flushed >= len(self.event_logs):
+            return True
+
+        try:
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+            except:
+                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
+
+            headers = self._get_or_create_headers(
+                worksheet, ["run_id", "timestamp", "event", "data_json"]
+            )
+
+            pending = self.event_logs[self._events_flushed:]
+            rows = []
+            for e in pending:
+                row_map = {
+                    "run_id": e["run_id"],
+                    "timestamp": e["timestamp"],
+                    "event": e["event"],
+                    "data_json": e["data_json"]
+                }
+                rows.append([row_map.get(h, "") for h in headers])
+            worksheet.append_rows(rows)
+            self._events_flushed = len(self.event_logs)
+            return True
+        except Exception as e:
+            print(f"⚠️ logs 이벤트 업로드 실패: {e}")
+            return False
+
+    def flush_errors_to_sheets(self, spreadsheet, sheet_name: str = "errors") -> bool:
+        """
+        Append all buffered error logs to Google Sheets.
+        """
+        if self._errors_flushed >= len(self.error_logs):
+            return True
+
+        try:
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+            except:
+                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
+
+            headers = self._get_or_create_headers(
+                worksheet, ["run_id", "timestamp", "message", "data_json"]
+            )
+
+            pending = self.error_logs[self._errors_flushed:]
+            rows = []
+            for e in pending:
+                row_map = {
+                    "run_id": e["run_id"],
+                    "timestamp": e["timestamp"],
+                    "message": e["message"],
+                    "data_json": e["data_json"]
+                }
+                rows.append([row_map.get(h, "") for h in headers])
+            worksheet.append_rows(rows)
+            self._errors_flushed = len(self.error_logs)
+            return True
+        except Exception as e:
+            print(f"⚠️ errors 업로드 실패: {e}")
+            return False
+
+
+def sync_logs_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "run_history"):
     """
     Sync run history CSV to Google Sheets.
 
     Args:
         csv_path: Path to run_history.csv
         spreadsheet: gspread spreadsheet object
-        sheet_name: Sheet name (default: "logs")
+        sheet_name: Sheet name (default: "run_history")
     """
     try:
         if not os.path.exists(csv_path):
