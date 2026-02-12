@@ -34,7 +34,9 @@ from src.modules.export.sheets import (
     sync_raw_and_processed,
     load_existing_links_from_sheets,
     filter_new_articles_from_sheets,
-    load_analysis_status_from_sheets
+    load_analysis_status_from_sheets,
+    clean_all_bom_in_sheets,
+    clean_bom
 )
 from src.modules.monitoring.logger import RunLogger, sync_logs_to_sheets
 
@@ -122,6 +124,10 @@ def main():
     parser.add_argument("--keyword_top_k", type=int, default=20,
                         help="키워드 추출 시 상위 K개 선택 (기본: 20)")
 
+    # BOM 정리 옵션
+    parser.add_argument("--clean_bom", action="store_true",
+                        help="Google Sheets 전체 BOM 문자 정리 후 종료")
+
     args = parser.parse_args()
 
     # CLI args 로깅
@@ -168,17 +174,17 @@ def main():
     # Google Sheets 연결 (주 저장소)
     existing_links = set()
     spreadsheet = None
-    def record_error(message, data=None):
-        logger.log_error(message, data)
+    def record_error(message, data=None, category="system"):
+        logger.log_error(message, data, category=category)
         if spreadsheet:
-            if logger.flush_errors_to_sheets(spreadsheet):
-                logger.log("sheets_errors_uploaded", len(logger.error_logs))
+            if logger.flush_logs_to_sheets(spreadsheet):
+                logger.log("sheets_logs_uploaded", len(logger._logs))
 
     # Error callback registration for OpenAI wrappers (log failures only)
-    set_llm_error_callback(lambda msg, data=None: record_error(msg, data))
-    set_batch_error_callback(lambda msg, data=None: record_error(msg, data))
-    set_pr_error_callback(lambda msg, data=None: record_error(msg, data))
-    set_media_error_callback(lambda msg, data=None: record_error(msg, data))
+    set_llm_error_callback(lambda msg, data=None: record_error(msg, data, category="openai_api"))
+    set_batch_error_callback(lambda msg, data=None: record_error(msg, data, category="openai_api"))
+    set_pr_error_callback(lambda msg, data=None: record_error(msg, data, category="openai_api"))
+    set_media_error_callback(lambda msg, data=None: record_error(msg, data, category="openai_api"))
 
     # Google Sheets 자동 연결 (credentials 필수 권장)
     creds_path = os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH", "service-account.json")
@@ -189,16 +195,23 @@ def main():
             print("\n📊 Google Sheets 연결 중...")
             spreadsheet = connect_sheets(creds_path, sheet_id)
             if spreadsheet:
+                # Sheets 기존 BOM 자동 정리 (데이터 로드 전)
+                print("🧹 Sheets BOM 문자 자동 정리 중...")
+                bom_results = clean_all_bom_in_sheets(spreadsheet)
+                bom_total = sum(bom_results.values())
+                if bom_total > 0:
+                    print(f"  ✅ {bom_total}개 셀 BOM 제거 완료")
+
                 existing_links = load_existing_links_from_sheets(spreadsheet)
                 print("✅ Google Sheets 연결 성공 (주 저장소)")
                 print("   CSV 파일은 troubleshooting용으로 함께 저장됩니다.")
-                logger.log_event("sheets_connected", {"sheet_id": sheet_id})
-                if logger.flush_events_to_sheets(spreadsheet):
-                    logger.log("sheets_event_logs_uploaded", len(logger.event_logs))
+                logger.log_event("sheets_connected", {"sheet_id": sheet_id}, category="sheets_sync")
+                if logger.flush_logs_to_sheets(spreadsheet):
+                    logger.log("sheets_logs_uploaded", len(logger._logs))
         except Exception as e:
-            record_error(f"Google Sheets 연결 실패: {e}", {"sheet_id": sheet_id})
+            record_error(f"Google Sheets 연결 실패: {e}", {"sheet_id": sheet_id}, category="sheets_sync")
             print("   ⚠️  CSV 파일만 사용합니다 (troubleshooting 모드)")
-            logger.log_event("sheets_connect_failed", {"error": str(e)})
+            logger.log_event("sheets_connect_failed", {"error": str(e)}, category="sheets_sync")
     else:
         print("\n" + "="*80)
         print("⚠️  경고: Google Sheets 설정이 없습니다!")
@@ -210,7 +223,21 @@ def main():
         print("\n  Google Sheets는 주 저장소입니다. 설정을 권장합니다.")
         print("  현재는 CSV 파일만 사용합니다 (troubleshooting 모드)")
         print("="*80 + "\n")
-        logger.log_event("sheets_not_configured", {"credentials_path": creds_path, "sheet_id": sheet_id})
+        logger.log_event("sheets_not_configured", {"credentials_path": creds_path, "sheet_id": sheet_id}, category="sheets_sync")
+
+    # --clean_bom 모드: Sheets 전체 BOM 정리 후 종료
+    if args.clean_bom:
+        if not spreadsheet:
+            print("❌ --clean_bom 사용 시 Google Sheets 연결이 필요합니다.")
+            print("  .env 파일에 GOOGLE_SHEETS_CREDENTIALS_PATH와 GOOGLE_SHEET_ID를 설정하세요.")
+            return
+        print("\n" + "=" * 80)
+        print("BOM 문자 정리 모드")
+        print("=" * 80)
+        results = clean_all_bom_in_sheets(spreadsheet)
+        total_cleaned = sum(results.values())
+        print(f"\n✅ BOM 정리 완료: 총 {total_cleaned}개 셀 정리")
+        return
 
     raw_csv_path = outdir / "raw.csv"
 
@@ -261,8 +288,9 @@ def main():
                 msg_parts.append(f"{sync_result['updated']}개 업데이트")
             msg_parts.append(f"{sync_result.get('skipped', 0)}개 건너뜀")
             print(f"✅ raw_data 시트 동기화 완료: {', '.join(msg_parts)}")
+            logger.log_event("sheets_sync_raw_data", sync_result, category="sheets_sync")
         except Exception as e:
-            record_error(f"raw_data 시트 동기화 실패: {e}")
+            record_error(f"raw_data 시트 동기화 실패: {e}", category="sheets_sync")
 
     # 수집 단계 메트릭
     articles_per_query = df_raw_new.groupby('query').size().to_dict() if 'query' in df_raw_new.columns else {}
@@ -277,8 +305,8 @@ def main():
         "existing_links_skipped": existing_links_skipped
     })
     if spreadsheet:
-        if logger.flush_events_to_sheets(spreadsheet):
-            logger.log("sheets_event_logs_uploaded", len(logger.event_logs))
+        if logger.flush_logs_to_sheets(spreadsheet):
+            logger.log("sheets_logs_uploaded", len(logger._logs))
     logger.end_stage("collection")
 
     # STEP 1.5: 미처리/미분석 행 필터링
@@ -313,7 +341,7 @@ def main():
             print(f"  - 총 처리 대상: {len(df_to_process)}개")
 
         except Exception as e:
-            record_error(f"Google Sheets 분석 상태 로드 실패: {e}")
+            record_error(f"Google Sheets 분석 상태 로드 실패: {e}", category="sheets_sync")
             df_to_process = df_raw_new
 
     # 2) Google Sheets 미연결 시 result.csv 기준
@@ -336,21 +364,9 @@ def main():
             # 최소 하나의 필드라도 존재하면 체크
             existing_cols = [col for col in analysis_cols_to_check if col in df_result_existing.columns]
             if existing_cols:
-                # 모든 BOM 및 invisible 문자 제거 함수 (inline)
+                # BOM 문자 포함 빈 값 체크 (clean_bom 재사용)
                 def is_empty_or_bom(val):
-                    """모든 BOM 및 invisible 문자만 있거나 빈 값인지 체크"""
-                    if pd.isna(val):
-                        return True
-                    val_str = str(val)
-                    # 모든 invisible 문자 제거
-                    invisible_chars = [
-                        '\ufeff', '\ufffe',  # BOM
-                        '\u200b', '\u200c', '\u200d', '\u2060',  # Zero Width
-                        '\u180e', '\u2028', '\u2029'  # 기타
-                    ]
-                    for char in invisible_chars:
-                        val_str = val_str.replace(char, '')
-                    return val_str.strip() == ""
+                    return clean_bom(val) == ""
 
                 # LLM 분석 또는 전처리 필드가 비어있는 행 찾기 (BOM 문자 포함)
                 missing_analysis = df_result_existing[
@@ -386,7 +402,7 @@ def main():
                 print(f"  - 미처리 행: {len(unprocessed_rows)}개")
 
         except Exception as e:
-            record_error(f"result.csv 로드 실패: {e}")
+            record_error(f"result.csv 로드 실패: {e}", category="system")
             df_to_process = df_raw
     else:
         print(f"\n📊 result.csv가 없습니다. 전체 raw.csv {len(df_raw)}개 기사 처리")
@@ -415,16 +431,16 @@ def main():
                     "sheets_rows_uploaded_result": result_sync.get("added", 0) + result_sync.get("updated", 0)
                 })
             except Exception as e:
-                record_error(f"Google Sheets 업로드 실패 (기존 데이터): {e}")
+                record_error(f"Google Sheets 업로드 실패 (기존 데이터): {e}", category="sheets_sync")
                 logger.log("sheets_sync_enabled", False)
             logger.end_stage("sheets_sync")
             logger.log_event("sheets_sync_completed", {
                 "sheets_rows_uploaded_raw": logger.metrics.get("sheets_rows_uploaded_raw", 0),
                 "sheets_rows_uploaded_result": logger.metrics.get("sheets_rows_uploaded_result", 0)
-            })
+            }, category="sheets_sync")
             if spreadsheet:
-                if logger.flush_events_to_sheets(spreadsheet):
-                    logger.log("sheets_event_logs_uploaded", len(logger.event_logs))
+                if logger.flush_logs_to_sheets(spreadsheet):
+                    logger.log("sheets_logs_uploaded", len(logger._logs))
 
         # 로그 저장
         logger.finalize()
@@ -491,7 +507,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (중복 제거)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (중복 제거): {e}")
+                record_error(f"Sheets 동기화 실패 (중복 제거): {e}", category="sheets_sync")
 
         # Step 2-3: Detect similar articles (Press Release)
         df_processed = detect_similar_articles(df_processed)
@@ -512,7 +528,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (보도자료 탐지)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (보도자료 탐지): {e}")
+                record_error(f"Sheets 동기화 실패 (보도자료 탐지): {e}", category="sheets_sync")
 
         # Step 2-4: Summarize press release groups (OpenAI)
         df_processed = summarize_press_release_groups(df_processed, env["openai_key"])
@@ -532,7 +548,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (보도자료 요약)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (보도자료 요약): {e}")
+                record_error(f"Sheets 동기화 실패 (보도자료 요약): {e}", category="sheets_sync")
 
         # Step 2-5: Media classification (OpenAI)
         media_csv_path = outdir / "media_directory.csv"
@@ -558,7 +574,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (언론사 분류)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (언론사 분류): {e}")
+                record_error(f"Sheets 동기화 실패 (언론사 분류): {e}", category="sheets_sync")
 
         # 나머지 NaN → 공란 변환
         df_processed = df_processed.fillna("")
@@ -585,18 +601,8 @@ def main():
             "press_release_groups": press_release_groups
         })
         if spreadsheet:
-            if logger.flush_events_to_sheets(spreadsheet):
-                logger.log("sheets_event_logs_uploaded", len(logger.event_logs))
-        logger.log_event("processing_completed", {
-            "articles_processed": len(df_processed),
-            "duplicates_removed": duplicates_removed,
-            "articles_filtered_by_date": filtered_count,
-            "press_releases_detected": press_releases,
-            "press_release_groups": press_release_groups
-        })
-        if spreadsheet:
-            if logger.flush_events_to_sheets(spreadsheet):
-                logger.log("sheets_event_logs_uploaded", len(logger.event_logs))
+            if logger.flush_logs_to_sheets(spreadsheet):
+                logger.log("sheets_logs_uploaded", len(logger._logs))
 
         # 기존 result.csv와 병합
         if result_csv_path.exists():
@@ -617,7 +623,7 @@ def main():
                 sync_results = sync_raw_and_processed(df_raw, df_result, spreadsheet)
                 print("✅ 전처리 결과 Sheets 동기화 완료")
             except Exception as e:
-                record_error(f"전처리 결과 Sheets 동기화 실패: {e}")
+                record_error(f"전처리 결과 Sheets 동기화 실패: {e}", category="sheets_sync")
     else:
         # Step 2: 처리 (미처리 행만)
         logger.start_stage("processing")
@@ -657,7 +663,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (중복 제거)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (중복 제거): {e}")
+                record_error(f"Sheets 동기화 실패 (중복 제거): {e}", category="sheets_sync")
 
         # Step 2-3: Detect similar articles (Press Release)
         df_processed = detect_similar_articles(df_processed)
@@ -678,7 +684,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (보도자료 탐지)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (보도자료 탐지): {e}")
+                record_error(f"Sheets 동기화 실패 (보도자료 탐지): {e}", category="sheets_sync")
 
         # Step 2-4: Summarize press release groups (OpenAI)
         df_processed = summarize_press_release_groups(df_processed, env["openai_key"])
@@ -698,7 +704,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (보도자료 요약)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (보도자료 요약): {e}")
+                record_error(f"Sheets 동기화 실패 (보도자료 요약): {e}", category="sheets_sync")
 
         # Step 2-5: Media classification (OpenAI)
         media_csv_path = outdir / "media_directory.csv"
@@ -724,7 +730,7 @@ def main():
                 sync_raw_and_processed(df_raw, df_temp, spreadsheet)
                 print("✅ Sheets 동기화 완료 (언론사 분류)")
             except Exception as e:
-                record_error(f"Sheets 동기화 실패 (언론사 분류): {e}")
+                record_error(f"Sheets 동기화 실패 (언론사 분류): {e}", category="sheets_sync")
 
         # 전처리 메트릭
         press_release_groups = df_processed['group_id'].nunique() if 'group_id' in df_processed.columns else 0
@@ -793,8 +799,8 @@ def main():
             "classification_errors": llm_metrics.get("classification_errors", 0)
         })
         if spreadsheet:
-            if logger.flush_events_to_sheets(spreadsheet):
-                logger.log("sheets_event_logs_uploaded", len(logger.event_logs))
+            if logger.flush_logs_to_sheets(spreadsheet):
+                logger.log("sheets_logs_uploaded", len(logger._logs))
 
         # 기존 result.csv와 병합
         if result_csv_path.exists():
@@ -819,7 +825,7 @@ def main():
                 sync_results = sync_raw_and_processed(df_raw, df_result, spreadsheet)
                 print("✅ 분류 결과 Sheets 동기화 완료")
             except Exception as e:
-                record_error(f"분류 결과 Sheets 동기화 실패: {e}")
+                record_error(f"분류 결과 Sheets 동기화 실패: {e}", category="sheets_sync")
 
         # Step 4: 리포트 생성
         print("\n" + "=" * 80)
@@ -875,17 +881,17 @@ def main():
                 "sheets_rows_uploaded_result": result_sync.get("added", 0) + result_sync.get("updated", 0)
             })
         except Exception as e:
-            record_error(f"Google Sheets 동기화 실패 (최종): {e}")
+            record_error(f"Google Sheets 동기화 실패 (최종): {e}", category="sheets_sync")
             print("   ⚠️  CSV 파일만 저장되었습니다 (troubleshooting 모드)")
             logger.log("sheets_sync_enabled", False)
         logger.end_stage("sheets_sync")
         logger.log_event("sheets_sync_completed", {
             "sheets_rows_uploaded_raw": logger.metrics.get("sheets_rows_uploaded_raw", 0),
             "sheets_rows_uploaded_result": logger.metrics.get("sheets_rows_uploaded_result", 0)
-        })
+        }, category="sheets_sync")
         if spreadsheet:
-            if logger.flush_events_to_sheets(spreadsheet):
-                logger.log("sheets_event_logs_uploaded", len(logger.event_logs))
+            if logger.flush_logs_to_sheets(spreadsheet):
+                logger.log("sheets_logs_uploaded", len(logger._logs))
     else:
         logger.log("sheets_sync_enabled", False)
         print("\n" + "=" * 80)
@@ -902,14 +908,14 @@ def main():
     logs_csv_path = outdir / "logs" / "run_history.csv"
     logger.save_csv(str(logs_csv_path))
 
-    # Sheets 로그 동기화
+    # Sheets run_history 동기화
     if spreadsheet:
         try:
             sync_logs_to_sheets(str(logs_csv_path), spreadsheet)
-            logger.log("sheets_logs_uploaded", 1)
+            logger.log("sheets_run_history_uploaded", 1)
         except Exception as e:
-            record_error(f"로그 Sheets 동기화 실패: {e}")
-            logger.log("sheets_logs_uploaded", 0)
+            record_error(f"run_history Sheets 동기화 실패: {e}", category="sheets_sync")
+            logger.log("sheets_run_history_uploaded", 0)
 
     # 로그 요약 출력
     logger.print_summary()

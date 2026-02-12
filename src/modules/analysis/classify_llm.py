@@ -14,6 +14,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from .llm_engine import load_prompts, analyze_article_llm
+from src.modules.export.sheets import clean_bom
 
 
 # CSV 쓰기 Lock (멀티스레드 환경에서 파일 쓰기 경합 방지)
@@ -138,34 +139,24 @@ def classify_llm(
     # ========================================
     print("\n[1/2] 분류 대상 선택 중...")
 
+    def already_classified(row) -> bool:
+        value = clean_bom(row.get("classified_at", ""))
+        return isinstance(value, str) and len(value.strip()) > 1
+
+    def has_article_id(row) -> bool:
+        value = clean_bom(row.get("article_id", ""))
+        return isinstance(value, str) and len(value.strip()) >= 6
+
     indices_to_classify = []
-    competitor_count = {}
-    classify_all_competitors = (max_competitor_classify <= 0)  # 0이면 무제한
-
     for idx, row in df.iterrows():
-        # 이미 분류된 행은 스킵 (보도자료 전처리 등)
-        if pd.notna(row.get("classified_at", "")) and row.get("classified_at", "") != "":
+        if already_classified(row):
             continue
-
-        group = row.get("group", "")
-
-        # 우리 브랜드는 전부
-        if group == "OUR":
-            indices_to_classify.append(idx)
-        # 경쟁사는 무제한 or 각 브랜드당 최신 N개
-        elif group == "COMPETITOR":
-            if classify_all_competitors:
-                indices_to_classify.append(idx)
-            else:
-                query = row.get("query", "")
-                count = competitor_count.get(query, 0)
-                if count < max_competitor_classify:
-                    competitor_count[query] = count + 1
-                    indices_to_classify.append(idx)
+        if not has_article_id(row):
+            continue
+        indices_to_classify.append(idx)
 
     # 스킵된 기사 통계 (보도자료 전처리 등)
-    skipped_count = sum(1 for _, row in df.iterrows()
-                       if pd.notna(row.get("classified_at", "")) and row.get("classified_at", "") != "")
+    skipped_count = sum(1 for _, row in df.iterrows() if already_classified(row))
 
     metrics["press_releases_skipped"] = skipped_count
 
@@ -178,8 +169,6 @@ def classify_llm(
         return df, metrics
 
     print(f"  선택된 기사: {len(indices_to_classify)}개")
-    print(f"  - 우리 브랜드: {sum(1 for idx in indices_to_classify if df.at[idx, 'group'] == 'OUR')}개")
-    print(f"  - 경쟁사: {sum(1 for idx in indices_to_classify if df.at[idx, 'group'] == 'COMPETITOR')}개")
     if skipped_count > 0:
         print(f"  - 스킵: {skipped_count}개 (이미 분류됨)")
 
@@ -248,14 +237,7 @@ def classify_llm(
                                 value = json.dumps(value, ensure_ascii=False)
                             # 모든 BOM 및 invisible 문자 제거
                             if isinstance(value, str):
-                                invisible_chars = [
-                                    '\ufeff', '\ufffe',  # BOM
-                                    '\u200b', '\u200c', '\u200d', '\u2060',  # Zero Width
-                                    '\u180e', '\u2028', '\u2029'  # 기타
-                                ]
-                                for char in invisible_chars:
-                                    value = value.replace(char, '')
-                                value = value.strip()
+                                value = clean_bom(value)
                             df.at[idx, col] = value
 
                     df.at[idx, "classified_at"] = timestamp
@@ -273,7 +255,7 @@ def classify_llm(
                                     mode='a' if file_exists else 'w',
                                     header=not file_exists,
                                     index=False,
-                                    encoding='utf-8-sig'
+                                    encoding='utf-8-sig' if not file_exists else 'utf-8'
                                 )
                         except Exception as csv_err:
                             print(f"⚠️  CSV 저장 실패 [idx={idx}]: {csv_err}")

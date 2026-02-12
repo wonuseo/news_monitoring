@@ -15,6 +15,8 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 import pandas as pd
 
+from src.modules.export.sheets import clean_bom
+
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 
@@ -323,18 +325,22 @@ JSON 객체만 출력하세요."""
 def should_classify(row: Dict, max_competitor_classify: int, 
                    competitor_count: Dict[str, int]) -> bool:
     """분류 대상 여부 판단"""
+    group_value = clean_bom(row.get("group", ""))
+    group = group_value.upper()
+
     # 우리 브랜드는 전부 분류
-    if row.get("group") == "OUR":
+    if group == "OUR":
         return True
     
     # 경쟁사는 각 브랜드당 최신 N개만 분류
-    if row.get("group") == "COMPETITOR":
-        query = row.get("query", "")
+    if group == "COMPETITOR":
+        query_raw = row.get("query", "")
+        query = clean_bom(query_raw)
         count = competitor_count.get(query, 0)
         if count < max_competitor_classify:
             competitor_count[query] = count + 1
             return True
-    
+   
     return False
 
 

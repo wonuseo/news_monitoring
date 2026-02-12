@@ -149,32 +149,34 @@ def enrich_with_media_info(
 def save_csv(df: pd.DataFrame, filepath: Path) -> None:
     """
     CSV 파일로 저장 (UTF-8 BOM 인코딩, 모든 필드 quoting)
-    BOM 문자(\ufeff)를 데이터에서 제거
+    BOM 문자(\ufeff) 및 invisible 문자를 데이터에서 제거
     """
     import csv
+    import re
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         # 모든 BOM 및 invisible 문자 제거 (데이터 내부)
         df_clean = df.copy()
 
-        # 제거할 invisible 문자 리스트
-        invisible_chars = [
-            '\ufeff', '\ufffe',  # BOM
-            '\u200b', '\u200c', '\u200d', '\u2060',  # Zero Width
-            '\u180e', '\u2028', '\u2029'  # 기타
-        ]
+        # 정규식으로 모든 invisible/제어 문자 일괄 제거
+        invisible_pattern = re.compile(
+            r'[\ufeff\ufffe'
+            r'\u200b-\u200f'
+            r'\u2028-\u202f'
+            r'\u2060\u180e'
+            r'\u00a0\u3000\u00ad'
+            r'\ufff9-\ufffc'
+            r'\x00-\x08\x0b\x0c\x0e-\x1f'
+            r'\x7f-\x9f]'
+        )
 
         for col in df_clean.columns:
-            if df_clean[col].dtype == 'object':  # 문자열 컬럼만
-                def clean_invisible(x):
-                    if pd.notna(x) and x != '':
-                        x_str = str(x)
-                        for char in invisible_chars:
-                            x_str = x_str.replace(char, '')
-                        return x_str.strip()
-                    return x
-                df_clean[col] = df_clean[col].apply(clean_invisible)
+            if df_clean[col].dtype == 'object':
+                df_clean[col] = df_clean[col].apply(
+                    lambda x: invisible_pattern.sub('', str(x)).strip()
+                    if pd.notna(x) and x != '' else x
+                )
 
         df_clean.to_csv(filepath, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
         print(f"💾 저장: {filepath}")

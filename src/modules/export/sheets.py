@@ -17,7 +17,10 @@ def clean_bom(value) -> str:
     제거 대상:
     - UTF-8/16/32 BOM: \ufeff, \ufffe
     - Zero Width 문자: \u200b, \u200c, \u200d, \u2060
-    - 기타 invisible 문자: \u180e, \u2028, \u2029
+    - Non-breaking/ideographic spaces: \u00a0, \u3000
+    - 기타 invisible 문자: \u180e, \u2028, \u2029, \u200e, \u200f, \u202a-\u202f
+    - C0/C1 제어 문자: \x00-\x08, \x0b, \x0c, \x0e-\x1f, \x7f-\x9f
+    - Interlinear annotation: \ufff9-\ufffc
 
     Args:
         value: 정리할 값
@@ -25,32 +28,129 @@ def clean_bom(value) -> str:
     Returns:
         정리된 문자열
     """
+    import re
+
     if pd.isna(value) or value is None:
         return ""
 
     # 문자열로 변환
     value_str = str(value)
 
-    # 모든 BOM 및 invisible 문자 제거
-    invisible_chars = [
-        '\ufeff',  # UTF-8/16 BE BOM (Zero Width No-Break Space)
-        '\ufffe',  # UTF-16 LE BOM
-        '\u200b',  # Zero Width Space
-        '\u200c',  # Zero Width Non-Joiner
-        '\u200d',  # Zero Width Joiner
-        '\u2060',  # Word Joiner
-        '\u180e',  # Mongolian Vowel Separator
-        '\u2028',  # Line Separator
-        '\u2029',  # Paragraph Separator
-    ]
-
-    for char in invisible_chars:
-        value_str = value_str.replace(char, '')
+    # 정규식으로 모든 invisible/제어 문자 일괄 제거
+    # BOM, Zero Width, 제어 문자, 방향 마크, non-breaking space 등
+    value_str = re.sub(
+        r'[\ufeff\ufffe'           # BOM
+        r'\u200b-\u200f'           # Zero Width + 방향 마크
+        r'\u2028-\u202f'           # 줄/단락 구분자 + 방향 포맷
+        r'\u2060'                  # Word Joiner
+        r'\u180e'                  # Mongolian Vowel Separator
+        r'\u00a0'                  # Non-Breaking Space
+        r'\u3000'                  # Ideographic Space (전각 공백)
+        r'\u00ad'                  # Soft Hyphen
+        r'\ufff9-\ufffc'           # Interlinear Annotation
+        r'\x00-\x08\x0b\x0c\x0e-\x1f'  # C0 제어 문자 (탭/개행 제외)
+        r'\x7f-\x9f'              # DEL + C1 제어 문자
+        r']', '', value_str
+    )
 
     # 앞뒤 공백 제거
     value_str = value_str.strip()
 
     return value_str
+
+
+def clean_all_bom_in_sheets(spreadsheet, sheet_names: list = None) -> Dict[str, int]:
+    """
+    Google Sheets의 모든 셀에서 BOM 및 invisible 문자를 일괄 제거
+
+    전체 시트 재작성 방식: API의 FORMATTED_VALUE가 BOM을 숨겨서
+    셀 단위 비교로는 감지 불가능한 BOM도 제거.
+
+    동작 방식:
+    1. 시트 전체 값을 읽기
+    2. 모든 셀 값에 clean_bom() 적용
+    3. 전체 시트를 정리된 값으로 덮어쓰기 (숨겨진 BOM도 제거)
+
+    Args:
+        spreadsheet: gspread Spreadsheet 객체
+        sheet_names: 정리할 시트 이름 리스트 (None이면 raw_data, total_result)
+
+    Returns:
+        {sheet_name: cleaned_cell_count}
+    """
+    if sheet_names is None:
+        sheet_names = ["raw_data", "total_result"]
+
+    results = {}
+
+    for sheet_name in sheet_names:
+        try:
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+            except Exception:
+                print(f"  ℹ️  '{sheet_name}' 워크시트가 없습니다. 건너뜀.")
+                results[sheet_name] = 0
+                continue
+
+            # 전체 데이터 읽기
+            all_values = worksheet.get_all_values()
+            if not all_values:
+                print(f"  ℹ️  '{sheet_name}' 워크시트가 비어있습니다.")
+                results[sheet_name] = 0
+                continue
+
+            # 모든 셀 값 정리 (API가 BOM을 숨겨도 감지 가능한 것은 카운트)
+            cleaned_rows = []
+            detected_count = 0
+
+            for row in all_values:
+                cleaned_row = []
+                for cell_value in row:
+                    if isinstance(cell_value, str) and cell_value:
+                        cleaned = clean_bom(cell_value)
+                        if cleaned != cell_value:
+                            detected_count += 1
+                        cleaned_row.append(cleaned)
+                    else:
+                        cleaned_row.append(cell_value if cell_value else "")
+                cleaned_rows.append(cleaned_row)
+
+            # 전체 시트 재작성 (숨겨진 BOM도 덮어쓰기로 제거)
+            num_rows = len(cleaned_rows)
+            num_cols = max(len(row) for row in cleaned_rows) if cleaned_rows else 0
+
+            if num_rows > 0 and num_cols > 0:
+                # 모든 행의 길이를 맞추기 (패딩)
+                for row in cleaned_rows:
+                    while len(row) < num_cols:
+                        row.append("")
+
+                last_col = col_num_to_letter(num_cols)
+                range_str = f"A1:{last_col}{num_rows}"
+
+                # 배치 단위로 업데이트 (대용량 시트 대응)
+                batch_row_size = 2000
+                for i in range(0, num_rows, batch_row_size):
+                    batch_rows = cleaned_rows[i:i + batch_row_size]
+                    start_row = i + 1
+                    end_row = i + len(batch_rows)
+                    batch_range = f"A{start_row}:{last_col}{end_row}"
+                    worksheet.update(batch_range, batch_rows, value_input_option='RAW')
+                    if i + batch_row_size < num_rows:
+                        time.sleep(1.0)
+
+                if detected_count > 0:
+                    print(f"  ✅ '{sheet_name}': {detected_count}개 셀 BOM 감지 + 전체 시트 재작성 완료 ({num_rows}행)")
+                else:
+                    print(f"  ✅ '{sheet_name}': 전체 시트 재작성 완료 ({num_rows}행, 숨겨진 BOM 포함 제거)")
+
+            results[sheet_name] = detected_count
+
+        except Exception as e:
+            print(f"  ❌ '{sheet_name}' BOM 정리 실패: {e}")
+            results[sheet_name] = 0
+
+    return results
 
 
 def col_num_to_letter(col_num: int) -> str:
@@ -313,9 +413,10 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
                 if key_val:
                     existing_by_key[key_val] = {"row_idx": row_idx, "data": row}
 
-        # 헤더 행이 없으면 추가
+        # 헤더 행이 없으면 추가 (BOM 제거 후)
         if len(existing_data) == 0:
-            worksheet.append_row(df.columns.tolist())
+            clean_headers = [clean_bom(col) for col in df.columns.tolist()]
+            worksheet.append_row(clean_headers)
 
         # 새로운 행과 업데이트 대상 행 분류
         new_rows = []
@@ -343,17 +444,19 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
 
                     # 업데이트가 필요한 경우:
                     # 1. 빈 값에 실제 값이 들어갈 때 (기존: 빈값, 새로운: 값 있음)
-                    # 2. 기존 값이 다를 때 (기존: 값A, 새로운: 값B)
-                    # 빈 값 → 빈 값은 업데이트하지 않음!
+                    # 2. 둘 다 값이 있고 다를 때 (기존: 값A, 새로운: 값B)
+                    # 절대 하지 않는 경우:
+                    # - 빈 값 → 빈 값 (변경 없음)
+                    # - 기존 값 → 빈 값 (기존 분석 결과 보호!)
                     if existing_val == "" and new_val != "":
                         needs_update = True
                         break
-                    elif existing_val != "" and new_val != existing_val:
+                    elif existing_val != "" and new_val != "" and new_val != existing_val:
                         needs_update = True
                         break
 
                 if needs_update:
-                    rows_to_update.append((row_idx, row))
+                    rows_to_update.append((row_idx, row, existing_row_data))
                 else:
                     skipped_count += 1
 
@@ -383,13 +486,18 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
         if rows_to_update:
             # batch_update 준비
             updates = []
-            for row_idx, row_data in rows_to_update:
-                # 전체 행 값 생성
+            for row_idx, row_data, existing_row_data in rows_to_update:
+                # 전체 행 값 생성 (기존 값 보호: 새 값이 비어있으면 기존 값 유지)
                 row_values = []
                 for col in df.columns:
-                    val = row_data[col]
-                    # BOM 문자 제거 및 빈 값 정리
-                    cleaned_val = clean_bom(val)
+                    new_val = clean_bom(row_data[col])
+                    existing_val = clean_bom(existing_row_data.get(col, ""))
+
+                    # 새 값이 비어있고 기존 값이 있으면 → 기존 값 보호
+                    if new_val == "" and existing_val != "":
+                        cleaned_val = existing_val
+                    else:
+                        cleaned_val = new_val
                     row_values.append(cleaned_val)
 
                 # A{row_idx}:LastCol{row_idx} 형식으로 범위 지정

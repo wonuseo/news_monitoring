@@ -30,10 +30,8 @@ class RunLogger:
             "run_id": self.run_id,
             "timestamp": datetime.now().isoformat(),
         }
-        self.event_logs = []
-        self._events_flushed = 0
-        self.error_logs = []
-        self._errors_flushed = 0
+        self._logs = []
+        self._logs_flushed = 0
         self.stage_start_times = {}
 
     def log(self, key: str, value: Any):
@@ -44,33 +42,34 @@ class RunLogger:
         """Log multiple metrics at once"""
         self.metrics.update(metrics_dict)
 
-    def log_event(self, event: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _append_log(self, level: str, category: str, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Log a point-in-time event for Google Sheets logs.
+        Internal: append a log entry to the unified buffer.
         """
         payload = {
             "run_id": self.run_id,
             "timestamp": datetime.now().isoformat(),
-            "event": event,
-            "data_json": json.dumps(data, ensure_ascii=False) if data else ""
-        }
-        self.event_logs.append(payload)
-        return payload
-
-    def log_error(self, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Log an error event (also print to terminal).
-        """
-        print(f"❌ ERROR: {message}")
-        self.metrics["errors_total"] = self.metrics.get("errors_total", 0) + 1
-        payload = {
-            "run_id": self.run_id,
-            "timestamp": datetime.now().isoformat(),
+            "level": level,
+            "category": category,
             "message": message,
             "data_json": json.dumps(data, ensure_ascii=False) if data else ""
         }
-        self.error_logs.append(payload)
+        self._logs.append(payload)
         return payload
+
+    def log_event(self, message: str, data: Optional[Dict[str, Any]] = None, category: str = "pipeline") -> Dict[str, Any]:
+        """
+        Log an INFO-level event.
+        """
+        return self._append_log(level="INFO", category=category, message=message, data=data)
+
+    def log_error(self, message: str, data: Optional[Dict[str, Any]] = None, category: str = "system") -> Dict[str, Any]:
+        """
+        Log an ERROR-level event (also print to terminal).
+        """
+        print(f"  ERROR: {message}")
+        self.metrics["errors_total"] = self.metrics.get("errors_total", 0) + 1
+        return self._append_log(level="ERROR", category=category, message=message, data=data)
 
     def start_stage(self, stage_name: str):
         """Mark the start of a pipeline stage (for duration tracking)"""
@@ -115,94 +114,92 @@ class RunLogger:
 
             # Append to existing file or create new one
             if os.path.exists(csv_path):
-                df.to_csv(csv_path, mode='a', header=False, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
+                df.to_csv(csv_path, mode='a', header=False, index=False, encoding='utf-8', quoting=csv.QUOTE_NONNUMERIC)
             else:
                 df.to_csv(csv_path, mode='w', header=True, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
 
-            print(f"\n📊 로그 저장: {csv_path}")
+            print(f"\n  Log saved: {csv_path}")
             return True
 
         except Exception as e:
-            print(f"\n⚠️ 로그 CSV 저장 실패: {e}")
+            print(f"\n  Log CSV save failed: {e}")
             return False
 
     def print_summary(self):
         """Print a formatted summary of key metrics"""
         print("\n" + "="*60)
-        print("📊 실행 요약 (Run Summary)")
+        print("  Run Summary")
         print("="*60)
 
         # Basic info
         print(f"Run ID: {self.metrics.get('run_id', 'N/A')}")
         print(f"Timestamp: {self.metrics.get('timestamp', 'N/A')}")
-        print(f"Total Duration: {self.metrics.get('duration_total', 0):.2f}초")
+        print(f"Total Duration: {self.metrics.get('duration_total', 0):.2f}s")
         print()
 
         # Collection
-        print("📥 수집 (Collection)")
-        print(f"  - 전체 수집: {self.metrics.get('articles_collected_total', 0)}개")
+        print("  Collection")
+        print(f"  - Total collected: {self.metrics.get('articles_collected_total', 0)}")
         if 'articles_collected_per_query' in self.metrics:
             per_query = self.metrics['articles_collected_per_query']
             if isinstance(per_query, str):
                 per_query = json.loads(per_query)
             for brand, count in per_query.items():
-                print(f"    • {brand}: {count}개")
-        print(f"  - 기존 링크 스킵: {self.metrics.get('existing_links_skipped', 0)}개")
-        print(f"  - 소요 시간: {self.metrics.get('duration_collection', 0):.2f}초")
+                print(f"    - {brand}: {count}")
+        print(f"  - Existing links skipped: {self.metrics.get('existing_links_skipped', 0)}")
+        print(f"  - Duration: {self.metrics.get('duration_collection', 0):.2f}s")
         print()
 
         # Processing
-        print("⚙️ 전처리 (Processing)")
-        print(f"  - 중복 제거: {self.metrics.get('duplicates_removed', 0)}개")
-        print(f"  - 전처리 완료: {self.metrics.get('articles_processed', 0)}개")
-        print(f"  - 보도자료 탐지: {self.metrics.get('press_releases_detected', 0)}개")
-        print(f"  - 보도자료 그룹: {self.metrics.get('press_release_groups', 0)}개")
-        print(f"  - 소요 시간: {self.metrics.get('duration_processing', 0):.2f}초")
+        print("  Processing")
+        print(f"  - Duplicates removed: {self.metrics.get('duplicates_removed', 0)}")
+        print(f"  - Processed: {self.metrics.get('articles_processed', 0)}")
+        print(f"  - Press releases detected: {self.metrics.get('press_releases_detected', 0)}")
+        print(f"  - Press release groups: {self.metrics.get('press_release_groups', 0)}")
+        print(f"  - Duration: {self.metrics.get('duration_processing', 0):.2f}s")
         print()
 
         # Media classification
         if self.metrics.get('media_domains_total', 0) > 0:
-            print("🏢 미디어 분류 (Media Classification)")
-            print(f"  - 전체 도메인: {self.metrics.get('media_domains_total', 0)}개")
-            print(f"  - 신규 분류: {self.metrics.get('media_domains_new', 0)}개")
-            print(f"  - 캐시 사용: {self.metrics.get('media_domains_cached', 0)}개")
+            print("  Media Classification")
+            print(f"  - Total domains: {self.metrics.get('media_domains_total', 0)}")
+            print(f"  - New classified: {self.metrics.get('media_domains_new', 0)}")
+            print(f"  - Cached: {self.metrics.get('media_domains_cached', 0)}")
             print()
 
         # Classification
-        print("🤖 LLM 분석 (Classification)")
-        print(f"  - 분석 완료: {self.metrics.get('articles_classified_llm', 0)}개")
-        print(f"  - API 호출: {self.metrics.get('llm_api_calls', 0)}회")
-        print(f"  - 추정 비용: ${self.metrics.get('llm_cost_estimated', 0):.4f}")
-        print(f"  - 보도자료 스킵: {self.metrics.get('press_releases_skipped', 0)}개")
-        print(f"  - 분류 실패: {self.metrics.get('classification_errors', 0)}개")
-        print(f"  - 소요 시간: {self.metrics.get('duration_classification', 0):.2f}초")
+        print("  LLM Classification")
+        print(f"  - Classified: {self.metrics.get('articles_classified_llm', 0)}")
+        print(f"  - API calls: {self.metrics.get('llm_api_calls', 0)}")
+        print(f"  - Estimated cost: ${self.metrics.get('llm_cost_estimated', 0):.4f}")
+        print(f"  - Press releases skipped: {self.metrics.get('press_releases_skipped', 0)}")
+        print(f"  - Classification errors: {self.metrics.get('classification_errors', 0)}")
+        print(f"  - Duration: {self.metrics.get('duration_classification', 0):.2f}s")
         print()
 
         # Results
-        print("📈 분류 결과 (Results)")
-        print(f"  - 우리 브랜드 관련: {self.metrics.get('our_brands_relevant', 0)}개")
-        print(f"  - 우리 브랜드 부정: {self.metrics.get('our_brands_negative', 0)}개")
-        print(f"  - 위험도 상: {self.metrics.get('danger_high', 0)}개")
-        print(f"  - 위험도 중: {self.metrics.get('danger_medium', 0)}개")
-        print(f"  - 경쟁사 기사: {self.metrics.get('competitor_articles', 0)}개")
+        print("  Classification Results")
+        print(f"  - Our brands relevant: {self.metrics.get('our_brands_relevant', 0)}")
+        print(f"  - Our brands negative: {self.metrics.get('our_brands_negative', 0)}")
+        print(f"  - Danger high: {self.metrics.get('danger_high', 0)}")
+        print(f"  - Danger medium: {self.metrics.get('danger_medium', 0)}")
+        print(f"  - Competitor articles: {self.metrics.get('competitor_articles', 0)}")
         print()
 
         # Sheets sync
         if self.metrics.get('sheets_sync_enabled'):
-            print("☁️ Google Sheets 동기화")
-            print(f"  - raw_data 업로드: {self.metrics.get('sheets_rows_uploaded_raw', 0)}행")
-            print(f"  - result 업로드: {self.metrics.get('sheets_rows_uploaded_result', 0)}행")
-            print(f"  - run_history 업로드: {self.metrics.get('sheets_logs_uploaded', 0)}행")
-            print(f"  - logs 이벤트 업로드: {self.metrics.get('sheets_event_logs_uploaded', 0)}행")
-            print(f"  - errors 업로드: {self.metrics.get('sheets_errors_uploaded', 0)}행")
-            print(f"  - 소요 시간: {self.metrics.get('duration_sheets_sync', 0):.2f}초")
+            print("  Google Sheets Sync")
+            print(f"  - raw_data uploaded: {self.metrics.get('sheets_rows_uploaded_raw', 0)} rows")
+            print(f"  - result uploaded: {self.metrics.get('sheets_rows_uploaded_result', 0)} rows")
+            print(f"  - run_history uploaded: {self.metrics.get('sheets_run_history_uploaded', 0)} rows")
+            print(f"  - logs uploaded: {self.metrics.get('sheets_logs_uploaded', 0)} rows")
+            print(f"  - Duration: {self.metrics.get('duration_sheets_sync', 0):.2f}s")
             print()
 
         # Errors
         if self.metrics.get('errors_total', 0) > 0:
-            print("⚠️ 에러")
-            print(f"  - 전체 에러: {self.metrics.get('errors_total', 0)}개")
-            print(f"  - 경고: {self.metrics.get('warnings_total', 0)}개")
+            print("  Errors")
+            print(f"  - Total errors: {self.metrics.get('errors_total', 0)}")
             print()
 
         print("="*60)
@@ -214,11 +211,12 @@ class RunLogger:
             return default_headers
         return existing
 
-    def flush_events_to_sheets(self, spreadsheet, sheet_name: str = "logs") -> bool:
+    def flush_logs_to_sheets(self, spreadsheet, sheet_name: str = "logs") -> bool:
         """
-        Append all buffered event logs to Google Sheets.
+        Append all buffered logs (INFO + ERROR) to a single Google Sheets tab.
+        Schema: run_id, timestamp, level, category, message, data_json
         """
-        if self._events_flushed >= len(self.event_logs):
+        if self._logs_flushed >= len(self._logs):
             return True
 
         try:
@@ -228,58 +226,26 @@ class RunLogger:
                 worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
 
             headers = self._get_or_create_headers(
-                worksheet, ["run_id", "timestamp", "event", "data_json"]
+                worksheet, ["run_id", "timestamp", "level", "category", "message", "data_json"]
             )
 
-            pending = self.event_logs[self._events_flushed:]
+            pending = self._logs[self._logs_flushed:]
             rows = []
-            for e in pending:
+            for entry in pending:
                 row_map = {
-                    "run_id": e["run_id"],
-                    "timestamp": e["timestamp"],
-                    "event": e["event"],
-                    "data_json": e["data_json"]
+                    "run_id": entry["run_id"],
+                    "timestamp": entry["timestamp"],
+                    "level": entry["level"],
+                    "category": entry["category"],
+                    "message": entry["message"],
+                    "data_json": entry["data_json"]
                 }
                 rows.append([row_map.get(h, "") for h in headers])
             worksheet.append_rows(rows)
-            self._events_flushed = len(self.event_logs)
+            self._logs_flushed = len(self._logs)
             return True
         except Exception as e:
-            print(f"⚠️ logs 이벤트 업로드 실패: {e}")
-            return False
-
-    def flush_errors_to_sheets(self, spreadsheet, sheet_name: str = "errors") -> bool:
-        """
-        Append all buffered error logs to Google Sheets.
-        """
-        if self._errors_flushed >= len(self.error_logs):
-            return True
-
-        try:
-            try:
-                worksheet = spreadsheet.worksheet(sheet_name)
-            except:
-                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
-
-            headers = self._get_or_create_headers(
-                worksheet, ["run_id", "timestamp", "message", "data_json"]
-            )
-
-            pending = self.error_logs[self._errors_flushed:]
-            rows = []
-            for e in pending:
-                row_map = {
-                    "run_id": e["run_id"],
-                    "timestamp": e["timestamp"],
-                    "message": e["message"],
-                    "data_json": e["data_json"]
-                }
-                rows.append([row_map.get(h, "") for h in headers])
-            worksheet.append_rows(rows)
-            self._errors_flushed = len(self.error_logs)
-            return True
-        except Exception as e:
-            print(f"⚠️ errors 업로드 실패: {e}")
+            print(f"  logs upload failed: {e}")
             return False
 
 
@@ -294,14 +260,14 @@ def sync_logs_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "run_histo
     """
     try:
         if not os.path.exists(csv_path):
-            print(f"⚠️ 로그 파일 없음: {csv_path}")
+            print(f"  Log file not found: {csv_path}")
             return False
 
         # Load CSV (with proper quoting for JSON fields)
         df = pd.read_csv(csv_path, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
 
         if df.empty:
-            print("⚠️ 로그 데이터 없음")
+            print("  No log data")
             return False
 
         # Get or create worksheet
@@ -319,9 +285,9 @@ def sync_logs_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "run_histo
         # Upload
         worksheet.update('A1', data, value_input_option='RAW')
 
-        print(f"✅ 로그 동기화 완료: {len(df)}개 실행 기록")
+        print(f"  Log sync complete: {len(df)} run records")
         return True
 
     except Exception as e:
-        print(f"⚠️ 로그 Sheets 동기화 실패: {e}")
+        print(f"  Log Sheets sync failed: {e}")
         return False
