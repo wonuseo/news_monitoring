@@ -6,6 +6,7 @@ import time
 import uuid
 import json
 import os
+import csv
 from datetime import datetime
 from typing import Dict, Any, Optional
 import pandas as pd
@@ -82,9 +83,9 @@ class RunLogger:
 
             # Append to existing file or create new one
             if os.path.exists(csv_path):
-                df.to_csv(csv_path, mode='a', header=False, index=False, encoding='utf-8-sig')
+                df.to_csv(csv_path, mode='a', header=False, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
             else:
-                df.to_csv(csv_path, mode='w', header=True, index=False, encoding='utf-8-sig')
+                df.to_csv(csv_path, mode='w', header=True, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
 
             print(f"\n📊 로그 저장: {csv_path}")
             return True
@@ -187,8 +188,8 @@ def sync_logs_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "logs"):
             print(f"⚠️ 로그 파일 없음: {csv_path}")
             return False
 
-        # Load CSV
-        df = pd.read_csv(csv_path, encoding='utf-8-sig')
+        # Load CSV (with proper quoting for JSON fields)
+        df = pd.read_csv(csv_path, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
 
         if df.empty:
             print("⚠️ 로그 데이터 없음")
