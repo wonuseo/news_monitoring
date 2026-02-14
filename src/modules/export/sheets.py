@@ -9,6 +9,128 @@ from datetime import datetime
 import os
 import time
 
+from src.utils.text_cleaning import clean_bom
+from src.utils.sheets_helpers import get_or_create_worksheet
+
+
+def clean_all_bom_in_sheets(spreadsheet, sheet_names: list = None) -> Dict[str, int]:
+    """
+    Google Sheets의 모든 셀에서 BOM 및 invisible 문자를 일괄 제거
+
+    전체 시트 재작성 방식: API의 FORMATTED_VALUE가 BOM을 숨겨서
+    셀 단위 비교로는 감지 불가능한 BOM도 제거.
+
+    동작 방식:
+    1. 시트 전체 값을 읽기
+    2. 모든 셀 값에 clean_bom() 적용
+    3. 전체 시트를 정리된 값으로 덮어쓰기 (숨겨진 BOM도 제거)
+
+    Args:
+        spreadsheet: gspread Spreadsheet 객체
+        sheet_names: 정리할 시트 이름 리스트 (None이면 raw_data, total_result)
+
+    Returns:
+        {sheet_name: cleaned_cell_count}
+    """
+    if sheet_names is None:
+        sheet_names = ["raw_data", "total_result"]
+
+    results = {}
+
+    for sheet_name in sheet_names:
+        try:
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+            except Exception:
+                print(f"  ℹ️  '{sheet_name}' 워크시트가 없습니다. 건너뜀.")
+                results[sheet_name] = 0
+                continue
+
+            # 전체 데이터 읽기
+            all_values = worksheet.get_all_values()
+            if not all_values:
+                print(f"  ℹ️  '{sheet_name}' 워크시트가 비어있습니다.")
+                results[sheet_name] = 0
+                continue
+
+            # 모든 셀 값 정리 (API가 BOM을 숨겨도 감지 가능한 것은 카운트)
+            cleaned_rows = []
+            detected_count = 0
+
+            for row in all_values:
+                cleaned_row = []
+                for cell_value in row:
+                    if isinstance(cell_value, str) and cell_value:
+                        cleaned = clean_bom(cell_value)
+                        if cleaned != cell_value:
+                            detected_count += 1
+                        cleaned_row.append(cleaned)
+                    else:
+                        cleaned_row.append(cell_value if cell_value else "")
+                cleaned_rows.append(cleaned_row)
+
+            # 전체 시트 재작성 (숨겨진 BOM도 덮어쓰기로 제거)
+            num_rows = len(cleaned_rows)
+            num_cols = max(len(row) for row in cleaned_rows) if cleaned_rows else 0
+
+            if num_rows > 0 and num_cols > 0:
+                # 모든 행의 길이를 맞추기 (패딩)
+                for row in cleaned_rows:
+                    while len(row) < num_cols:
+                        row.append("")
+
+                last_col = col_num_to_letter(num_cols)
+                range_str = f"A1:{last_col}{num_rows}"
+
+                # 배치 단위로 업데이트 (대용량 시트 대응)
+                batch_row_size = 2000
+                for i in range(0, num_rows, batch_row_size):
+                    batch_rows = cleaned_rows[i:i + batch_row_size]
+                    start_row = i + 1
+                    end_row = i + len(batch_rows)
+                    batch_range = f"A{start_row}:{last_col}{end_row}"
+                    worksheet.update(batch_range, batch_rows, value_input_option='RAW')
+                    if i + batch_row_size < num_rows:
+                        time.sleep(1.0)
+
+                if detected_count > 0:
+                    print(f"  ✅ '{sheet_name}': {detected_count}개 셀 BOM 감지 + 전체 시트 재작성 완료 ({num_rows}행)")
+                else:
+                    print(f"  ✅ '{sheet_name}': 전체 시트 재작성 완료 ({num_rows}행, 숨겨진 BOM 포함 제거)")
+
+            results[sheet_name] = detected_count
+
+        except Exception as e:
+            print(f"  ❌ '{sheet_name}' BOM 정리 실패: {e}")
+            results[sheet_name] = 0
+
+    return results
+
+
+def col_num_to_letter(col_num: int) -> str:
+    """
+    컬럼 번호를 Excel/Sheets 스타일 문자로 변환
+
+    Args:
+        col_num: 컬럼 번호 (1-based, 1=A, 27=AA)
+
+    Returns:
+        컬럼 문자 (A, B, ..., Z, AA, AB, ...)
+
+    Examples:
+        1 -> A
+        26 -> Z
+        27 -> AA
+        52 -> AZ
+        53 -> BA
+    """
+    result = ""
+    while col_num > 0:
+        col_num -= 1  # 0-based로 변환
+        result = chr(65 + (col_num % 26)) + result
+        col_num //= 26
+    return result
+
 
 def connect_sheets(credentials_path: str, sheet_id: str):
     """
@@ -97,6 +219,71 @@ def load_existing_links_from_sheets(spreadsheet, sheet_name: str = "raw_data") -
         return set()
 
 
+def load_analysis_status_from_sheets(
+    spreadsheet,
+    sheet_name: str = "total_result",
+    analysis_cols: Optional[List[str]] = None
+) -> Dict[str, set]:
+    """
+    [DEPRECATED] reprocess_checker.py의 check_reprocess_targets()로 대체됨.
+    호환성을 위해 유지하지만, main.py에서는 더 이상 호출하지 않음.
+
+    Google Sheets에서 분석 완료/미완료 링크 집합 로드
+
+    Returns:
+        {"processed_links": set, "missing_analysis_links": set}
+    """
+    if analysis_cols is None:
+        # LLM 분석 + 전처리 필드 체크
+        analysis_cols = [
+            "brand_relevance", "sentiment_stage",  # LLM 분석
+            "source", "media_domain", "date_only"  # 전처리 필드
+        ]
+
+    try:
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except Exception:
+            print(f"  ℹ️  '{sheet_name}' 워크시트가 없습니다. 첫 실행으로 간주합니다.")
+            return {"processed_links": set(), "missing_analysis_links": set()}
+
+        existing_data = worksheet.get_all_records()
+        if not existing_data:
+            print(f"  ℹ️  '{sheet_name}' 워크시트가 비어있습니다.")
+            return {"processed_links": set(), "missing_analysis_links": set()}
+
+        processed_links = set()
+        missing_analysis_links = set()
+
+        for row in existing_data:
+            link = row.get("link", "")
+            if not link:
+                continue
+            processed_links.add(link)
+            # 분석 필드가 하나라도 비어 있으면 재분석 대상으로 간주 (BOM 문자도 빈 값으로 처리)
+            for col in analysis_cols:
+                val = row.get(col, "")
+                # BOM 문자 제거 후 체크
+                cleaned_val = clean_bom(val)
+                if cleaned_val == "":
+                    missing_analysis_links.add(link)
+                    break
+
+        print(f"📂 Google Sheets에서 {len(processed_links)}개 기존 기사 로드 (total_result)")
+        if missing_analysis_links:
+            print(f"  ℹ️  분석 누락 링크 {len(missing_analysis_links)}개 발견")
+
+        return {
+            "processed_links": processed_links,
+            "missing_analysis_links": missing_analysis_links
+        }
+
+    except Exception as e:
+        print(f"⚠️  Google Sheets 분석 상태 로드 실패: {e}")
+        print("  → result.csv 기준으로 계속 진행합니다.")
+        return {"processed_links": set(), "missing_analysis_links": set()}
+
+
 def filter_new_articles_from_sheets(df_raw: pd.DataFrame, existing_links: set) -> pd.DataFrame:
     """
     Google Sheets 기존 데이터와 비교하여 새 기사만 필터링
@@ -123,109 +310,212 @@ def filter_new_articles_from_sheets(df_raw: pd.DataFrame, existing_links: set) -
 
 def sync_to_sheets(df: pd.DataFrame, spreadsheet,
                   sheet_name: str = "전체데이터",
-                  key_column: str = "link") -> Dict[str, int]:
+                  key_column: str = "link",
+                  update_fields: list = None,
+                  force_update_existing: bool = False) -> Dict[str, int]:
     """
-    DataFrame을 Google Sheets에 증분 업로드
+    DataFrame을 Google Sheets에 upsert (update or insert)
 
     Args:
         df: 업로드할 DataFrame
         spreadsheet: gspread Spreadsheet 객체
         sheet_name: 워크시트 이름
         key_column: 중복 제거 기준 컬럼
+        update_fields: 업데이트할 필드 리스트 (None이면 분석 필드 자동 감지)
+        force_update_existing: True면 기존 키 행도 강제 업데이트
 
     Returns:
-        {"added": N, "skipped": N, "errors": N}
+        {"attempted": N, "added": N, "updated": N, "skipped": N, "errors": N}
+        - attempted: 이번에 업로드 대상으로 넘긴 기사 수
+        - added: 새로 추가된 기사 수
+        - updated: 기존 행 업데이트된 기사 수
+        - skipped: 시트에 이미 존재하고 업데이트 불필요한 기사 수
     """
+    # 업데이트할 분석 및 전처리 필드 (기본값)
+    if update_fields is None:
+        update_fields = [
+            # LLM 분석 필드
+            "brand_relevance", "brand_relevance_query_keywords",
+            "sentiment_stage", "danger_level", "issue_category",
+            "news_category", "news_keyword_summary", "classified_at",
+            # 전처리 필드
+            "press_release_group", "cluster_id", "source",
+            "media_domain", "media_name", "media_group", "media_type",
+            # Looker Studio 시계열 필드
+            "date_only", "week_number", "month", "article_count"
+        ]
+
     try:
         # 워크시트 선택 또는 생성
-        try:
-            worksheet = spreadsheet.worksheet(sheet_name)
-        except:
-            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=30)
-            print(f"  📝 새 워크시트 생성: {sheet_name}")
+        worksheet = get_or_create_worksheet(spreadsheet, sheet_name, rows=1000, cols=30)
 
-        # 기존 데이터 읽기 (헤더만 읽기, 성능상 모든 행 읽지 않음)
+        # 기존 데이터 읽기
         try:
             existing_data = worksheet.get_all_records()
         except:
             existing_data = []
 
-        # 기존 key_column 값들을 set으로 저장 (중복 체크용)
-        existing_keys = set()
-        if existing_data and key_column in existing_data[0]:
-            existing_keys = {row.get(key_column, "") for row in existing_data}
+        attempted = len(df)
+        added_count = 0
+        updated_count = 0
+        skipped_count = 0
 
-        # 새로운 행만 필터링
-        if key_column in df.columns:
-            new_rows = df[~df[key_column].isin(existing_keys)]
-        else:
-            new_rows = df
+        # 기존 데이터를 dict로 변환 (link → row_index, row_data)
+        existing_by_key = {}
+        if existing_data:
+            for row_idx, row in enumerate(existing_data, start=2):  # 헤더는 1행, 데이터는 2행부터
+                key_val = row.get(key_column, "")
+                if key_val:
+                    existing_by_key[key_val] = {"row_idx": row_idx, "data": row}
 
-        if len(new_rows) == 0:
-            print(f"  ℹ️  {sheet_name}: 새 기사 없음")
-            return {"added": 0, "skipped": len(df), "errors": 0}
-
-        # 헤더 행이 없으면 추가
+        # 헤더 행이 없으면 추가 (BOM 제거 후)
         if len(existing_data) == 0:
-            worksheet.append_row(df.columns.tolist())
+            clean_headers = [clean_bom(col) for col in df.columns.tolist()]
+            worksheet.append_row(clean_headers)
 
-        # 새로운 행들을 batch로 추가
-        values_to_append = []
-        for _, row in new_rows.iterrows():
-            row_values = []
-            for col in df.columns:
-                val = row[col]
-                # None을 빈 문자열로 변환
-                if pd.isna(val) or val is None:
-                    row_values.append("")
+        # 새로운 행과 업데이트 대상 행 분류
+        new_rows = []
+        rows_to_update = []  # (row_idx, new_values)
+
+        for _, row in df.iterrows():
+            key_val = row[key_column] if key_column in df.columns else None
+
+            if not key_val or key_val not in existing_by_key:
+                # 새 행: append 대상
+                new_rows.append(row)
+            else:
+                # 기존 행: 업데이트 필요 여부 체크
+                existing_row_info = existing_by_key[key_val]
+                existing_row_data = existing_row_info["data"]
+                row_idx = existing_row_info["row_idx"]
+
+                # 업데이트 필요 여부 확인
+                if force_update_existing:
+                    needs_update = True
                 else:
-                    row_values.append(str(val))
-            values_to_append.append(row_values)
+                    needs_update = False
+                    for field in update_fields:
+                        if field not in df.columns:
+                            continue
+                        new_val = clean_bom(row.get(field, ""))
+                        existing_val = clean_bom(existing_row_data.get(field, ""))
 
-        # 일괄 추가 (최대 1000행씩, Rate limit 대응)
-        batch_size = 1000
-        total_batches = (len(values_to_append) + batch_size - 1) // batch_size
+                        # 업데이트가 필요한 경우:
+                        # 1. 빈 값에 실제 값이 들어갈 때 (기존: 빈값, 새로운: 값 있음)
+                        # 2. 둘 다 값이 있고 다를 때 (기존: 값A, 새로운: 값B)
+                        # 절대 하지 않는 경우:
+                        # - 빈 값 → 빈 값 (변경 없음)
+                        # - 기존 값 → 빈 값 (기존 분석 결과 보호!)
+                        if existing_val == "" and new_val != "":
+                            needs_update = True
+                            break
+                        elif existing_val != "" and new_val != "" and new_val != existing_val:
+                            needs_update = True
+                            break
 
-        for batch_idx, i in enumerate(range(0, len(values_to_append), batch_size), 1):
-            batch = values_to_append[i:i+batch_size]
+                if needs_update:
+                    rows_to_update.append((row_idx, row, existing_row_data))
+                else:
+                    skipped_count += 1
 
-            # Exponential backoff으로 재시도
-            max_retries = 3
-            for retry in range(max_retries):
-                try:
-                    worksheet.append_rows(batch)
+        # 새 행 추가 (batch append)
+        if new_rows:
+            values_to_append = []
+            for row in new_rows:
+                row_values = []
+                for col in df.columns:
+                    val = row[col]
+                    # BOM 문자 제거 및 빈 값 정리
+                    cleaned_val = clean_bom(val)
+                    row_values.append(cleaned_val)
+                values_to_append.append(row_values)
 
-                    # 진행 상황 출력 (배치가 2개 이상일 때만)
-                    if total_batches > 1:
-                        print(f"    [{batch_idx}/{total_batches}] {len(batch)}개 행 업로드 완료")
+            # 일괄 추가 (최대 1000행씩)
+            batch_size = 1000
+            for i in range(0, len(values_to_append), batch_size):
+                batch = values_to_append[i:i+batch_size]
+                worksheet.append_rows(batch)
+                time.sleep(1.0)  # Rate limit 방지
 
-                    # Rate limit 방지: 각 배치 사이 1초 대기 (마지막 배치 제외)
-                    if i + batch_size < len(values_to_append):
-                        time.sleep(1.0)
+            added_count = len(new_rows)
+            print(f"  ✅ {sheet_name}: {added_count}개 행 추가")
 
-                    break  # 성공 시 재시도 루프 종료
+        # 기존 행 업데이트 (batch update)
+        if rows_to_update:
+            # batch_update 준비
+            updates = []
+            for row_idx, row_data, existing_row_data in rows_to_update:
+                # 전체 행 값 생성 (기존 값 보호: 새 값이 비어있으면 기존 값 유지)
+                row_values = []
+                for col in df.columns:
+                    new_val = clean_bom(row_data[col])
+                    existing_val = clean_bom(existing_row_data.get(col, ""))
 
-                except Exception as e:
-                    error_msg = str(e).lower()
-
-                    # Rate limit 오류 감지
-                    if "rate" in error_msg or "quota" in error_msg or "429" in error_msg:
-                        wait_time = (2 ** retry) * 2  # 2s, 4s, 8s
-                        print(f"    ⚠️  Rate limit 감지, {wait_time}초 대기 후 재시도... ({retry+1}/{max_retries})")
-                        time.sleep(wait_time)
-
-                        if retry == max_retries - 1:
-                            raise  # 마지막 재시도 실패 시 예외 발생
+                    # 새 값이 비어있고 기존 값이 있으면 → 기존 값 보호
+                    if new_val == "" and existing_val != "":
+                        cleaned_val = existing_val
                     else:
-                        # Rate limit 외 오류는 즉시 발생
-                        raise
+                        cleaned_val = new_val
+                    row_values.append(cleaned_val)
 
-        print(f"  ✅ {sheet_name}: {len(new_rows)}개 행 추가")
-        return {"added": len(new_rows), "skipped": len(df) - len(new_rows), "errors": 0}
+                # A{row_idx}:LastCol{row_idx} 형식으로 범위 지정
+                # 컬럼 수를 올바르게 문자로 변환 (A, B, ..., Z, AA, AB, ...)
+                last_col_letter = col_num_to_letter(len(df.columns))
+                range_name = f"A{row_idx}:{last_col_letter}{row_idx}"
+
+                updates.append({"range": range_name, "values": [row_values]})
+
+            # 디버그: 업데이트 범위 요약 출력
+            if len(updates) > 0:
+                first_range = updates[0]["range"]
+                last_range = updates[-1]["range"]
+                if len(updates) == 1:
+                    print(f"    🔍 업데이트 범위: {first_range} (1개 행)")
+                else:
+                    print(f"    🔍 업데이트 범위: {first_range} ~ {last_range} ({len(updates)}개 행)")
+
+            # batch_update 실행 (최대 100개씩)
+            update_batch_size = 100
+            for i in range(0, len(updates), update_batch_size):
+                batch_updates = updates[i:i+update_batch_size]
+                try:
+                    worksheet.batch_update(batch_updates, value_input_option='RAW')
+                    time.sleep(1.0)  # Rate limit 방지
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f"    ⚠️  batch_update 실패: {error_msg}")
+                    # 디버그: 첫 번째 업데이트 range 출력
+                    if batch_updates:
+                        print(f"    🔍 첫 번째 range 예시: {batch_updates[0]['range']}")
+                    # Fallback: 개별 update
+                    for idx, update in enumerate(batch_updates):
+                        try:
+                            range_str = update["range"]
+                            # 디버그: 개별 update 시 range 출력 (처음 3개만)
+                            if idx < 3:
+                                print(f"    🔍 개별 update 시도 [{idx+1}]: range='{range_str}'")
+                            worksheet.update(range_str, update["values"], value_input_option='RAW')
+                            time.sleep(0.5)
+                        except Exception as e2:
+                            print(f"    ⚠️  개별 update 실패 [range={update.get('range', 'N/A')}]: {e2}")
+
+            updated_count = len(rows_to_update)
+            print(f"  🔄 {sheet_name}: {updated_count}개 행 업데이트")
+
+        if added_count == 0 and updated_count == 0:
+            print(f"  ℹ️  {sheet_name}: 변경 사항 없음 ({skipped_count}개 건너뜀)")
+
+        return {
+            "attempted": attempted,
+            "added": added_count,
+            "updated": updated_count,
+            "skipped": skipped_count,
+            "errors": 0
+        }
 
     except Exception as e:
         print(f"  ❌ {sheet_name} 업로드 실패: {e}")
-        return {"added": 0, "skipped": 0, "errors": len(df)}
+        return {"attempted": len(df), "added": 0, "updated": 0, "skipped": 0, "errors": len(df)}
 
 
 def configure_sheet_schema(worksheet) -> None:
@@ -273,16 +563,78 @@ def configure_sheet_schema(worksheet) -> None:
         print(f"  ⚠️  스키마 설정 실패: {e}")
 
 
+TOTAL_RESULT_MIN_DATE = "2026-02-01"
+TOTAL_RESULT_DATE_COLUMNS = [
+    "pub_datetime",
+    "date_only",
+    "pubDate",
+    "pub_date",
+    "published_at",
+    "date",
+]
+
+
+def filter_total_result_by_date(
+    df_result: pd.DataFrame,
+    min_date: str = TOTAL_RESULT_MIN_DATE,
+) -> pd.DataFrame:
+    """
+    Keep only rows on/after min_date for total_result upload.
+    raw_data는 영향을 받지 않는다.
+    """
+    if df_result.empty:
+        return df_result
+
+    candidate_cols = [col for col in TOTAL_RESULT_DATE_COLUMNS if col in df_result.columns]
+    if not candidate_cols:
+        print("  ⚠️  total_result 날짜 컬럼이 없어 날짜 필터를 건너뜁니다.")
+        return df_result
+
+    cutoff = pd.Timestamp(min_date, tz="UTC")
+
+    # 컬럼별 파싱 성공률/유지 건수를 비교해 가장 신뢰도 높은 날짜 컬럼 선택
+    best_col = None
+    best_parsed = None
+    best_score = (-1, -1)  # (kept_count, valid_count)
+    for col in candidate_cols:
+        parsed = pd.to_datetime(df_result[col], errors="coerce", utc=True)
+        valid_count = int(parsed.notna().sum())
+        kept_count = int((parsed >= cutoff).sum())
+        score = (kept_count, valid_count)
+        if score > best_score:
+            best_col = col
+            best_parsed = parsed
+            best_score = score
+
+    if best_col is None or best_parsed is None:
+        print("  ⚠️  total_result 날짜 파싱 실패로 날짜 필터를 건너뜁니다.")
+        return df_result
+
+    keep_mask = best_parsed >= cutoff
+
+    before_count = len(df_result)
+    filtered = df_result[keep_mask].copy()
+    removed_count = before_count - len(filtered)
+    print(
+        f"  🔎 total_result 날짜 필터({best_col}): "
+        f"{removed_count}개 제외 (< {min_date}), {len(filtered)}개 유지"
+    )
+
+    return filtered
+
+
 def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spreadsheet) -> Dict[str, Dict]:
     """
-    원본 데이터와 분류 결과를 Google Sheets에 업로드 (4개 시트)
+    원본 데이터와 분류 결과를 Google Sheets에 upsert (update or insert)
 
     시트 구조:
     - raw_data: 원본 데이터 (수집된 그대로)
-    - total_result: 전체 분류 결과 (독립기사 + 보도자료)
-    - independent: source != "보도자료"인 기사만
-    - press_release: source == "보도자료"인 기사만
-    - media_directory: 언론사 정보 (별도 함수에서 관리)
+    - total_result: 전체 분류 결과 (독립기사 + 보도자료) - 기존 행 업데이트 지원
+
+    동작:
+    - 새 기사: append
+    - 기존 기사 (분석 필드 비어있음): update
+    - 기존 기사 (분석 필드 있음): skip
 
     Args:
         df_raw: 원본 데이터 (수집된 그대로)
@@ -290,42 +642,40 @@ def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spread
         spreadsheet: gspread Spreadsheet 객체
 
     Returns:
-        {sheet_name: {added, skipped, errors}}
+        {sheet_name: {added, updated, skipped, errors}}
     """
     results = {}
 
     print("📊 Google Sheets 동기화 중...")
 
     # 1. raw_data - 원본 데이터
-    print("\n  [1/4] raw_data (원본 데이터)")
+    print("\n  [1/2] raw_data (원본 데이터)")
     results["raw_data"] = sync_to_sheets(df_raw, spreadsheet, "raw_data")
 
-    # 2. total_result - 전체 분류 결과
-    print("  [2/4] total_result (전체 분류 결과)")
-    results["total_result"] = sync_to_sheets(df_result, spreadsheet, "total_result")
-
-    # 3. independent - source가 "보도자료"가 아닌 기사
-    print("  [3/4] independent (독립기사)")
-    df_independent = df_result[df_result["source"] != "보도자료"].copy()
-    results["independent"] = sync_to_sheets(df_independent, spreadsheet, "independent")
-
-    # 4. press_release - source가 "보도자료"인 기사
-    print("  [4/4] press_release (보도자료)")
-    df_press_release = df_result[df_result["source"] == "보도자료"].copy()
-    results["press_release"] = sync_to_sheets(df_press_release, spreadsheet, "press_release")
+    # 2. total_result - 전체 분류 결과 (upsert 지원)
+    df_result_for_total = filter_total_result_by_date(df_result, TOTAL_RESULT_MIN_DATE)
+    print("  [2/2] total_result (전체 분류 결과)")
+    results["total_result"] = sync_to_sheets(
+        df_result_for_total,
+        spreadsheet,
+        "total_result",
+        force_update_existing=True
+    )
 
     # 통계
     print("\n✅ Google Sheets 동기화 완료")
-    total_added = sum(r["added"] for r in results.values())
-    total_skipped = sum(r["skipped"] for r in results.values())
-    total_errors = sum(r["errors"] for r in results.values())
+    total_attempted = sum(r.get("attempted", 0) for r in results.values())
+    total_added = sum(r.get("added", 0) for r in results.values())
+    total_updated = sum(r.get("updated", 0) for r in results.values())
+    total_skipped = sum(r.get("skipped", 0) for r in results.values())
+    total_errors = sum(r.get("errors", 0) for r in results.values())
 
+    print(f"  - 시도됨: {total_attempted}개")
     print(f"  - 추가됨: {total_added}개")
-    print(f"  - 건너뜀: {total_skipped}개")
-    print(f"  - 오류: {total_errors}개")
-    print(f"  - 독립기사: {len(df_independent)}개")
-    print(f"  - 보도자료: {len(df_press_release)}개")
-
+    print(f"  - 업데이트됨: {total_updated}개")
+    print(f"  - 건너뜀(변경 없음): {total_skipped}개")
+    if total_errors > 0:
+        print(f"  - 오류: {total_errors}개")
     return results
 
 
@@ -368,12 +718,14 @@ def sync_all_sheets(df: pd.DataFrame, spreadsheet) -> Dict[str, Dict]:
 
     # 통계
     print("\n✅ Google Sheets 동기화 완료")
+    total_attempted = sum(r.get("attempted", 0) for r in results.values())
     total_added = sum(r["added"] for r in results.values())
     total_skipped = sum(r["skipped"] for r in results.values())
     total_errors = sum(r["errors"] for r in results.values())
 
+    print(f"  - 시도됨: {total_attempted}개")
     print(f"  - 추가됨: {total_added}개")
-    print(f"  - 건너뜀: {total_skipped}개")
+    print(f"  - 건너뜀(시트에 이미 존재): {total_skipped}개")
     print(f"  - 오류: {total_errors}개")
 
     return results

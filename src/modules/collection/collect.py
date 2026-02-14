@@ -240,7 +240,7 @@ def _save_immediately(rows: List[Dict], raw_csv_path: str = None, spreadsheet = 
                 mode='a' if file_exists else 'w',
                 header=not file_exists,
                 index=False,
-                encoding='utf-8-sig'
+                encoding='utf-8-sig' if not file_exists else 'utf-8'
             )
             print(f"    💾 CSV 저장: {len(rows)}개 기사")
         except Exception as e:

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**News Monitoring System** - Automated pipeline for hotel brand news monitoring that collects articles from Naver API, performs hybrid LLM+rule-based analysis for sentiment/risk/categorization, and outputs results to Google Sheets + CSV + Word reports.
+**News Monitoring System** - Automated pipeline for hotel brand news monitoring that collects articles from Naver API, performs LLM-based analysis for sentiment/risk/categorization, and outputs results to Google Sheets + CSV + Word reports.
 
 **Core Flow**: Collection → Processing → LLM Classification → Reporting → Sheets Sync
 
@@ -43,7 +43,18 @@ Linear 5-step pipeline:
 STEP 1: Collection
 ├─ Naver API (pagination: 9 pages × 100 = 900 articles/brand)
 ├─ Load existing links from Google Sheets (skip duplicates)
-└─ Save to raw.csv + append to Sheets
+├─ Save to raw.csv + append to Sheets
+└─ --recheck_only: Skip API, load raw_data from Sheets
+
+STEP 1.5: Reprocess Check
+├─ Load total_result (Sheets → CSV fallback)
+├─ Rule 1: raw links missing from total_result
+├─ Rules 2-5: Field-level empty check (brand_relevance, sentiment_stage, source, media_domain, date_only)
+├─ Union all targets → clear classified_at → merge with new articles
+└─ Module: reprocess_checker.py
+
+STEP 1.6: Date Filtering
+└─ Filter articles to 2026-02-01+ only (hard-coded in main.py and sheets.py)
 
 STEP 2: Processing
 ├─ Normalize (HTML strip, ISO dates, article_id, article_no)
@@ -53,15 +64,17 @@ STEP 2: Processing
 └─ Media classification (domain → name/group/type via OpenAI batch)
 
 STEP 3: LLM Classification
-├─ Press release preset (skip LLM for cost savings)
-├─ LLM Analysis (OpenAI gpt-4o-mini, selective: 우리 브랜드 all + 경쟁사 all)
+├─ Step 3-1: Press release LLM classification (representative per cluster → share results)
+│   └─ Module: classify_press_releases.py
+├─ Step 3-2: General LLM classification (non-press-release articles)
+│   └─ LLM Analysis (OpenAI gpt-4o-mini, 우리 브랜드 all + 경쟁사 all)
 │   └─ Outputs: brand_relevance, sentiment_stage, danger_level,
 │       issue_category, news_category, news_keyword_summary
 └─ Structured output via prompts.yaml (no retraining needed)
 
 STEP 4: Reporting
 ├─ Console report (summary statistics)
-└─ Keyword extraction (optional, saved to Google Sheets)
+└─ Keyword extraction (automatic, saved to Google Sheets + CSV)
 
 STEP 5: Sheets Sync
 └─ Incremental upload to 2 tabs (raw_data, result)
@@ -72,18 +85,20 @@ STEP 5: Sheets Sync
 ```
 src/modules/
 ├── collection/
-│   ├── collect.py       # Naver API pagination
-│   └── scrape.py        # Browser automation (optional)
+│   └── collect.py       # Naver API pagination
 ├── processing/
 │   ├── process.py       # Normalize, dedupe, CSV I/O
 │   ├── press_release_detector.py # Press release detection & summarization
 │   ├── media_classify.py # OpenAI media outlet classification
-│   ├── fulltext.py      # Full-text extraction (optional)
-│   └── looker_prep.py   # Time-series columns (optional)
+│   ├── reprocess_checker.py # Reprocess target detection (missing/incomplete fields)
+│   └── looker_prep.py   # Time-series columns (Looker Studio)
 ├── analysis/
-│   ├── classify_llm.py  # LLM-only classifier (current)
-│   ├── llm_engine.py    # OpenAI Structured Output engine
-│   ├── preset_pr.py     # Press release preset values
+│   ├── classify_llm.py  # LLM classification orchestrator (parallel processing)
+│   ├── classify_press_releases.py # Press release cluster LLM classification
+│   ├── llm_engine.py    # OpenAI Responses API engine (structured output)
+│   ├── llm_orchestrator.py # Parallel chunked task runner (ThreadPoolExecutor)
+│   ├── classification_stats.py # Statistics generation & reporting
+│   ├── result_writer.py # CSV/Sheets incremental saving (thread-safe)
 │   ├── keyword_extractor.py # Category-specific keyword extraction (kiwipiepy + Log-odds)
 │   └── prompts.yaml     # LLM prompts & schemas
 ├── monitoring/
@@ -91,9 +106,14 @@ src/modules/
 └── export/
     ├── report.py        # CSV + Word generation
     └── sheets.py        # Google Sheets sync
+
+src/utils/
+├── openai_client.py     # OpenAI API wrapper with retry/backoff (direct HTTP, no SDK)
+├── sheets_helpers.py    # Sheet creation & intermediate sync helpers
+└── text_cleaning.py     # BOM/invisible character cleaning
 ```
 
-**Note**: System uses LLM-only classification. Legacy files (`hybrid.py`, `rule_engine.py`, `rules.yaml`) have been removed. The file `classify.py` still exists but is not used in the current pipeline (legacy code).
+**Note**: System uses LLM-only classification. Legacy files (`classify.py`, `hybrid.py`, `rule_engine.py`, `rules.yaml`, `preset_pr.py`) have been removed.
 
 ## Key Configuration Files
 
@@ -108,6 +128,10 @@ COMPETITORS = ["신라호텔", "조선호텔"]
 - Output schema (JSON)
 - Decision rules for sentiment, danger, issue categories
 - No retraining needed - edit YAML to change logic
+
+**API Model Config** (`src/api_models.yaml`):
+- Per-task model selection (article_classification, media_classification, press_release_summary)
+- All default to gpt-4o-mini
 
 **Environment** (`.env`):
 ```bash
@@ -142,20 +166,23 @@ python main.py --chunk_size 50
 # Limit competitor analysis (default is unlimited)
 python main.py --max_competitor_classify 20
 
-# Extract category-specific keywords (kiwipiepy + Log-odds → Google Sheets)
-python main.py --extract_keywords --keyword_top_k 20
+# Adjust keyword extraction count (default: 20, auto-runs every time)
+python main.py --keyword_top_k 30
 
-# Browser scraping with date range
-python main.py --scrape --start_date 2026-01-01 --end_date 2026-02-08
-
-# Full-text extraction (high/medium risk only)
-python main.py --fulltext --fulltext_risk_levels 상,중
+# BOM cleanup in Google Sheets
+python main.py --clean_bom
 
 # Custom output directory
 python main.py --outdir reports
 
-# Parallel processing (adjust workers)
-python main.py --max_workers 10
+# Parallel processing (adjust workers, default: 3)
+python main.py --max_workers 5
+
+# Recheck only (no API collection, reprocess missing/incomplete from Sheets)
+python main.py --recheck_only
+
+# Recheck only + dry run (inspect targets without LLM cost)
+python main.py --recheck_only --dry_run
 ```
 
 ## Data Flow & Key Columns
@@ -212,22 +239,25 @@ python main.py --max_workers 10
 - Cost: ~$0.001 per 100 domains
 
 ### LLM Classification Strategy
-- **Model**: OpenAI gpt-4o-mini (as configured in prompts.yaml)
+- **Model**: OpenAI gpt-4o-mini (as configured in prompts.yaml and api_models.yaml)
 - **Full analysis by default**: OUR_BRANDS (all) + COMPETITORS (all)
   - Use `--max_competitor_classify N` to limit competitor analysis
-- **Press releases**: Preset values via `preset_pr.py`, skip LLM (save cost)
+- **Press releases**: Cluster-based LLM classification via `classify_press_releases.py`
+  - Selects 1 representative article per cluster → LLM analyzes → shares result across cluster
+  - Significantly reduces API calls vs individual classification
 - **Chunking**: Default 100 articles/chunk (reduce for timeouts)
-- **Parallel**: ThreadPoolExecutor with max_workers (default 10)
+- **Parallel**: ThreadPoolExecutor via `llm_orchestrator.py` with max_workers (default 3)
 - **Incremental save**: Appends to result.csv after each successful chunk
 - **Configuration**: All prompts and rules in `prompts.yaml` - no code changes needed
+- **OpenAI integration**: Direct HTTP via `src/utils/openai_client.py` (no openai SDK)
 
-### Keyword Extraction (Optional)
+### Keyword Extraction (Automatic)
 - **Method**: kiwipiepy (Korean morphological analysis) + Log-odds ratio with Laplace smoothing
 - **POS tags**: NNG (common noun), NNP (proper noun), VV (verb), VA (adjective)
 - **Statistics**: Log-odds ratio = log(P(word|category)) - log(P(word|other categories))
 - **Output**: Top-K keywords per category (default: 20)
 - **Categories**: sentiment_stage, danger_level, issue_category, news_category, brand_relevance
-- **Usage**: `--extract_keywords --keyword_top_k 20`
+- **Usage**: Runs automatically after classification, adjust count with `--keyword_top_k 30`
 - **Storage**:
   - Primary: Google Sheets `keywords` tab
   - Backup: `data/keywords/keywords_{category}.csv`
@@ -276,14 +306,14 @@ The system automatically tracks all pipeline metrics and saves them to CSV + Goo
 - `raw.csv` - Raw API collection (UTF-8 BOM, troubleshooting backup)
 - `result.csv` - LLM classified results (UTF-8 BOM, troubleshooting backup)
 - `media_directory.csv` - Media outlet directory (persistent)
-- `keywords/` - Category-specific keyword CSV files (if `--extract_keywords`, troubleshooting backup)
+- `keywords/` - Category-specific keyword CSV files (automatic, troubleshooting backup)
 - `logs/run_history.csv` - Run metrics history (persistent, append mode)
 
 **Google Sheets** (primary data store, if configured):
 - `raw_data` tab: Raw collected articles
 - `result` tab: Classified articles with all LLM columns
 - `logs` tab: Run history with metrics
-- `keywords` tab: Category-specific keywords (if `--extract_keywords`)
+- `keywords` tab: Category-specific keywords (automatic)
 - Auto-deduplication by link
 - CSV files are backups for troubleshooting
 
@@ -298,7 +328,7 @@ The system automatically tracks all pipeline metrics and saves them to CSV + Goo
 | Timeout during classification | Reduce `--chunk_size` (try 50 or 30) |
 | Rate limit (429) | Built-in retry; reduce `--chunk_size` if persistent |
 | Sheets sync fails | Check credentials path and Sheet ID in `.env` |
-| Playwright errors | Run `playwright install` |
+| BOM characters in Sheets | Run `python main.py --clean_bom` |
 
 **Test Commands**:
 ```bash
@@ -310,13 +340,17 @@ python main.py --display 10 --raw_only
 
 # Debug classification
 python main.py --display 20 --chunk_size 5 --max_workers 1
+
+# Recheck only (inspect reprocess targets without API collection)
+python main.py --recheck_only --dry_run
 ```
 
-**Incremental Processing**:
-- System checks `result.csv` for processed links
-- Finds unprocessed rows (new articles)
-- Finds rows with missing analysis fields (failed previous runs)
-- Processes both categories automatically
+**Reprocess Check** (STEP 1.5, `reprocess_checker.py`):
+- Loads total_result from Sheets (fallback: result.csv)
+- Rule 1: Finds raw links missing from total_result
+- Rules 2-5: Checks field-level completeness (brand_relevance, sentiment_stage, source, media_domain, date_only)
+- Merges all targets, clears classified_at, combines with new articles
+- `--recheck_only`: Skips API collection, loads raw_data from Sheets, runs full pipeline on targets
 
 ## Development Notes
 
@@ -331,14 +365,21 @@ python main.py --display 20 --chunk_size 5 --max_workers 1
 - `--raw_only` for collection testing
 - `--display 10` for small dataset tests
 - `--chunk_size 5` for debugging classification
-- Tests directory (`tests/`) exists for unit tests (in development)
+- Tests: `tests/test_llm_quality.py`, `tests/test_press_release_detector.py`, `tests/test_reprocess_checker.py`
 
 **Important Functions**:
 - Collection: `collect_all_news()` in `collect.py`
 - Processing: `normalize_df()`, `dedupe_df()`, `detect_similar_articles()` in `process.py`
-- Classification: `classify_llm()` in `classify_llm.py`
-- Reporting: `create_word_report()` in `report.py`
-- Sheets: `sync_raw_and_processed()` in `sheets.py`
+- Classification:
+  - `classify_llm()` in `classify_llm.py` - Main orchestrator with parallel processing
+  - `classify_press_releases()` in `classify_press_releases.py` - Cluster-based press release classification
+  - `analyze_article_llm()` in `llm_engine.py` - Single article LLM analysis
+  - `run_chunked_parallel()` in `llm_orchestrator.py` - Parallel chunked task runner
+  - `save_result_to_csv_incremental()` in `result_writer.py` - Thread-safe CSV saving
+  - `get_classification_stats()` in `classification_stats.py` - Statistics generation
+- Reprocess: `check_reprocess_targets()`, `load_raw_data_from_sheets()`, `clear_classified_at_for_targets()` in `reprocess_checker.py`
+- Reporting: `generate_console_report()` in `report.py`
+- Sheets: `sync_raw_and_processed()` in `sheets.py`, `sync_result_to_sheets()` in `result_writer.py`
 
 **Documentation Notes**:
 - ⚠️ README.md is outdated - describes removed hybrid system (rules.yaml, hybrid.py)
@@ -352,11 +393,30 @@ python main.py --display 20 --chunk_size 5 --max_workers 1
 - Replaced TF-IDF keywords with OpenAI group summaries
 - Added CSV-based media directory with Sheets sync
 
-**Phase 10 (Current - LLM-Only)**:
+**Phase 10 (LLM-Only)**:
 - **Removed hybrid system**: Deleted `rule_engine.py`, `hybrid.py`, `rules.yaml`
 - **LLM-only classification**: Uses OpenAI structured output
 - **Configuration-driven**: All logic in `prompts.yaml` (no retraining needed)
 - **Cleaner architecture**: Single classification path via `classify_llm.py`
+
+**Phase 11 (Analysis Module Refactoring)**:
+- **Removed legacy classify.py**: Deleted unused 3-stage classification system (473 lines)
+- **Module separation**: Extracted `classification_stats.py` and `result_writer.py` from `classify_llm.py`
+- **Single Responsibility**: Each module now has one clear purpose:
+  - `classify_llm.py`: Parallel processing orchestration only
+  - `llm_engine.py`: OpenAI API calls with structured output (schema caching optimized)
+  - `classification_stats.py`: Statistics generation and reporting
+  - `result_writer.py`: Thread-safe CSV/Sheets incremental saving
+- **Code reduction**: 44% reduction in analysis module size (841 net lines removed)
+- **Thread safety**: Lock-based CSV writing for multithread environments
+
+**Phase 12 (Current - Press Release LLM Classification)**:
+- **Replaced preset system**: `preset_pr.py` deprecated → `classify_press_releases.py`
+- **Cluster-based classification**: Representative article per cluster analyzed by LLM, results shared across cluster
+- **New orchestration**: `llm_orchestrator.py` for chunked parallel processing
+- **API model config**: `src/api_models.yaml` for per-task model selection
+- **Date filtering**: Hard-coded 2026-02-01+ filter in main.py and sheets.py
+- **Utility extraction**: `src/utils/` with `openai_client.py`, `sheets_helpers.py`, `text_cleaning.py`
 
 **Google Sheets as Primary Store**:
 - CSV files are backups for troubleshooting

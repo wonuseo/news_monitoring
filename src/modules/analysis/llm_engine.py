@@ -4,40 +4,123 @@ prompts.yaml 기반 단일 OpenAI 호출로 전체 분류 수행
 """
 
 import json
-import time
 import yaml
-import requests
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from src.utils.openai_client import (
+    OPENAI_API_URL,
+    set_error_callback,
+    load_api_models,
+    call_openai_with_retry,
+    extract_response_text,
+)
 
-OPENAI_API_URL = "https://api.openai.com/v1/responses"
 
-
-def load_api_models(yaml_path: Path = None) -> dict:
-    """
-    api_models.yaml 로드
-
-    Args:
-        yaml_path: api_models.yaml 경로 (기본값: src/api_models.yaml)
-
-    Returns:
-        models 딕셔너리
-    """
-    if yaml_path is None:
-        yaml_path = Path(__file__).parent.parent.parent / "api_models.yaml"
-
-    try:
-        with open(yaml_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-            return config.get("models", {})
-    except FileNotFoundError:
-        print(f"⚠️  {yaml_path} 파일을 찾을 수 없습니다. 기본 모델(gpt-5-nano) 사용")
-        return {
-            "article_classification": "gpt-5-nano",
-            "media_classification": "gpt-5-nano",
-            "press_release_summary": "gpt-5-nano"
+# JSON Schema 캐싱 (매번 생성 비용 제거)
+_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": [
+        "reasoning",
+        "brand_relevance",
+        "brand_relevance_query_keywords",
+        "sentiment_stage",
+        "danger_level",
+        "issue_category",
+        "news_category",
+        "news_keyword_summary"
+    ],
+    "additionalProperties": False,
+    "properties": {
+        "reasoning": {
+            "type": "object",
+            "description": "분석 추론 과정 (내부용, 저장하지 않음)",
+            "required": [
+                "article_subject",
+                "brand_role",
+                "subject_test",
+                "sentiment_rationale"
+            ],
+            "additionalProperties": False,
+            "properties": {
+                "article_subject": {
+                    "type": "string",
+                    "description": "기사의 핵심 주체 (예: 'TS손해보험', '롯데호텔')"
+                },
+                "brand_role": {
+                    "type": "string",
+                    "enum": ["주체", "배경장소", "나열", "무관"],
+                    "description": "query 브랜드의 기사 내 역할"
+                },
+                "subject_test": {
+                    "type": "string",
+                    "description": "주체 테스트 결과: 브랜드명 제거 시 기사 주제 변화 여부"
+                },
+                "sentiment_rationale": {
+                    "type": "string",
+                    "description": "감정 판단 근거 1문장"
+                }
+            }
+        },
+        "brand_relevance": {
+            "type": "string",
+            "enum": ["관련", "언급", "무관", "판단 필요"]
+        },
+        "brand_relevance_query_keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 0,
+            "maxItems": 3
+        },
+        "sentiment_stage": {
+            "type": "string",
+            "enum": ["긍정", "중립", "부정 후보", "부정 확정"]
+        },
+        "danger_level": {
+            "type": ["string", "null"],
+            "enum": ["상", "중", "하", None]
+        },
+        "issue_category": {
+            "type": ["string", "null"],
+            "enum": [
+                "안전/사고",
+                "위생/식음",
+                "보안/개인정보/IT",
+                "법무/규제",
+                "고객 분쟁",
+                "서비스 품질/운영",
+                "가격/상업",
+                "노무/인사",
+                "거버넌스/윤리",
+                "평판/PR",
+                "기타",
+                None
+            ]
+        },
+        "news_category": {
+            "type": "string",
+            "enum": [
+                "PR/보도자료",
+                "사업/실적",
+                "브랜드/마케팅",
+                "상품/오퍼링",
+                "제휴/파트너십",
+                "이벤트/프로모션",
+                "시설/오픈",
+                "고객 경험",
+                "운영/기술",
+                "인사/조직",
+                "리스크/위기",
+                "ESG/사회",
+                "기타"
+            ]
+        },
+        "news_keyword_summary": {
+            "type": "string",
+            "maxLength": 50
         }
+    }
+}
 
 
 def load_prompts(yaml_path: Path = None) -> dict:
@@ -84,7 +167,7 @@ def call_openai_structured(
     max_retries: int = 5
 ) -> Optional[Dict]:
     """
-    OpenAI Structured Output 호출 (5회 max retry 지원)
+    OpenAI Structured Output 호출 (재시도 지원)
 
     Args:
         system_prompt: 시스템 프롬프트
@@ -122,78 +205,31 @@ def call_openai_structured(
         }
     }
 
-    last_error = None
+    response = call_openai_with_retry(
+        OPENAI_API_URL, headers, payload,
+        max_retries=max_retries, label="LLM분류"
+    )
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=60)
+    if response is None:
+        return None
 
-            if response.status_code == 401:
-                raise RuntimeError("OpenAI API 인증 실패 (401). API 키를 확인하세요.")
-            elif response.status_code == 429:
-                print(f"⚠️  OpenAI 요청 한도 초과 (429) - 시도 {attempt + 1}/{max_retries}")
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 5초 → 10초 → 20초 → 40초 → 80초
-                    wait_time = 5 * (2 ** attempt)
-                    print(f"   {wait_time}초 대기 후 재시도...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise RuntimeError("OpenAI 요청 한도 초과 (5회 재시도 후에도 실패)")
-            elif response.status_code == 400:
-                try:
-                    error_detail = response.json()
-                    raise RuntimeError(f"OpenAI 요청 오류 (400): {error_detail}")
-                except json.JSONDecodeError:
-                    raise RuntimeError(f"OpenAI 요청 오류 (400): {response.text[:200]}")
-            elif response.status_code >= 500:
-                print(f"⚠️  OpenAI 서버 오류 ({response.status_code}) - 시도 {attempt + 1}/{max_retries}")
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (2 ** attempt)
-                    print(f"   {wait_time}초 대기 후 재시도...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise RuntimeError(f"OpenAI 서버 오류 ({response.status_code}, 5회 재시도 후에도 실패)")
+    data = response.json()
+    content = extract_response_text(data)
 
-            response.raise_for_status()
-            data = response.json()
+    if not content:
+        print("  Responses API 응답에서 output_text를 찾을 수 없습니다.")
+        return None
 
-            content = data.get("output_text", "").strip()
-            if not content:
-                output = data.get("output", [])
-                if output:
-                    contents = output[0].get("content", [])
-                    for item in contents:
-                        if item.get("type") == "output_text" and item.get("text"):
-                            content = item["text"].strip()
-                            break
-
-            if not content:
-                raise KeyError("Responses API 응답에서 output_text를 찾을 수 없습니다.")
-
-            result = json.loads(content)
-
-            return result
-
-        except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException) as e:
-            last_error = e
-            print(f"⚠️  OpenAI 호출 오류 - 시도 {attempt + 1}/{max_retries}: {e}")
-            if attempt < max_retries - 1:
-                wait_time = 2 * (2 ** attempt)
-                print(f"   {wait_time}초 대기 후 재시도...")
-                time.sleep(wait_time)
-                continue
-            else:
-                print(f"❌ 5회 재시도 후에도 실패: {last_error}")
-                return None
-
-    return None
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"  JSON 파싱 실패: {e}")
+        return None
 
 
 def build_response_schema() -> dict:
     """
-    JSON Schema 생성 (reasoning 필드를 첫 번째로 배치하여 CoT 유도)
+    JSON Schema 반환 (캐싱된 상수 사용)
 
     OpenAI Structured Output은 스키마 순서대로 생성하므로,
     reasoning을 먼저 생성하게 하여 분류 품질을 향상시킨다.
@@ -201,105 +237,7 @@ def build_response_schema() -> dict:
     Returns:
         JSON Schema 딕셔너리
     """
-    return {
-        "type": "object",
-        "required": [
-            "reasoning",
-            "brand_relevance",
-            "brand_relevance_query_keywords",
-            "sentiment_stage",
-            "danger_level",
-            "issue_category",
-            "news_category",
-            "news_keyword_summary"
-        ],
-        "additionalProperties": False,
-        "properties": {
-            "reasoning": {
-                "type": "object",
-                "description": "분석 추론 과정 (내부용, 저장하지 않음)",
-                "required": [
-                    "article_subject",
-                    "brand_role",
-                    "subject_test",
-                    "sentiment_rationale"
-                ],
-                "additionalProperties": False,
-                "properties": {
-                    "article_subject": {
-                        "type": "string",
-                        "description": "기사의 핵심 주체 (예: 'TS손해보험', '롯데호텔')"
-                    },
-                    "brand_role": {
-                        "type": "string",
-                        "enum": ["주체", "배경장소", "나열", "무관"],
-                        "description": "query 브랜드의 기사 내 역할"
-                    },
-                    "subject_test": {
-                        "type": "string",
-                        "description": "주체 테스트 결과: 브랜드명 제거 시 기사 주제 변화 여부"
-                    },
-                    "sentiment_rationale": {
-                        "type": "string",
-                        "description": "감정 판단 근거 1문장"
-                    }
-                }
-            },
-            "brand_relevance": {
-                "type": "string",
-                "enum": ["관련", "언급", "무관", "판단 필요"]
-            },
-            "brand_relevance_query_keywords": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 0,
-                "maxItems": 3
-            },
-            "sentiment_stage": {
-                "type": "string",
-                "enum": ["긍정", "중립", "부정 후보", "부정 확정"]
-            },
-            "danger_level": {
-                "type": ["string", "null"],
-                "enum": ["상", "중", "하", None]
-            },
-            "issue_category": {
-                "type": ["string", "null"],
-                "enum": [
-                    "안전/사고",
-                    "위생/식음",
-                    "보안/개인정보/IT",
-                    "법무/규제",
-                    "고객 분쟁",
-                    "서비스 품질/운영",
-                    "가격/상업",
-                    "노무/인사",
-                    "거버넌스/윤리",
-                    "평판/PR",
-                    "기타",
-                    None
-                ]
-            },
-            "news_category": {
-                "type": "string",
-                "enum": [
-                    "사업/실적",
-                    "브랜드/마케팅",
-                    "상품/오퍼링",
-                    "고객 경험",
-                    "운영/기술",
-                    "인사/조직",
-                    "리스크/위기",
-                    "ESG/사회",
-                    "기타"
-                ]
-            },
-            "news_keyword_summary": {
-                "type": "string",
-                "maxLength": 50
-            }
-        }
-    }
+    return _RESPONSE_SCHEMA
 
 
 def _post_process_result(result: Dict) -> Dict:
