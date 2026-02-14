@@ -11,6 +11,8 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 import pandas as pd
 
+from src.utils.sheets_helpers import get_or_create_worksheet
+
 
 class RunLogger:
     """
@@ -220,10 +222,7 @@ class RunLogger:
             return True
 
         try:
-            try:
-                worksheet = spreadsheet.worksheet(sheet_name)
-            except:
-                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
+            worksheet = get_or_create_worksheet(spreadsheet, sheet_name, rows=1000, cols=10)
 
             headers = self._get_or_create_headers(
                 worksheet, ["run_id", "timestamp", "level", "category", "message", "data_json"]
@@ -249,9 +248,9 @@ class RunLogger:
             return False
 
 
-def sync_logs_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "run_history"):
+def sync_run_history_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "run_history"):
     """
-    Sync run history CSV to Google Sheets.
+    Sync run history CSV to Google Sheets (full replace).
 
     Args:
         csv_path: Path to run_history.csv
@@ -271,10 +270,7 @@ def sync_logs_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "run_histo
             return False
 
         # Get or create worksheet
-        try:
-            worksheet = spreadsheet.worksheet(sheet_name)
-        except:
-            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=50)
+        worksheet = get_or_create_worksheet(spreadsheet, sheet_name, rows=1000, cols=50)
 
         # Clear and upload (full replace strategy for logs)
         worksheet.clear()

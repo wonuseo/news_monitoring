@@ -4,36 +4,21 @@ media_classify.py - Media Outlet Classification Module
 """
 
 import json
-import time
-import random
 import uuid
-import yaml
-import requests
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 from pathlib import Path
 import pandas as pd
 
-OPENAI_API_URL = "https://api.openai.com/v1/responses"
-
-_error_callback = None
-
-
-def set_error_callback(callback):
-    """Register error logger callback: fn(message: str, data: dict)."""
-    global _error_callback
-    _error_callback = callback
-
-
-def load_api_models() -> dict:
-    """api_models.yaml에서 모델 설정 로드"""
-    yaml_path = Path(__file__).parent.parent.parent / "api_models.yaml"
-    try:
-        with open(yaml_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-            return config.get("models", {})
-    except FileNotFoundError:
-        return {"media_classification": "gpt-5-nano"}
+from src.utils.openai_client import (
+    OPENAI_API_URL,
+    set_error_callback,
+    load_api_models,
+    call_openai_with_retry,
+    extract_response_text,
+    notify_error,
+)
+from src.utils.sheets_helpers import get_or_create_worksheet
 
 
 def extract_domain_safe(url: str) -> str:
@@ -118,11 +103,7 @@ def load_media_directory(spreadsheet=None, csv_path: Path = None) -> Dict[str, D
 def classify_media_outlets_batch(
     domains: List[str],
     openai_key: str,
-    retry: bool = True,
-    retry_count: int = 0,
     max_retries: int = 5,
-    base_wait: int = 15,
-    request_id: str = None
 ) -> Dict[str, Dict]:
     """
     OpenAI API를 사용하여 언론사 정보 분류 (배치 처리)
@@ -130,7 +111,7 @@ def classify_media_outlets_batch(
     Args:
         domains: 분류할 도메인 목록
         openai_key: OpenAI API 키
-        retry: 재시도 여부
+        max_retries: 최대 재시도 횟수
 
     Returns:
         {domain: {"media_name": ..., "media_group": ..., "media_type": ...}} 형태의 딕셔너리
@@ -202,133 +183,45 @@ JSON만 반환:
         "max_output_tokens": min(len(domains) * 100, 8000)  # 최소 100토큰/도메인, 최대 8000
     }
 
-    request_id = request_id or uuid.uuid4().hex[:8]
-    current_retry = retry_count
+    request_id = uuid.uuid4().hex[:8]
+    print(f"  🤖 OpenAI 분류: {len(domains)}개 신규 도메인", end="", flush=True)
 
-    while True:
-        try:
-            print(f"  🤖 OpenAI 분류: {len(domains)}개 신규 도메인", end="", flush=True)
-            response = requests.post(
-                OPENAI_API_URL,
-                headers=headers,
-                json=data,
-                timeout=60
-            )
+    response = call_openai_with_retry(
+        OPENAI_API_URL, headers, data,
+        max_retries=max_retries, request_id=request_id, label="언론사분류"
+    )
 
-            if response.status_code == 429:  # Rate limit
-                if retry and current_retry < max_retries - 1:
-                    wait_time = base_wait * (2 ** current_retry)
-                    retry_after = response.headers.get("Retry-After")
-                    retry_after_seconds = None
-                    if retry_after:
-                        try:
-                            retry_after_seconds = float(retry_after)
-                        except ValueError:
-                            retry_after_seconds = None
-                    if retry_after_seconds is not None:
-                        wait_time = retry_after_seconds
-                    wait_time = max(wait_time, 10)
-                    jitter = random.uniform(0, 6)
-                    wait_time += jitter
-                    if _error_callback:
-                        _error_callback(
-                            "OpenAI 요청 한도 초과 (429)",
-                            {
-                                "request_id": request_id,
-                                "status": 429,
-                                "retry_after": retry_after_seconds,
-                                "wait_time": round(wait_time, 1),
-                                "attempt": current_retry + 1,
-                            }
-                        )
-                    if retry_after_seconds is not None:
-                        print(f" (Rate limit [req:{request_id}] Retry-After={retry_after_seconds:.1f}s, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도, retry {current_retry + 1}/{max_retries})")
-                    else:
-                        print(f" (Rate limit [req:{request_id}] Retry-After 없음, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도, retry {current_retry + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                    current_retry += 1
-                    continue
-                print(" (Rate limit 초과, 기본값 사용)")
-                if _error_callback:
-                    _error_callback(
-                        "OpenAI 언론사 분류 429 - 재시도 실패",
-                        {"request_id": request_id, "status": 429, "attempts": max_retries}
-                    )
-                return _fallback_classification(domains)
+    if response is None:
+        print(" (재시도 실패, 기본값 사용)")
+        return _fallback_classification(domains)
 
-            if response.status_code != 200:
-                print(f" (API 오류 {response.status_code}, 기본값 사용)")
-                if _error_callback:
-                    _error_callback(
-                        "OpenAI 언론사 분류 API 오류",
-                        {"request_id": request_id, "status": response.status_code}
-                    )
-                return _fallback_classification(domains)
+    result = response.json()
+    content = extract_response_text(result)
 
-            result = response.json()
-            content = result.get("output_text", "").strip()
-            if not content:
-                output = result.get("output", [])
-                if output:
-                    contents = output[0].get("content", [])
-                    for item in contents:
-                        if item.get("type") == "output_text" and item.get("text"):
-                            content = item["text"].strip()
-                            break
+    try:
+        parsed = json.loads(content)
+        classifications = parsed.get("classifications", [])
+    except json.JSONDecodeError as e:
+        print(f" (JSON 파싱 실패: {str(e)[:50]}, 기본값 사용)")
+        notify_error(
+            "OpenAI 언론사 분류 파싱 실패",
+            {"request_id": request_id, "error": f"{type(e).__name__}: {e}"}
+        )
+        return _fallback_classification(domains)
 
-            try:
-                parsed = json.loads(content)
-                classifications = parsed.get("classifications", [])
-            except json.JSONDecodeError as e:
-                if _error_callback:
-                    _error_callback(
-                        "OpenAI 언론사 분류 파싱 실패",
-                        {"request_id": request_id, "error": f"{type(e).__name__}: {e}", "attempt": current_retry + 1}
-                    )
-                if retry and current_retry < max_retries - 1:
-                    print(f" (JSON 파싱 실패 [req:{request_id}]: {str(e)[:50]}, 2초 대기 후 재시도 {current_retry + 1}/{max_retries})")
-                    time.sleep(2)
-                    current_retry += 1
-                    continue
-                else:
-                    print(f" (JSON 파싱 실패: {str(e)[:50]}, 기본값 사용)")
-                    if _error_callback:
-                        _error_callback(
-                            "OpenAI 언론사 분류 파싱 실패",
-                            {"request_id": request_id, "error": f"{type(e).__name__}: {e}", "attempt": current_retry + 1}
-                        )
-                    return _fallback_classification(domains)
+    # 도메인 기준 딕셔너리로 변환
+    media_info = {}
+    for item in classifications:
+        domain = item.get("domain", "")
+        if domain:
+            media_info[domain] = {
+                "media_name": item.get("media_name", domain),
+                "media_group": item.get("media_group", domain),
+                "media_type": item.get("media_type", "기타")
+            }
 
-            # 도메인 기준 딕셔너리로 변환
-            media_info = {}
-            for item in classifications:
-                domain = item.get("domain", "")
-                if domain:
-                    media_info[domain] = {
-                        "media_name": item.get("media_name", domain),
-                        "media_group": item.get("media_group", domain),
-                        "media_type": item.get("media_type", "기타")
-                    }
-
-            print(f" ✅")
-            return media_info
-
-        except requests.exceptions.Timeout:
-            print(" (Timeout, 기본값 사용)")
-            if _error_callback:
-                _error_callback(
-                    "OpenAI 언론사 분류 Timeout",
-                    {"request_id": request_id}
-                )
-            return _fallback_classification(domains)
-        except Exception as e:
-            print(f" (오류: {e}, 기본값 사용)")
-            if _error_callback:
-                _error_callback(
-                    "OpenAI 언론사 분류 실패(예외)",
-                    {"request_id": request_id, "error": str(e)}
-                )
-            return _fallback_classification(domains)
+    print(f" ✅")
+    return media_info
 
 
 def _fallback_classification(domains: List[str]) -> Dict[str, Dict]:
@@ -366,10 +259,10 @@ def update_media_directory(spreadsheet=None, new_entries: Dict[str, Dict] = None
     # 1. Google Sheets 업데이트 (배치 처리로 rate limit 방지)
     if spreadsheet:
         try:
-            try:
-                worksheet = spreadsheet.worksheet("media_directory")
-            except:
-                worksheet = spreadsheet.add_worksheet(title="media_directory", rows=1, cols=4)
+            worksheet = get_or_create_worksheet(spreadsheet, "media_directory", rows=1, cols=4)
+            # Ensure header row exists
+            existing_rows = worksheet.row_values(1)
+            if not existing_rows:
                 worksheet.append_row(["domain", "media_name", "media_group", "media_type"])
 
             # 배치 업데이트: 모든 행을 한 번에 추가

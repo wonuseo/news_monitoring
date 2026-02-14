@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**News Monitoring System** - Automated pipeline for hotel brand news monitoring that collects articles from Naver API, performs hybrid LLM+rule-based analysis for sentiment/risk/categorization, and outputs results to Google Sheets + CSV + Word reports.
+**News Monitoring System** - Automated pipeline for hotel brand news monitoring that collects articles from Naver API, performs LLM-based analysis for sentiment/risk/categorization, and outputs results to Google Sheets + CSV + Word reports.
 
 **Core Flow**: Collection → Processing → LLM Classification → Reporting → Sheets Sync
 
@@ -43,7 +43,15 @@ Linear 5-step pipeline:
 STEP 1: Collection
 ├─ Naver API (pagination: 9 pages × 100 = 900 articles/brand)
 ├─ Load existing links from Google Sheets (skip duplicates)
-└─ Save to raw.csv + append to Sheets
+├─ Save to raw.csv + append to Sheets
+└─ --recheck_only: Skip API, load raw_data from Sheets
+
+STEP 1.5: Reprocess Check
+├─ Load total_result (Sheets → CSV fallback)
+├─ Rule 1: raw links missing from total_result
+├─ Rules 2-6: Field-level empty check (brand_relevance, sentiment_stage, source, media_domain, date_only)
+├─ Union all targets → clear classified_at → merge with new articles
+└─ Module: reprocess_checker.py
 
 STEP 2: Processing
 ├─ Normalize (HTML strip, ISO dates, article_id, article_no)
@@ -78,11 +86,14 @@ src/modules/
 │   ├── process.py       # Normalize, dedupe, CSV I/O
 │   ├── press_release_detector.py # Press release detection & summarization
 │   ├── media_classify.py # OpenAI media outlet classification
+│   ├── reprocess_checker.py # Reprocess target detection (missing/incomplete fields)
 │   ├── fulltext.py      # Full-text extraction (optional)
 │   └── looker_prep.py   # Time-series columns (optional)
 ├── analysis/
-│   ├── classify_llm.py  # LLM-only classifier (current)
-│   ├── llm_engine.py    # OpenAI Structured Output engine
+│   ├── classify_llm.py  # LLM classification orchestrator (parallel processing)
+│   ├── llm_engine.py    # OpenAI Structured Output engine (low-level API)
+│   ├── classification_stats.py # Statistics generation & reporting
+│   ├── result_writer.py # CSV/Sheets incremental saving (thread-safe)
 │   ├── preset_pr.py     # Press release preset values
 │   ├── keyword_extractor.py # Category-specific keyword extraction (kiwipiepy + Log-odds)
 │   └── prompts.yaml     # LLM prompts & schemas
@@ -93,7 +104,7 @@ src/modules/
     └── sheets.py        # Google Sheets sync
 ```
 
-**Note**: System uses LLM-only classification. Legacy files (`hybrid.py`, `rule_engine.py`, `rules.yaml`) have been removed. The file `classify.py` still exists but is not used in the current pipeline (legacy code).
+**Note**: System uses LLM-only classification. All legacy files (`classify.py`, `hybrid.py`, `rule_engine.py`, `rules.yaml`) have been removed.
 
 ## Key Configuration Files
 
@@ -156,6 +167,12 @@ python main.py --outdir reports
 
 # Parallel processing (adjust workers)
 python main.py --max_workers 10
+
+# Recheck only (no API collection, reprocess missing/incomplete from Sheets)
+python main.py --recheck_only
+
+# Recheck only + dry run (inspect targets without LLM cost)
+python main.py --recheck_only --dry_run
 ```
 
 ## Data Flow & Key Columns
@@ -310,13 +327,17 @@ python main.py --display 10 --raw_only
 
 # Debug classification
 python main.py --display 20 --chunk_size 5 --max_workers 1
+
+# Recheck only (inspect reprocess targets without API collection)
+python main.py --recheck_only --dry_run
 ```
 
-**Incremental Processing**:
-- System checks `result.csv` for processed links
-- Finds unprocessed rows (new articles)
-- Finds rows with missing analysis fields (failed previous runs)
-- Processes both categories automatically
+**Reprocess Check** (STEP 1.5, `reprocess_checker.py`):
+- Loads total_result from Sheets (fallback: result.csv)
+- Rule 1: Finds raw links missing from total_result
+- Rules 2-6: Checks field-level completeness (brand_relevance, sentiment_stage, source, media_domain, date_only)
+- Merges all targets, clears classified_at, combines with new articles
+- `--recheck_only`: Skips API collection, loads raw_data from Sheets, runs full pipeline on targets
 
 ## Development Notes
 
@@ -336,9 +357,14 @@ python main.py --display 20 --chunk_size 5 --max_workers 1
 **Important Functions**:
 - Collection: `collect_all_news()` in `collect.py`
 - Processing: `normalize_df()`, `dedupe_df()`, `detect_similar_articles()` in `process.py`
-- Classification: `classify_llm()` in `classify_llm.py`
+- Classification:
+  - `classify_llm()` in `classify_llm.py` - Main orchestrator with parallel processing
+  - `analyze_article_llm()` in `llm_engine.py` - Single article LLM analysis
+  - `save_result_to_csv_incremental()` in `result_writer.py` - Thread-safe CSV saving
+  - `get_classification_stats()` in `classification_stats.py` - Statistics generation
+- Reprocess: `check_reprocess_targets()`, `load_raw_data_from_sheets()`, `clear_classified_at_for_targets()` in `reprocess_checker.py`
 - Reporting: `create_word_report()` in `report.py`
-- Sheets: `sync_raw_and_processed()` in `sheets.py`
+- Sheets: `sync_raw_and_processed()` in `sheets.py`, `sync_result_to_sheets()` in `result_writer.py`
 
 **Documentation Notes**:
 - ⚠️ README.md is outdated - describes removed hybrid system (rules.yaml, hybrid.py)
@@ -352,11 +378,22 @@ python main.py --display 20 --chunk_size 5 --max_workers 1
 - Replaced TF-IDF keywords with OpenAI group summaries
 - Added CSV-based media directory with Sheets sync
 
-**Phase 10 (Current - LLM-Only)**:
+**Phase 10 (LLM-Only)**:
 - **Removed hybrid system**: Deleted `rule_engine.py`, `hybrid.py`, `rules.yaml`
 - **LLM-only classification**: Uses OpenAI structured output
 - **Configuration-driven**: All logic in `prompts.yaml` (no retraining needed)
 - **Cleaner architecture**: Single classification path via `classify_llm.py`
+
+**Phase 11 (Current - Analysis Module Refactoring)**:
+- **Removed legacy classify.py**: Deleted unused 3-stage classification system (473 lines)
+- **Module separation**: Extracted `classification_stats.py` and `result_writer.py` from `classify_llm.py`
+- **Single Responsibility**: Each module now has one clear purpose:
+  - `classify_llm.py`: Parallel processing orchestration only
+  - `llm_engine.py`: OpenAI API calls with structured output (schema caching optimized)
+  - `classification_stats.py`: Statistics generation and reporting
+  - `result_writer.py`: Thread-safe CSV/Sheets incremental saving
+- **Code reduction**: 44% reduction in analysis module size (841 net lines removed)
+- **Thread safety**: Lock-based CSV writing for multithread environments
 
 **Google Sheets as Primary Store**:
 - CSV files are backups for troubleshooting

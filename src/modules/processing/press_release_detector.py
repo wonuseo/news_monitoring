@@ -5,47 +5,20 @@ press_release_detector.py - Press Release Detection & Summarization
 
 import re
 import json
-import time
-import random
 import uuid
-import yaml
-import requests
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List
+from tqdm import tqdm
 
-
-def _extract_response_text(result: Dict) -> str:
-    text = result.get("output_text", "")
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    for section in result.get("output", []):
-        contents = section.get("content", [])
-        for item in contents:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "output_text" and isinstance(item.get("text"), str):
-                return item["text"].strip()
-            # Some payloads embed raw text without explicit type
-            raw_text = item.get("text")
-            if isinstance(raw_text, str) and raw_text.strip():
-                return raw_text.strip()
-    # Fallback to legacy choices (if any)
-    for choice in result.get("choices", []):
-        message = choice.get("message", {})
-        content = message.get("content", "")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-    return ""
-
-
-_error_callback = None
-
-
-def set_error_callback(callback):
-    """Register error logger callback: fn(message: str, data: dict)."""
-    global _error_callback
-    _error_callback = callback
+from src.utils.openai_client import (
+    OPENAI_API_URL,
+    set_error_callback,
+    load_api_models,
+    call_openai_with_retry,
+    extract_response_text,
+    notify_error,
+)
 
 
 def _trim_json_object(payload: str) -> str:
@@ -71,9 +44,9 @@ def _repair_json_text(payload: str) -> str:
 
 
 def _parse_summaries_from_result(result: Dict) -> List[Dict]:
-    text = _extract_response_text(result)
+    text = extract_response_text(result)
     if not text:
-        print("❌ JSON 파싱 실패: API 응답에 텍스트가 없습니다")
+        print("  JSON 파싱 실패: API 응답에 텍스트가 없습니다")
         print(f"   전체 응답 구조: {json.dumps(result, indent=2, ensure_ascii=False)[:500]}")
         raise ValueError("Responses API 반환 body에 텍스트가 없습니다.")
 
@@ -89,11 +62,11 @@ def _parse_summaries_from_result(result: Dict) -> List[Dict]:
             break
         except json.JSONDecodeError as exc:
             last_exc = exc
-            print(f"❌ JSON 파싱 시도 {i} 실패: {exc}")
+            print(f"  JSON 파싱 시도 {i} 실패: {exc}")
             print(f"   시도한 텍스트 (앞 300자): {candidate[:300]}")
 
     if parsed is None:
-        print("❌ 모든 JSON 파싱 시도 실패")
+        print("  모든 JSON 파싱 시도 실패")
         print(f"   원본 텍스트 (앞 500자): {text[:500]}")
         print(f"   정제된 텍스트 (앞 500자): {trimmed[:500]}")
         raise last_exc or ValueError("Responses API JSON을 파싱할 수 없습니다.")
@@ -103,29 +76,16 @@ def _parse_summaries_from_result(result: Dict) -> List[Dict]:
     elif isinstance(parsed, list):
         summaries = parsed
     else:
-        print(f"❌ 예상하지 못한 JSON 구조: {type(parsed)}")
+        print(f"  예상하지 못한 JSON 구조: {type(parsed)}")
         print(f"   파싱된 객체: {json.dumps(parsed, indent=2, ensure_ascii=False)[:500]}")
         raise ValueError("Responses API가 요약 목록을 포함하지 않습니다.")
 
     if not isinstance(summaries, list):
-        print(f"❌ summaries가 리스트가 아님: {type(summaries)}")
+        print(f"  summaries가 리스트가 아님: {type(summaries)}")
         print(f"   summaries 값: {summaries}")
         raise ValueError("Responses API가 summaries 리스트를 반환하지 않았습니다.")
 
     return summaries
-
-OPENAI_API_URL = "https://api.openai.com/v1/responses"
-
-
-def load_api_models() -> dict:
-    """api_models.yaml에서 모델 설정 로드"""
-    yaml_path = Path(__file__).parent.parent.parent / "api_models.yaml"
-    try:
-        with open(yaml_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-            return config.get("models", {})
-    except FileNotFoundError:
-        return {"press_release_summary": "gpt-5-nano"}
 
 
 def detect_similar_articles(
@@ -180,12 +140,12 @@ def detect_similar_articles(
         import numpy as np
         from collections import deque
     except ImportError as e:
-        print(f"⚠️  필수 패키지가 설치되지 않았습니다 ({e}). 유사도 검사를 건너뜁니다.")
+        print(f"  필수 패키지가 설치되지 않았습니다 ({e}). 유사도 검사를 건너뜁니다.")
         return df
 
     # 필수 컬럼 확인
     if "query" not in df.columns:
-        print("⚠️  'query' 컬럼이 없습니다. 유사도 검사를 건너뜁니다.")
+        print("  'query' 컬럼이 없습니다. 유사도 검사를 건너뜁니다.")
         return df
 
     # 유틸 함수들
@@ -233,7 +193,7 @@ def detect_similar_articles(
     # 빈 텍스트 제거
     valid_mask = (df["title_clean"].str.len() > 0) | (df["desc_clean"].str.len() > 0)
     if valid_mask.sum() < 2:
-        print(f"✅ 유효한 기사가 {valid_mask.sum()}개로 너무 적습니다. 유사도 검사 스킵")
+        print(f"  유효한 기사가 {valid_mask.sum()}개로 너무 적습니다. 유사도 검사 스킵")
         df = df.drop(columns=["title_clean", "desc_clean", "pub_dt_ordinal"])
         return df
 
@@ -337,7 +297,7 @@ def detect_similar_articles(
                     total_press_release += 1
 
         except Exception as e:
-            print(f"⚠️  '{query}' 처리 중 오류 발생: {e}")
+            print(f"  '{query}' 처리 중 오류 발생: {e}")
             continue
 
     # 임시 컬럼 제거
@@ -352,11 +312,7 @@ def detect_similar_articles(
 def _call_openai_summarize_batch(
     articles: List[Dict],
     openai_key: str,
-    retry: bool = True,
-    retry_count: int = 0,
     max_retries: int = 5,
-    base_wait: int = 15,
-    request_id: str = None
 ) -> Dict[str, str]:
     """OpenAI API로 기사 배치 요약"""
     articles_text = "\n".join([
@@ -383,132 +339,62 @@ IMPORTANT: JSON 객체만 출력하세요. 다른 설명이나 마크다운 없�
     api_models = load_api_models()
     model = api_models.get("press_release_summary", "gpt-5-nano")
 
-    request_id = request_id or uuid.uuid4().hex[:8]
-    current_retry = retry_count
+    request_id = uuid.uuid4().hex[:8]
 
-    while True:
-        try:
-            response = requests.post(
-                OPENAI_API_URL,
-                headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-                    "text": {
-                        "format": {
-                            "type": "json_schema",
-                            "name": "press_release_summaries",
-                            "strict": False,
-                            "schema": {
+    headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "press_release_summaries",
+                "strict": False,
+                "schema": {
+                    "type": "object",
+                    "required": ["summaries"],
+                    "additionalProperties": True,
+                    "properties": {
+                        "summaries": {
+                            "type": "array",
+                            "items": {
                                 "type": "object",
-                                "required": ["summaries"],
+                                "required": ["cluster_id", "summary"],
                                 "additionalProperties": True,
                                 "properties": {
-                                    "summaries": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "required": ["cluster_id", "summary"],
-                                            "additionalProperties": True,
-                                            "properties": {
-                                                "cluster_id": {"type": "string"},
-                                                "summary": {"type": "string"}
-                                            }
-                                        }
-                                    }
+                                    "cluster_id": {"type": "string"},
+                                    "summary": {"type": "string"}
                                 }
                             }
                         }
-                    },
-                },
-                timeout=60
-            )
-
-            if response.status_code == 429 and retry:
-                if current_retry < max_retries - 1:
-                    wait_time = base_wait * (2 ** current_retry)
-                    retry_after = response.headers.get("Retry-After")
-                    retry_after_seconds = None
-                    if retry_after:
-                        try:
-                            retry_after_seconds = float(retry_after)
-                        except ValueError:
-                            retry_after_seconds = None
-                    if retry_after_seconds is not None:
-                        wait_time = retry_after_seconds
-                    wait_time = max(wait_time, 10)
-                    jitter = random.uniform(0, 6)
-                    wait_time += jitter
-                    if _error_callback:
-                        _error_callback(
-                            "OpenAI 요청 한도 초과 (429)",
-                            {
-                                "request_id": request_id,
-                                "status": 429,
-                                "retry_after": retry_after_seconds,
-                                "wait_time": round(wait_time, 1),
-                                "attempt": current_retry + 1,
-                            }
-                        )
-                    if retry_after_seconds is not None:
-                        print(f"  (Rate limit [req:{request_id}] Retry-After={retry_after_seconds:.1f}s, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도, retry {current_retry + 1}/{max_retries})")
-                    else:
-                        print(f"  (Rate limit [req:{request_id}] Retry-After 없음, jitter={jitter:.1f}s → {wait_time:.1f}초 대기 후 재시도, retry {current_retry + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                    current_retry += 1
-                    continue
-                print("  (Rate limit 초과, 기본값 사용)")
-                if _error_callback:
-                    _error_callback(
-                        "OpenAI 보도자료 요약 429 - 재시도 실패",
-                        {"request_id": request_id, "status": 429, "attempts": max_retries}
-                    )
-                return {a["cluster_id"]: a["title"][:15] for a in articles}
-
-            if response.status_code != 200:
-                print(f"  (API 오류 {response.status_code}, 기본값 사용)")
-                if _error_callback:
-                    _error_callback(
-                        "OpenAI 보도자료 요약 API 오류",
-                        {"request_id": request_id, "status": response.status_code}
-                    )
-                return {a["cluster_id"]: a["title"][:15] for a in articles}
-
-            result = response.json()
-            try:
-                summaries = _parse_summaries_from_result(result)
-                return {
-                    item["cluster_id"]: item["summary"]
-                    for item in summaries
-                    if isinstance(item, dict) and "cluster_id" in item and "summary" in item
+                    }
                 }
-            except (ValueError, json.JSONDecodeError, KeyError) as e:
-                if _error_callback:
-                    _error_callback(
-                        "OpenAI 보도자료 요약 파싱 실패",
-                        {"request_id": request_id, "error": f"{type(e).__name__}: {e}", "attempt": current_retry + 1}
-                    )
-                if retry and current_retry < max_retries - 1:
-                    print(f"  (JSON 파싱 실패 [req:{request_id}]: {type(e).__name__}, 재시도 {current_retry + 1}/{max_retries})")
-                    time.sleep(2)
-                    current_retry += 1
-                    continue
-                print(f"  (최종 파싱 실패, 기본값 사용)")
-                if _error_callback:
-                    _error_callback(
-                        "OpenAI 보도자료 요약 파싱 실패",
-                        {"request_id": request_id, "error": f"{type(e).__name__}: {e}", "attempt": current_retry + 1}
-                    )
-                return {a["cluster_id"]: a["title"][:15] for a in articles}
+            }
+        },
+    }
 
-        except Exception as e:
-            print(f"  (오류: {e}, 기본값 사용)")
-            if _error_callback:
-                _error_callback(
-                    "OpenAI 보도자료 요약 실패(예외)",
-                    {"request_id": request_id, "error": str(e)}
-                )
-            return {a["cluster_id"]: a["title"][:15] for a in articles}
+    response = call_openai_with_retry(
+        OPENAI_API_URL, headers, payload,
+        max_retries=max_retries, request_id=request_id, label="보도자료요약"
+    )
+
+    if response is None:
+        return {a["cluster_id"]: a["title"][:15] for a in articles}
+
+    result = response.json()
+    try:
+        summaries = _parse_summaries_from_result(result)
+        return {
+            item["cluster_id"]: item["summary"]
+            for item in summaries
+            if isinstance(item, dict) and "cluster_id" in item and "summary" in item
+        }
+    except (ValueError, json.JSONDecodeError, KeyError) as e:
+        notify_error(
+            "OpenAI 보도자료 요약 파싱 실패",
+            {"request_id": request_id, "error": f"{type(e).__name__}: {e}"}
+        )
+        return {a["cluster_id"]: a["title"][:15] for a in articles}
 
 
 def summarize_press_release_groups(
@@ -544,11 +430,20 @@ def summarize_press_release_groups(
         pr_df["pub_datetime_parsed"] = pd.to_datetime(pr_df["pub_datetime"], errors="coerce")
         earliest_articles = pr_df.sort_values("pub_datetime_parsed").groupby("cluster_id").first().reset_index()
 
-        # 이미 요약이 있는 cluster_id 제외
-        existing_summaries = df[press_release_mask & (df["press_release_group"].notna()) & (df["press_release_group"] != "")]
-        existing_cluster_ids = set(existing_summaries["cluster_id"].unique())
+        # 이미 요약이 있는 클러스터는 기존 값을 전체 멤버에 전파하고, OpenAI 호출 대상에서 제외
+        existing_cluster_ids = set()
+        for cluster_id, cluster_rows in pr_df.groupby("cluster_id"):
+            existing_values = cluster_rows["press_release_group"].dropna().astype(str)
+            existing_values = existing_values[existing_values.str.strip() != ""]
+            if len(existing_values) == 0:
+                continue
 
-        # 요약이 필요한 cluster_id만 선택
+            existing_cluster_ids.add(cluster_id)
+            existing_summary = existing_values.iloc[0]
+            cluster_mask = press_release_mask & (df["cluster_id"] == cluster_id)
+            df.loc[cluster_mask, "press_release_group"] = existing_summary
+
+        # 요약이 필요한 cluster_id만 선택 (클러스터 내 요약이 전혀 없는 경우)
         articles_to_summarize = [
             {"cluster_id": row["cluster_id"], "title": row["title"], "description": row["description"]}
             for _, row in earliest_articles.iterrows()
@@ -560,10 +455,14 @@ def summarize_press_release_groups(
             return df
 
         group_summaries = {}
-        for i in range(0, len(articles_to_summarize), 20):
+        total_to_summarize = len(articles_to_summarize)
+        pbar = tqdm(total=total_to_summarize, desc="보도자료 요약", unit="그룹")
+        for i in range(0, total_to_summarize, 20):
             batch = articles_to_summarize[i:i+20]
             batch_summaries = _call_openai_summarize_batch(batch, openai_key)
             group_summaries.update(batch_summaries)
+            pbar.update(len(batch))
+        pbar.close()
 
         # press_release_group 업데이트
         for idx, row in df[press_release_mask].iterrows():
@@ -582,5 +481,5 @@ def summarize_press_release_groups(
         return df
 
     except Exception as e:
-        print(f"⚠️  보도자료 그룹 요약 중 오류: {e}")
+        print(f"  보도자료 그룹 요약 중 오류: {e}")
         return df

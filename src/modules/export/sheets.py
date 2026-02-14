@@ -9,54 +9,8 @@ from datetime import datetime
 import os
 import time
 
-
-def clean_bom(value) -> str:
-    """
-    모든 BOM 및 invisible 문자를 제거하고 빈 문자열로 변환
-
-    제거 대상:
-    - UTF-8/16/32 BOM: \ufeff, \ufffe
-    - Zero Width 문자: \u200b, \u200c, \u200d, \u2060
-    - Non-breaking/ideographic spaces: \u00a0, \u3000
-    - 기타 invisible 문자: \u180e, \u2028, \u2029, \u200e, \u200f, \u202a-\u202f
-    - C0/C1 제어 문자: \x00-\x08, \x0b, \x0c, \x0e-\x1f, \x7f-\x9f
-    - Interlinear annotation: \ufff9-\ufffc
-
-    Args:
-        value: 정리할 값
-
-    Returns:
-        정리된 문자열
-    """
-    import re
-
-    if pd.isna(value) or value is None:
-        return ""
-
-    # 문자열로 변환
-    value_str = str(value)
-
-    # 정규식으로 모든 invisible/제어 문자 일괄 제거
-    # BOM, Zero Width, 제어 문자, 방향 마크, non-breaking space 등
-    value_str = re.sub(
-        r'[\ufeff\ufffe'           # BOM
-        r'\u200b-\u200f'           # Zero Width + 방향 마크
-        r'\u2028-\u202f'           # 줄/단락 구분자 + 방향 포맷
-        r'\u2060'                  # Word Joiner
-        r'\u180e'                  # Mongolian Vowel Separator
-        r'\u00a0'                  # Non-Breaking Space
-        r'\u3000'                  # Ideographic Space (전각 공백)
-        r'\u00ad'                  # Soft Hyphen
-        r'\ufff9-\ufffc'           # Interlinear Annotation
-        r'\x00-\x08\x0b\x0c\x0e-\x1f'  # C0 제어 문자 (탭/개행 제외)
-        r'\x7f-\x9f'              # DEL + C1 제어 문자
-        r']', '', value_str
-    )
-
-    # 앞뒤 공백 제거
-    value_str = value_str.strip()
-
-    return value_str
+from src.utils.text_cleaning import clean_bom
+from src.utils.sheets_helpers import get_or_create_worksheet
 
 
 def clean_all_bom_in_sheets(spreadsheet, sheet_names: list = None) -> Dict[str, int]:
@@ -271,6 +225,9 @@ def load_analysis_status_from_sheets(
     analysis_cols: Optional[List[str]] = None
 ) -> Dict[str, set]:
     """
+    [DEPRECATED] reprocess_checker.py의 check_reprocess_targets()로 대체됨.
+    호환성을 위해 유지하지만, main.py에서는 더 이상 호출하지 않음.
+
     Google Sheets에서 분석 완료/미완료 링크 집합 로드
 
     Returns:
@@ -354,7 +311,8 @@ def filter_new_articles_from_sheets(df_raw: pd.DataFrame, existing_links: set) -
 def sync_to_sheets(df: pd.DataFrame, spreadsheet,
                   sheet_name: str = "전체데이터",
                   key_column: str = "link",
-                  update_fields: list = None) -> Dict[str, int]:
+                  update_fields: list = None,
+                  force_update_existing: bool = False) -> Dict[str, int]:
     """
     DataFrame을 Google Sheets에 upsert (update or insert)
 
@@ -364,6 +322,7 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
         sheet_name: 워크시트 이름
         key_column: 중복 제거 기준 컬럼
         update_fields: 업데이트할 필드 리스트 (None이면 분석 필드 자동 감지)
+        force_update_existing: True면 기존 키 행도 강제 업데이트
 
     Returns:
         {"attempted": N, "added": N, "updated": N, "skipped": N, "errors": N}
@@ -388,11 +347,7 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
 
     try:
         # 워크시트 선택 또는 생성
-        try:
-            worksheet = spreadsheet.worksheet(sheet_name)
-        except:
-            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=30)
-            print(f"  📝 새 워크시트 생성: {sheet_name}")
+        worksheet = get_or_create_worksheet(spreadsheet, sheet_name, rows=1000, cols=30)
 
         # 기존 데이터 읽기
         try:
@@ -434,26 +389,29 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
                 existing_row_data = existing_row_info["data"]
                 row_idx = existing_row_info["row_idx"]
 
-                # 업데이트 필요 여부 확인 (실제 값 변경이 있을 때만)
-                needs_update = False
-                for field in update_fields:
-                    if field not in df.columns:
-                        continue
-                    new_val = clean_bom(row.get(field, ""))
-                    existing_val = clean_bom(existing_row_data.get(field, ""))
+                # 업데이트 필요 여부 확인
+                if force_update_existing:
+                    needs_update = True
+                else:
+                    needs_update = False
+                    for field in update_fields:
+                        if field not in df.columns:
+                            continue
+                        new_val = clean_bom(row.get(field, ""))
+                        existing_val = clean_bom(existing_row_data.get(field, ""))
 
-                    # 업데이트가 필요한 경우:
-                    # 1. 빈 값에 실제 값이 들어갈 때 (기존: 빈값, 새로운: 값 있음)
-                    # 2. 둘 다 값이 있고 다를 때 (기존: 값A, 새로운: 값B)
-                    # 절대 하지 않는 경우:
-                    # - 빈 값 → 빈 값 (변경 없음)
-                    # - 기존 값 → 빈 값 (기존 분석 결과 보호!)
-                    if existing_val == "" and new_val != "":
-                        needs_update = True
-                        break
-                    elif existing_val != "" and new_val != "" and new_val != existing_val:
-                        needs_update = True
-                        break
+                        # 업데이트가 필요한 경우:
+                        # 1. 빈 값에 실제 값이 들어갈 때 (기존: 빈값, 새로운: 값 있음)
+                        # 2. 둘 다 값이 있고 다를 때 (기존: 값A, 새로운: 값B)
+                        # 절대 하지 않는 경우:
+                        # - 빈 값 → 빈 값 (변경 없음)
+                        # - 기존 값 → 빈 값 (기존 분석 결과 보호!)
+                        if existing_val == "" and new_val != "":
+                            needs_update = True
+                            break
+                        elif existing_val != "" and new_val != "" and new_val != existing_val:
+                            needs_update = True
+                            break
 
                 if needs_update:
                     rows_to_update.append((row_idx, row, existing_row_data))
@@ -605,6 +563,66 @@ def configure_sheet_schema(worksheet) -> None:
         print(f"  ⚠️  스키마 설정 실패: {e}")
 
 
+TOTAL_RESULT_MIN_DATE = "2026-02-01"
+TOTAL_RESULT_DATE_COLUMNS = [
+    "pub_datetime",
+    "date_only",
+    "pubDate",
+    "pub_date",
+    "published_at",
+    "date",
+]
+
+
+def filter_total_result_by_date(
+    df_result: pd.DataFrame,
+    min_date: str = TOTAL_RESULT_MIN_DATE,
+) -> pd.DataFrame:
+    """
+    Keep only rows on/after min_date for total_result upload.
+    raw_data는 영향을 받지 않는다.
+    """
+    if df_result.empty:
+        return df_result
+
+    candidate_cols = [col for col in TOTAL_RESULT_DATE_COLUMNS if col in df_result.columns]
+    if not candidate_cols:
+        print("  ⚠️  total_result 날짜 컬럼이 없어 날짜 필터를 건너뜁니다.")
+        return df_result
+
+    cutoff = pd.Timestamp(min_date, tz="UTC")
+
+    # 컬럼별 파싱 성공률/유지 건수를 비교해 가장 신뢰도 높은 날짜 컬럼 선택
+    best_col = None
+    best_parsed = None
+    best_score = (-1, -1)  # (kept_count, valid_count)
+    for col in candidate_cols:
+        parsed = pd.to_datetime(df_result[col], errors="coerce", utc=True)
+        valid_count = int(parsed.notna().sum())
+        kept_count = int((parsed >= cutoff).sum())
+        score = (kept_count, valid_count)
+        if score > best_score:
+            best_col = col
+            best_parsed = parsed
+            best_score = score
+
+    if best_col is None or best_parsed is None:
+        print("  ⚠️  total_result 날짜 파싱 실패로 날짜 필터를 건너뜁니다.")
+        return df_result
+
+    keep_mask = best_parsed >= cutoff
+
+    before_count = len(df_result)
+    filtered = df_result[keep_mask].copy()
+    removed_count = before_count - len(filtered)
+    print(
+        f"  🔎 total_result 날짜 필터({best_col}): "
+        f"{removed_count}개 제외 (< {min_date}), {len(filtered)}개 유지"
+    )
+
+    return filtered
+
+
 def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spreadsheet) -> Dict[str, Dict]:
     """
     원본 데이터와 분류 결과를 Google Sheets에 upsert (update or insert)
@@ -635,8 +653,14 @@ def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spread
     results["raw_data"] = sync_to_sheets(df_raw, spreadsheet, "raw_data")
 
     # 2. total_result - 전체 분류 결과 (upsert 지원)
+    df_result_for_total = filter_total_result_by_date(df_result, TOTAL_RESULT_MIN_DATE)
     print("  [2/2] total_result (전체 분류 결과)")
-    results["total_result"] = sync_to_sheets(df_result, spreadsheet, "total_result")
+    results["total_result"] = sync_to_sheets(
+        df_result_for_total,
+        spreadsheet,
+        "total_result",
+        force_update_existing=True
+    )
 
     # 통계
     print("\n✅ Google Sheets 동기화 완료")
