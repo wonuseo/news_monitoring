@@ -90,6 +90,7 @@ def _parse_summaries_from_result(result: Dict) -> List[Dict]:
 
 def detect_similar_articles(
     df: pd.DataFrame,
+    spreadsheet=None,
     day_window: int = 3,
     strong_start_day: int = 4,
     thr_title_cos: float = 0.70,
@@ -108,9 +109,11 @@ def detect_similar_articles(
     - Query별 독립 클러스터링
     - BFS로 Connected Components 그룹화
     - 모든 기사 유지 (비파괴적 라벨링만 수행)
+    - Cumulative cluster numbering (Google Sheets 기반)
 
     Args:
         df: 정규화 및 중복 제거된 DataFrame (query, pub_datetime 컬럼 필수)
+        spreadsheet: gspread Spreadsheet 객체 (선택사항, cumulative numbering용)
         day_window: 기본 규칙 적용 날짜 범위 (기본값: 3일)
         strong_start_day: 초강유사 규칙 시작 날짜 (기본값: 4일)
         thr_title_cos: Title Cosine 임계값 (기본값: 0.70)
@@ -133,6 +136,15 @@ def detect_similar_articles(
     # 컬럼 초기화
     df["source"] = "일반기사"
     df["cluster_id"] = ""
+
+    # Cumulative cluster numbering (Google Sheets에서 기존 최대값 가져오기)
+    max_cluster_num = 0
+    if spreadsheet:
+        from src.utils.sheets_helpers import get_max_values_from_sheets
+        max_values = get_max_values_from_sheets(spreadsheet)
+        max_cluster_num = max_values["max_cluster_num"]
+        if max_cluster_num > 0:
+            print(f"  📊 기존 최대 cluster_id 번호: {max_cluster_num} (cumulative numbering)")
 
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
@@ -201,12 +213,13 @@ def detect_similar_articles(
     df["title_tokset"] = df["title_clean"].map(lambda x: set(tokenize_simple(x)))
     df["desc_tokset"] = df["desc_clean"].map(lambda x: set(tokenize_simple(x)))
 
-    # Query별 클러스터링
+    # Query별 클러스터링 (cumulative global counter)
     total_press_release = 0
     total_clusters = 0
+    cluster_id_counter = max_cluster_num + 1  # 전체 global counter (기존 최대값 + 1부터 시작)
 
     for query, group_df in df.groupby("query"):
-        cluster_id_counter = 1  # Query별로 1부터 시작
+        # cluster_id_counter는 query 간에도 계속 증가 (cumulative)
         idxs = group_df.index.tolist()
         m = len(idxs)
 

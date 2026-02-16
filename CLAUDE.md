@@ -63,13 +63,22 @@ STEP 2: Processing
 ├─ OpenAI group summarization (press_release_group)
 └─ Media classification (domain → name/group/type via OpenAI batch)
 
-STEP 3: LLM Classification
+STEP 3: LLM Classification & Source Verification
 ├─ Step 3-1: Press release LLM classification (representative per cluster → share results)
 │   └─ Module: classify_press_releases.py
 ├─ Step 3-2: General LLM classification (non-press-release articles)
 │   └─ LLM Analysis (OpenAI gpt-4o-mini, 우리 브랜드 all + 경쟁사 all)
 │   └─ Outputs: brand_relevance, sentiment_stage, danger_level,
 │       issue_category, news_category, news_keyword_summary
+├─ Step 3-3: Source verification & topic grouping (LLM cluster verification)
+│   ├─ Part A: Verify press release clusters via LLM (1 API call/cluster)
+│   │   └─ LLM judges 보도자료/유사주제 per cluster; rule-based fallback on failure
+│   ├─ Part A-2: Cross-query cluster merge (TF-IDF cosine + Jaccard, no date constraint)
+│   │   └─ Merges clusters/articles across different queries; LLM borderline verification
+│   ├─ Part B: Discover topic groups among unclustered articles
+│   │   └─ Jaccard similarity + news_category match + LLM borderline verification
+│   ├─ Prompts: source_verifier_prompts.yaml (external, editable)
+│   └─ Module: source_verifier.py
 └─ Structured output via prompts.yaml (no retraining needed)
 
 STEP 4: Reporting
@@ -100,9 +109,11 @@ src/modules/
 │   ├── classification_stats.py # Statistics generation & reporting
 │   ├── result_writer.py # CSV/Sheets incremental saving (thread-safe)
 │   ├── keyword_extractor.py # Category-specific keyword extraction (kiwipiepy + Log-odds)
+│   ├── source_verifier.py # Source verification & topic grouping (LLM cluster verification)
+│   ├── source_verifier_prompts.yaml # Source verification prompts (cluster_verification + topic_similarity)
 │   └── prompts.yaml     # LLM prompts & schemas
 ├── monitoring/
-│   └── logger.py        # Fixed-schema run metrics (45 cols, 3-sheet: run_history/errors/events)
+│   └── logger.py        # Fixed-schema run metrics (55 cols, 3-sheet: run_history/errors/events)
 └── export/
     ├── report.py        # CSV + Word generation
     └── sheets.py        # Google Sheets sync
@@ -129,8 +140,12 @@ COMPETITORS = ["신라호텔", "조선호텔"]
 - Decision rules for sentiment, danger, issue categories
 - No retraining needed - edit YAML to change logic
 
+**Source Verifier Prompts** (`src/modules/analysis/source_verifier_prompts.yaml`):
+- cluster_verification: LLM 보도자료/유사주제 클러스터 판단
+- topic_similarity: LLM 경계선 주제 유사도 판단
+
 **API Model Config** (`src/api_models.yaml`):
-- Per-task model selection (article_classification, media_classification, press_release_summary)
+- Per-task model selection (article_classification, media_classification, press_release_summary, source_verification)
 - All default to gpt-4o-mini
 
 **Environment** (`.env`):
@@ -195,7 +210,7 @@ python main.py --recheck_only --dry_run
 - `pub_datetime` (ISO 8601)
 - `article_id` (MD5 hash, 12-char, 영구 식별자, 시스템용)
 - `article_no` (순차 번호, 사람이 읽는 번호, 검토용)
-- `source` ("보도자료" if similar, else "일반기사")
+- `source` ("보도자료" / "유사주제" / "일반기사" — verified by LLM results in Step 3-3)
 - `cluster_id` (press release cluster ID)
 - `press_release_group` (OpenAI 3-word summary)
 - `media_domain`, `media_name`, `media_group`, `media_type`
@@ -213,7 +228,7 @@ python main.py --recheck_only --dry_run
 **Google Sheets** (primary data store):
 - `raw_data` tab: Raw collected articles
 - `total_result` tab: Classified articles with all LLM columns
-- `run_history` tab: Fixed-schema run metrics (45 columns)
+- `run_history` tab: Fixed-schema run metrics (55 columns)
 - `errors` tab: ERROR-level logs only
 - `events` tab: INFO-level logs only
 - `keywords` tab: Category-specific keywords (automatic)
@@ -284,17 +299,18 @@ python main.py --recheck_only --dry_run
 Fixed-schema 3-sheet logging system. Tracks all pipeline metrics per run.
 
 **3-Sheet Structure** (Google Sheets):
-- `run_history`: Fixed 45-column metrics per run (full replace on sync)
+- `run_history`: Fixed 55-column metrics per run (full replace on sync)
 - `errors`: ERROR-level logs with stage context (append)
 - `events`: INFO-level logs with stage context (append)
 
-**Tracked Metrics** (45 columns in `RUN_HISTORY_SCHEMA`):
+**Tracked Metrics** (55 columns in `RUN_HISTORY_SCHEMA`):
 - **Basic**: run_id, timestamp, run_mode, cli_args
 - **Collection**: articles_collected_total, articles_collected_per_query, existing_links_skipped, duration_collection
 - **Reprocess**: reprocess_targets_total, reprocess_missing_from_result, reprocess_field_missing
 - **Processing**: articles_processed, duplicates_removed, articles_filtered_by_date, press_releases_detected, press_release_groups, press_release_avg_cluster_size, media_domains_total, media_domains_new, media_domains_cached, duration_processing
 - **PR Classification**: pr_clusters_analyzed, pr_articles_propagated, pr_llm_success, pr_llm_failed, pr_cost_estimated, duration_pr_classification
 - **General Classification**: articles_classified_llm, llm_api_calls, classification_errors, press_releases_skipped, llm_cost_estimated, duration_general_classification
+- **Source Verification**: sv_clusters_verified, sv_kept_press_release, sv_reclassified_similar_topic, sv_cross_merged_groups, sv_cross_merged_articles, sv_new_topic_groups, sv_new_topic_articles, duration_source_verification
 - **Results**: our_brands_relevant, our_brands_negative, danger_high, danger_medium, competitor_articles, total_result_count
 - **Sheets Sync**: sheets_sync_enabled, sheets_rows_uploaded_raw, sheets_rows_uploaded_result, duration_sheets_sync
 - **Errors/Total**: errors_total, duration_total
@@ -308,7 +324,7 @@ Fixed-schema 3-sheet logging system. Tracks all pipeline metrics per run.
 **Usage**:
 - Automatic: No configuration needed, logs saved after every run
 - Monitor costs: Check `llm_cost_estimated` column (USD)
-- Track performance: Compare `duration_*` columns across runs (5 stages)
+- Track performance: Compare `duration_*` columns across runs (6 stages)
 
 ## Output Files
 
@@ -323,7 +339,7 @@ Fixed-schema 3-sheet logging system. Tracks all pipeline metrics per run.
 **Google Sheets** (primary data store, if configured):
 - `raw_data` tab: Raw collected articles
 - `total_result` tab: Classified articles with all LLM columns
-- `run_history` tab: Fixed-schema run metrics (45 columns)
+- `run_history` tab: Fixed-schema run metrics (55 columns)
 - `errors` tab: ERROR-level logs with stage context
 - `events` tab: INFO-level logs with stage context
 - `keywords` tab: Category-specific keywords (automatic)
@@ -390,6 +406,8 @@ python main.py --recheck_only --dry_run
   - `run_chunked_parallel()` in `llm_orchestrator.py` - Parallel chunked task runner
   - `save_result_to_csv_incremental()` in `result_writer.py` - Thread-safe CSV saving
   - `get_classification_stats()` in `classification_stats.py` - Statistics generation
+- Source Verification: `verify_and_regroup_sources()`, `verify_press_release_clusters()`, `llm_verify_cluster()`, `merge_cross_query_clusters()`, `discover_topic_groups()`, `llm_verify_topic_similarity()` in `source_verifier.py`
+- Source Verifier Engine: `load_source_verifier_prompts()`, `render_prompt()`, `call_openai_structured()` in `llm_engine.py`
 - Reprocess: `check_reprocess_targets()`, `load_raw_data_from_sheets()`, `clear_classified_at_for_targets()` in `reprocess_checker.py`
 - Reporting: `generate_console_report()` in `report.py`
 - Sheets: `sync_raw_and_processed()` in `sheets.py`, `sync_result_to_sheets()` in `result_writer.py`
@@ -432,12 +450,24 @@ python main.py --recheck_only --dry_run
 - **Utility extraction**: `src/utils/` with `openai_client.py`, `sheets_helpers.py`, `text_cleaning.py`
 
 **Phase 13 (Current - Logging System Redesign)**:
-- **Fixed schema**: `RUN_HISTORY_SCHEMA` (45 columns) prevents column drift across runs
+- **Fixed schema**: `RUN_HISTORY_SCHEMA` (51 columns) prevents column drift across runs
 - **3-sheet structure**: `run_history` + `errors` + `events` (replaces single `logs` tab)
-- **5-stage duration tracking**: collection, processing, pr_classification, general_classification, sheets_sync
+- **6-stage duration tracking**: collection, processing, pr_classification, general_classification, source_verification, sheets_sync
 - **Metrics collection**: `media_classify` and `classify_press_releases` return `(df, stats)` tuples
 - **Schema validation**: Auto-backup old CSV on schema mismatch, prevents blank Sheets on upload failure
 - **Stage context**: All errors/events tagged with pipeline stage for debugging
+
+**Phase 14 (Source Verification & Topic Grouping)**:
+- **Step 3-3**: Post-LLM source verification with LLM cluster verification
+- **Part A**: LLM cluster verification (1 API call/cluster) — 보도자료/유사주제 판단; rule-based fallback on failure
+- **Part A-2**: Cross-query cluster merge — TF-IDF cosine + Jaccard (no date constraint), LLM borderline verification
+- **Part B**: Discover topic groups via Jaccard similarity + LLM borderline verification (0.35~0.50)
+- **New source labels**: 보도자료 / 유사주제 / 일반기사
+- **Prompts**: `source_verifier_prompts.yaml` (external, cluster_verification + topic_similarity)
+- **Model config**: `source_verification` key in `api_models.yaml` (default: gpt-4o-mini)
+- **Module**: `source_verifier.py` in `src/modules/analysis/`
+- **Engine**: `load_source_verifier_prompts()`, `render_prompt()`, `call_openai_structured()` in `llm_engine.py`
+- **Logger**: 8 new columns in RUN_HISTORY_SCHEMA (55 total, +2 for cross-query merge)
 
 **Google Sheets as Primary Store**:
 - CSV files are backups for troubleshooting

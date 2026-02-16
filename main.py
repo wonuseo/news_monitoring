@@ -26,11 +26,13 @@ from src.modules.processing.reprocess_checker import (
 )
 from src.modules.processing.looker_prep import add_time_series_columns
 from src.modules.analysis.classify_llm import classify_llm
+from src.modules.analysis.result_writer import invalidate_csv_header_cache
 from src.modules.analysis.classification_stats import get_classification_stats, print_classification_stats
 from src.modules.analysis.llm_engine import set_error_callback as set_llm_error_callback
 from src.modules.processing.press_release_detector import set_error_callback as set_pr_error_callback
 from src.modules.processing.media_classify import set_error_callback as set_media_error_callback
 from src.modules.analysis.classify_press_releases import classify_press_releases
+from src.modules.analysis.source_verifier import verify_and_regroup_sources
 from src.modules.analysis.keyword_extractor import extract_all_categories
 from src.modules.export.report import generate_console_report
 from src.modules.export.sheets import (
@@ -85,8 +87,8 @@ def run_preprocessing_pipeline(
     """
     sync_error_fn = lambda msg: record_error(msg, category="sheets_sync")
 
-    # Step 2-1: Normalize
-    df_normalized = normalize_df(df_to_process)
+    # Step 2-1: Normalize (cumulative article_no numbering)
+    df_normalized = normalize_df(df_to_process, spreadsheet)
     before_dedupe = len(df_normalized)
 
     # 날짜 필터링은 STEP 1.6에서 이미 수행됨
@@ -102,8 +104,8 @@ def run_preprocessing_pipeline(
         "중복 제거", save_csv, sync_error_fn
     )
 
-    # Step 2-3: Detect similar articles (Press Release)
-    df_processed = detect_similar_articles(df_processed)
+    # Step 2-3: Detect similar articles (Press Release, cumulative cluster_id numbering)
+    df_processed = detect_similar_articles(df_processed, spreadsheet)
     press_releases = len(df_processed[df_processed['source'] == '보도자료']) if 'source' in df_processed.columns else 0
 
     # 중간 동기화 (보도자료 탐지 완료 후)
@@ -576,6 +578,7 @@ def main():
 
         # 결과 저장
         save_csv(df_result, result_csv_path)
+        invalidate_csv_header_cache(str(result_csv_path))
 
         # Google Sheets 즉시 동기화 (전처리 완료 직후)
         if spreadsheet:
@@ -664,6 +667,17 @@ def main():
         # 나머지 NaN -> 공란 변환 (FutureWarning 방지)
         df_classified = df_classified.fillna("").infer_objects(copy=False)
 
+        # Step 3-3: Source 검증 및 주제 그룹화
+        if not args.dry_run:
+            current_stage = "source_verification"
+            logger.start_stage("source_verification")
+            df_classified, sv_metrics = verify_and_regroup_sources(df_classified, openai_key=env["openai_key"])
+            logger.log_dict(sv_metrics)
+            logger.end_stage("source_verification")
+            logger.log_event("source_verification_completed", sv_metrics, stage="source_verification")
+            if spreadsheet:
+                logger.flush_all_to_sheets(spreadsheet)
+
         # Step 3.7: Looker Studio 준비 (항상 실행)
         print("\n🕒 Looker Studio 시계열 컬럼 추가 중...")
         df_classified = add_time_series_columns(df_classified)
@@ -692,6 +706,7 @@ def main():
 
         # 결과 저장 (단일 CSV 파일)
         save_csv(df_result, result_csv_path)
+        invalidate_csv_header_cache(str(result_csv_path))
 
         # Google Sheets 즉시 동기화 (분류 완료 직후)
         if spreadsheet:

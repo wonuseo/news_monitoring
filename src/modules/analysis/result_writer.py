@@ -3,12 +3,19 @@ result_writer.py - Classification Result Saving & Syncing
 분류 결과 실시간 저장 및 Google Sheets 동기화
 """
 
+import csv
 import os
 from threading import Lock
-from typing import Optional
+from typing import List, Optional
 import pandas as pd
 
 csv_write_lock = Lock()
+_csv_header_cache: dict[str, List[str]] = {}
+
+
+def invalidate_csv_header_cache(result_csv_path: str) -> None:
+    """CSV 헤더 캐시 무효화 (파일이 외부에서 재작성된 경우 호출)."""
+    _csv_header_cache.pop(result_csv_path, None)
 
 
 def save_result_to_csv_incremental(
@@ -18,6 +25,9 @@ def save_result_to_csv_incremental(
 ) -> bool:
     """
     단일 분류 결과를 CSV에 실시간 append (멀티스레드 안전)
+
+    기존 CSV 파일이 있으면 헤더 순서를 읽어 컬럼 정렬 후 append.
+    DataFrame 컬럼 순서와 CSV 헤더 순서가 다를 수 있으므로 반드시 정렬 필요.
 
     Args:
         df: 전체 DataFrame
@@ -34,6 +44,24 @@ def save_result_to_csv_incremental(
         with csv_write_lock:
             row_df = df.loc[[idx]].copy()
             file_exists = os.path.exists(result_csv_path)
+
+            if file_exists:
+                # 기존 CSV 헤더 순서 캐시 (파일당 1회만 읽기)
+                if result_csv_path not in _csv_header_cache:
+                    with open(result_csv_path, 'r', encoding='utf-8-sig') as f:
+                        reader = csv.reader(f)
+                        _csv_header_cache[result_csv_path] = next(reader)
+
+                csv_cols = _csv_header_cache[result_csv_path]
+
+                # DataFrame에만 있는 신규 컬럼 → 뒤에 추가
+                for col in row_df.columns:
+                    if col not in csv_cols:
+                        csv_cols.append(col)
+
+                # CSV 헤더 순서에 맞춰 컬럼 재정렬
+                row_df = row_df.reindex(columns=csv_cols)
+
             row_df.to_csv(
                 result_csv_path,
                 mode='a' if file_exists else 'w',
@@ -41,6 +69,11 @@ def save_result_to_csv_incremental(
                 index=False,
                 encoding='utf-8-sig' if not file_exists else 'utf-8'
             )
+
+            # 새 파일 생성 시 헤더 캐시 설정
+            if not file_exists:
+                _csv_header_cache[result_csv_path] = list(row_df.columns)
+
         return True
     except Exception as e:
         print(f"⚠️  CSV 저장 실패 [idx={idx}]: {e}")
