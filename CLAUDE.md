@@ -102,7 +102,7 @@ src/modules/
 │   ├── keyword_extractor.py # Category-specific keyword extraction (kiwipiepy + Log-odds)
 │   └── prompts.yaml     # LLM prompts & schemas
 ├── monitoring/
-│   └── logger.py        # Run metrics logging (CSV + Google Sheets)
+│   └── logger.py        # Fixed-schema run metrics (45 cols, 3-sheet: run_history/errors/events)
 └── export/
     ├── report.py        # CSV + Word generation
     └── sheets.py        # Google Sheets sync
@@ -206,14 +206,17 @@ python main.py --recheck_only --dry_run
 - `sentiment_stage`: "긍정" / "중립" / "부정 후보" / "부정 확정"
 - `danger_level`: "상" / "중" / "하" / null (only if brand_relevance + negative)
 - `issue_category`: One of 11 Korean categories (안전/사고, 법무/규제, etc.) or null
-- `news_category`: One of 9 Korean categories (사업/실적, 브랜드/마케팅, etc.)
+- `news_category`: One of 13 Korean categories (PR/보도자료, 사업/실적, 브랜드/마케팅, 상품/오퍼링, 제휴/파트너십, 이벤트/프로모션, 시설/오픈, 고객 경험, 운영/기술, 인사/조직, 리스크/위기, ESG/사회, 기타)
 - `news_keyword_summary`: 5-word Korean summary
 - `classified_at`: ISO timestamp
 
 **Google Sheets** (primary data store):
 - `raw_data` tab: Raw collected articles
-- `result` tab: Classified articles with all LLM columns
-- `logs` tab: Run history with metrics (CSV backup: `data/logs/run_history.csv`)
+- `total_result` tab: Classified articles with all LLM columns
+- `run_history` tab: Fixed-schema run metrics (45 columns)
+- `errors` tab: ERROR-level logs only
+- `events` tab: INFO-level logs only
+- `keywords` tab: Category-specific keywords (automatic)
 - Incremental append (deduplicates by link)
 
 ## Critical Implementation Details
@@ -278,26 +281,34 @@ python main.py --recheck_only --dry_run
 
 ## Logging System
 
-The system automatically tracks all pipeline metrics and saves them to CSV + Google Sheets.
+Fixed-schema 3-sheet logging system. Tracks all pipeline metrics per run.
 
-**Tracked Metrics** (34 columns):
-- **Basic**: run_id, timestamp, duration_total, cli_args
+**3-Sheet Structure** (Google Sheets):
+- `run_history`: Fixed 45-column metrics per run (full replace on sync)
+- `errors`: ERROR-level logs with stage context (append)
+- `events`: INFO-level logs with stage context (append)
+
+**Tracked Metrics** (45 columns in `RUN_HISTORY_SCHEMA`):
+- **Basic**: run_id, timestamp, run_mode, cli_args
 - **Collection**: articles_collected_total, articles_collected_per_query, existing_links_skipped, duration_collection
-- **Processing**: duplicates_removed, articles_processed, press_releases_detected, press_release_groups, duration_processing
-- **Media**: media_domains_total, media_domains_new, media_domains_cached
-- **Classification**: articles_classified_llm, llm_api_calls, llm_cost_estimated, press_releases_skipped, classification_errors, duration_classification
-- **Results**: our_brands_relevant, our_brands_negative, danger_high, danger_medium, competitor_articles
-- **Sheets**: sheets_sync_enabled, sheets_rows_uploaded_raw, sheets_rows_uploaded_result, sheets_logs_uploaded, duration_sheets_sync
+- **Reprocess**: reprocess_targets_total, reprocess_missing_from_result, reprocess_field_missing
+- **Processing**: articles_processed, duplicates_removed, articles_filtered_by_date, press_releases_detected, press_release_groups, press_release_avg_cluster_size, media_domains_total, media_domains_new, media_domains_cached, duration_processing
+- **PR Classification**: pr_clusters_analyzed, pr_articles_propagated, pr_llm_success, pr_llm_failed, pr_cost_estimated, duration_pr_classification
+- **General Classification**: articles_classified_llm, llm_api_calls, classification_errors, press_releases_skipped, llm_cost_estimated, duration_general_classification
+- **Results**: our_brands_relevant, our_brands_negative, danger_high, danger_medium, competitor_articles, total_result_count
+- **Sheets Sync**: sheets_sync_enabled, sheets_rows_uploaded_raw, sheets_rows_uploaded_result, duration_sheets_sync
+- **Errors/Total**: errors_total, duration_total
+
+**Error/Event Schema** (6 columns): run_id, timestamp, category, stage, message, data_json
 
 **Log Storage**:
-- CSV: `data/logs/run_history.csv` (append mode, persistent)
-- Google Sheets: `logs` tab (full replace on each sync)
+- CSV: `data/logs/run_history.csv` (append mode, auto-backup on schema mismatch)
+- Google Sheets: `run_history` tab (full replace), `errors`/`events` tabs (append)
 
 **Usage**:
 - Automatic: No configuration needed, logs saved after every run
-- View logs: `cat data/logs/run_history.csv` or open Google Sheets
 - Monitor costs: Check `llm_cost_estimated` column (USD)
-- Track performance: Compare `duration_*` columns across runs
+- Track performance: Compare `duration_*` columns across runs (5 stages)
 
 ## Output Files
 
@@ -311,8 +322,10 @@ The system automatically tracks all pipeline metrics and saves them to CSV + Goo
 
 **Google Sheets** (primary data store, if configured):
 - `raw_data` tab: Raw collected articles
-- `result` tab: Classified articles with all LLM columns
-- `logs` tab: Run history with metrics
+- `total_result` tab: Classified articles with all LLM columns
+- `run_history` tab: Fixed-schema run metrics (45 columns)
+- `errors` tab: ERROR-level logs with stage context
+- `events` tab: INFO-level logs with stage context
 - `keywords` tab: Category-specific keywords (automatic)
 - Auto-deduplication by link
 - CSV files are backups for troubleshooting
@@ -410,13 +423,21 @@ python main.py --recheck_only --dry_run
 - **Code reduction**: 44% reduction in analysis module size (841 net lines removed)
 - **Thread safety**: Lock-based CSV writing for multithread environments
 
-**Phase 12 (Current - Press Release LLM Classification)**:
+**Phase 12 (Press Release LLM Classification)**:
 - **Replaced preset system**: `preset_pr.py` deprecated → `classify_press_releases.py`
 - **Cluster-based classification**: Representative article per cluster analyzed by LLM, results shared across cluster
 - **New orchestration**: `llm_orchestrator.py` for chunked parallel processing
 - **API model config**: `src/api_models.yaml` for per-task model selection
 - **Date filtering**: Hard-coded 2026-02-01+ filter in main.py and sheets.py
 - **Utility extraction**: `src/utils/` with `openai_client.py`, `sheets_helpers.py`, `text_cleaning.py`
+
+**Phase 13 (Current - Logging System Redesign)**:
+- **Fixed schema**: `RUN_HISTORY_SCHEMA` (45 columns) prevents column drift across runs
+- **3-sheet structure**: `run_history` + `errors` + `events` (replaces single `logs` tab)
+- **5-stage duration tracking**: collection, processing, pr_classification, general_classification, sheets_sync
+- **Metrics collection**: `media_classify` and `classify_press_releases` return `(df, stats)` tuples
+- **Schema validation**: Auto-backup old CSV on schema mismatch, prevents blank Sheets on upload failure
+- **Stage context**: All errors/events tagged with pipeline stage for debugging
 
 **Google Sheets as Primary Store**:
 - CSV files are backups for troubleshooting

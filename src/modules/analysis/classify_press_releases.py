@@ -1,17 +1,25 @@
 """
 classify_press_releases.py - Press Release LLM Classification with Result Sharing
-보도자료 대표 기사 선정 → LLM 분석 → 클러스터 내 결과 공유
+보도자료 대표 기사 선정 -> LLM 분석 -> 클러스터 내 결과 공유
 """
 
 import json
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
 from .llm_engine import load_prompts, analyze_article_llm
 from .llm_orchestrator import run_chunked_parallel
 from .result_writer import save_result_to_csv_incremental, sync_result_to_sheets
+
+EMPTY_PR_METRICS = {
+    "pr_clusters_analyzed": 0,
+    "pr_articles_propagated": 0,
+    "pr_llm_success": 0,
+    "pr_llm_failed": 0,
+    "pr_cost_estimated": 0,
+}
 
 
 def select_representative_articles(df: pd.DataFrame) -> Dict[str, int]:
@@ -64,9 +72,9 @@ def classify_press_releases(
     result_csv_path: Optional[str] = None,
     spreadsheet=None,
     raw_df: pd.DataFrame = None,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict]:
     """
-    보도자료 LLM 분류 (대표 기사 분석 → 클러스터 내 공유)
+    보도자료 LLM 분류 (대표 기사 분석 -> 클러스터 내 공유)
 
     처리 흐름:
     1. 보도자료 필터링 (source="보도자료", cluster_id 존재)
@@ -85,13 +93,13 @@ def classify_press_releases(
         raw_df: 원본 raw DataFrame (Sheets 동기화용)
 
     Returns:
-        분류 결과가 채워진 DataFrame
+        (df, pr_metrics) 튜플
     """
     df = df.copy()
 
     if "cluster_id" not in df.columns:
         print("⚠️  cluster_id 컬럼이 없습니다. 보도자료 분류 스킵")
-        return df
+        return df, EMPTY_PR_METRICS.copy()
 
     pr_mask = (
         (df["source"] == "보도자료") &
@@ -102,7 +110,7 @@ def classify_press_releases(
 
     if pr_count == 0:
         print("ℹ️  보도자료가 없습니다. 분류 스킵")
-        return df
+        return df, EMPTY_PR_METRICS.copy()
 
     print(f"\n📋 보도자료 LLM 분류 시작: {pr_count}개 기사")
 
@@ -113,7 +121,7 @@ def classify_press_releases(
         prompts_config = load_prompts()
     except Exception as e:
         print(f"⚠️  prompts.yaml 로드 실패: {e}")
-        return df
+        return df, EMPTY_PR_METRICS.copy()
 
     result_columns = [
         "brand_relevance",
@@ -158,7 +166,7 @@ def classify_press_releases(
 
     if len(tasks) == 0:
         print("ℹ️  보도자료 대표 기사 분석 대상이 없습니다")
-        return df
+        return df, EMPTY_PR_METRICS.copy()
 
     print(f"  - LLM 호출 예정: {len(tasks)}회")
     print(f"  - 분석 중 (청크 크기: {chunk_size}, 워커: {max_workers})")
@@ -257,4 +265,12 @@ def classify_press_releases(
     print("  - 클러스터 기반 결과 공유")
     print(f"  - 대표 기사 LLM 분석: 성공 {run_stats['success']}개, 실패 {run_stats['failed']}개")
 
-    return df
+    pr_metrics = {
+        "pr_clusters_analyzed": len(tasks),
+        "pr_articles_propagated": propagated_count,
+        "pr_llm_success": run_stats["success"],
+        "pr_llm_failed": run_stats["failed"],
+        "pr_cost_estimated": 0,  # Cost tracking can be added later
+    }
+
+    return df, pr_metrics

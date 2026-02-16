@@ -118,7 +118,7 @@ def enrich_with_media_info(
     spreadsheet=None,
     openai_key: str = None,
     csv_path: Path = None
-) -> pd.DataFrame:
+):
     """
     DataFrame에 언론사 정보 추가 (wrapper for media_classify.add_media_columns)
 
@@ -129,17 +129,18 @@ def enrich_with_media_info(
         csv_path: media_directory CSV 경로 (선택사항)
 
     Returns:
-        언론사 정보 컬럼이 추가된 DataFrame
+        (df, media_stats) 튜플
     """
+    empty_stats = {"media_domains_total": 0, "media_domains_new": 0, "media_domains_cached": 0}
     try:
         from src.modules.processing.media_classify import add_media_columns
         return add_media_columns(df, spreadsheet, openai_key, csv_path)
     except ImportError:
         print("⚠️  media_classify 모듈을 로드할 수 없습니다.")
-        return df
+        return df, empty_stats
     except Exception as e:
         print(f"⚠️  언론사 정보 추가 중 오류: {e}")
-        return df
+        return df, empty_stats
 
 
 # detect_similar_articles 함수는 similarity_detector.py로 이동

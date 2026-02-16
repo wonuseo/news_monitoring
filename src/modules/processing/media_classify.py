@@ -310,7 +310,7 @@ def add_media_columns(
     spreadsheet=None,
     openai_key: str = None,
     csv_path: Path = None
-) -> pd.DataFrame:
+):
     """
     DataFrame에 언론사 정보 컬럼 추가
 
@@ -321,12 +321,12 @@ def add_media_columns(
         csv_path: media_directory CSV 경로 (선택사항)
 
     Returns:
-        4개의 새로운 컬럼이 추가된 DataFrame:
-        - media_domain: 추출된 도메인
-        - media_name: 언론사명
-        - media_group: 언론사 그룹
-        - media_type: 매체 분류
+        (df, media_stats) 튜플:
+        - df: 4개의 새로운 컬럼이 추가된 DataFrame
+        - media_stats: {"media_domains_total", "media_domains_new", "media_domains_cached"}
     """
+    empty_stats = {"media_domains_total": 0, "media_domains_new": 0, "media_domains_cached": 0}
+
     print("🏢 언론사 정보 추가 중...")
     df = df.copy()
 
@@ -339,7 +339,7 @@ def add_media_columns(
     # originallink 컬럼이 없으면 조기 반환
     if "originallink" not in df.columns:
         print("  ⚠️  originallink 컬럼이 없습니다.")
-        return df
+        return df, empty_stats
 
     try:
         # 도메인 추출
@@ -351,7 +351,7 @@ def add_media_columns(
 
         if not unique_domains:
             print("  ⚠️  추출된 도메인이 없습니다.")
-            return df
+            return df, empty_stats
 
         # media_directory 로드 (Google Sheets 또는 CSV)
         existing_media = load_media_directory(spreadsheet=spreadsheet, csv_path=csv_path)
@@ -386,8 +386,13 @@ def add_media_columns(
         if new_domains:
             print(f"  - 신규 분류: {len(new_domains)}개")
 
-        return df
+        media_stats = {
+            "media_domains_total": len(unique_domains),
+            "media_domains_new": len(new_domains),
+            "media_domains_cached": len(unique_domains) - len(new_domains),
+        }
+        return df, media_stats
 
     except Exception as e:
         print(f"⚠️  언론사 정보 추가 중 오류: {e}")
-        return df
+        return df, empty_stats

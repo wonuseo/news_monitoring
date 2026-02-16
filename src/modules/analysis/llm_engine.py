@@ -264,11 +264,12 @@ def _post_process_result(result: Dict) -> Dict:
     brand_rel = result.get("brand_relevance", "")
     sentiment = result.get("sentiment_stage", "")
 
-    # 규칙 1: 무관 → 중립, danger/issue null
+    # 규칙 1: 무관 → 중립, danger/issue null, news_category=비관련
     if brand_rel == "무관":
         result["sentiment_stage"] = "중립"
         result["danger_level"] = None
         result["issue_category"] = None
+        result["news_category"] = "비관련"
 
     # 규칙 2: danger_level은 (관련/언급) + (부정 후보/부정 확정)일 때만
     if brand_rel not in ("관련", "언급") or sentiment not in ("부정 후보", "부정 확정"):
