@@ -140,6 +140,33 @@ def load_prompts(yaml_path: Path = None) -> dict:
         return yaml.safe_load(f)
 
 
+# Source verifier prompts 캐싱
+_source_verifier_prompts_cache: Optional[dict] = None
+
+
+def load_source_verifier_prompts(yaml_path: Path = None) -> dict:
+    """
+    source_verifier_prompts.yaml 로드 (캐싱 지원)
+
+    Args:
+        yaml_path: YAML 경로 (기본값: 현재 디렉토리)
+
+    Returns:
+        prompts 딕셔너리
+    """
+    global _source_verifier_prompts_cache
+    if _source_verifier_prompts_cache is not None:
+        return _source_verifier_prompts_cache
+
+    if yaml_path is None:
+        yaml_path = Path(__file__).parent / "source_verifier_prompts.yaml"
+
+    with open(yaml_path, 'r', encoding='utf-8') as f:
+        _source_verifier_prompts_cache = yaml.safe_load(f)
+
+    return _source_verifier_prompts_cache
+
+
 def render_prompt(template: str, context: Dict) -> str:
     """
     간단한 {{variable}} 치환 렌더링
@@ -164,7 +191,9 @@ def call_openai_structured(
     response_schema: dict,
     openai_key: str,
     model: str = None,
-    max_retries: int = 5
+    max_retries: int = 5,
+    label: str = "LLM분류",
+    schema_name: str = "analysis_result"
 ) -> Optional[Dict]:
     """
     OpenAI Structured Output 호출 (재시도 지원)
@@ -176,6 +205,8 @@ def call_openai_structured(
         openai_key: OpenAI API 키
         model: 모델명 (None이면 api_models.yaml에서 로드)
         max_retries: 최대 재시도 횟수 (기본: 5)
+        label: 로그 라벨 (기본: "LLM분류")
+        schema_name: JSON schema name (기본: "analysis_result")
 
     Returns:
         파싱된 JSON 응답 또는 None (실패시)
@@ -198,7 +229,7 @@ def call_openai_structured(
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "analysis_result",
+                "name": schema_name,
                 "strict": True,
                 "schema": response_schema
             }
@@ -207,7 +238,7 @@ def call_openai_structured(
 
     response = call_openai_with_retry(
         OPENAI_API_URL, headers, payload,
-        max_retries=max_retries, label="LLM분류"
+        max_retries=max_retries, label=label
     )
 
     if response is None:

@@ -11,6 +11,9 @@ models:
   # 보도자료 요약 (클러스터별 5단어 요약)
   press_release_summary: "gpt-4o-mini"
 
+  # Source 검증 (클러스터 검증 + 주제 유사도)
+  source_verification: "gpt-4o-mini"
+
 # 사용 가능한 모델 예시:
 # - gpt-4o
 # - gpt-4o-mini

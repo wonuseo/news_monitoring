@@ -43,6 +43,13 @@ RUN_HISTORY_SCHEMA = [
     "articles_classified_llm", "llm_api_calls",
     "classification_errors", "press_releases_skipped", "llm_cost_estimated",
     "duration_general_classification",
+    # Source Verification
+    "sv_clusters_verified", "sv_kept_press_release",
+    "sv_reclassified_similar_topic",
+    "sv_cross_merged_groups", "sv_cross_merged_articles",
+    "sv_new_topic_groups", "sv_new_topic_articles",
+    "sv_llm_verified", "sv_llm_rejected",
+    "duration_source_verification",
     # Results
     "our_brands_relevant", "our_brands_negative",
     "danger_high", "danger_medium",
@@ -288,6 +295,25 @@ class RunLogger:
         print(f"  - Classification errors: {self.metrics.get('classification_errors', 0)}")
         print(f"  - Duration: {self.metrics.get('duration_general_classification', 0):.2f}s")
         print()
+
+        # Source Verification
+        sv_verified = self.metrics.get('sv_clusters_verified', 0)
+        sv_cross_groups = self.metrics.get('sv_cross_merged_groups', 0)
+        sv_new_groups = self.metrics.get('sv_new_topic_groups', 0)
+        if sv_verified or sv_cross_groups or sv_new_groups:
+            print("  Source Verification")
+            if sv_verified:
+                print(f"  - Clusters verified: {sv_verified}")
+                print(f"  - Kept as press release: {self.metrics.get('sv_kept_press_release', 0)}")
+                print(f"  - Reclassified similar topic: {self.metrics.get('sv_reclassified_similar_topic', 0)}")
+            if sv_cross_groups:
+                print(f"  - Cross-query merged groups: {sv_cross_groups}")
+                print(f"  - Cross-query merged articles: {self.metrics.get('sv_cross_merged_articles', 0)}")
+            if sv_new_groups:
+                print(f"  - New topic groups: {sv_new_groups}")
+                print(f"  - New topic articles: {self.metrics.get('sv_new_topic_articles', 0)}")
+            print(f"  - Duration: {self.metrics.get('duration_source_verification', 0):.2f}s")
+            print()
 
         # Results
         print("  Results")

@@ -4,7 +4,7 @@ Google Sheets로 데이터를 증분 업로드하고 Looker Studio 연계
 """
 
 import pandas as pd
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from datetime import datetime
 import os
 import time
@@ -177,6 +177,68 @@ def connect_sheets(credentials_path: str, sheet_id: str):
         return None
 
 
+def _normalize_header(value) -> str:
+    """Normalize headers/cells for robust column matching."""
+    return clean_bom(value)
+
+
+def _read_sheet_values(worksheet) -> Tuple[List[str], List[List[str]]]:
+    """
+    Read worksheet values and return normalized headers + data rows.
+
+    Returns:
+        (headers, rows)
+    """
+    all_values = worksheet.get_all_values()
+    if not all_values:
+        return [], []
+    headers = [_normalize_header(h) for h in all_values[0]]
+    return headers, all_values[1:]
+
+
+def _find_header_index(headers: List[str], column_name: str) -> Optional[int]:
+    """Find header index (case-insensitive)."""
+    target = _normalize_header(column_name).lower()
+    for idx, header in enumerate(headers):
+        if _normalize_header(header).lower() == target:
+            return idx
+    return None
+
+
+def _ensure_sheet_headers(
+    worksheet,
+    existing_headers: List[str],
+    df_headers: List[str],
+) -> List[str]:
+    """
+    Ensure worksheet has clean headers and includes all DataFrame columns.
+    Returns the final header order used for read/write.
+    """
+    final_headers = [_normalize_header(h) for h in existing_headers]
+
+    # 빈 시트(또는 헤더만 손상)면 DataFrame 헤더로 초기화
+    if not final_headers or all(h == "" for h in final_headers):
+        final_headers = [_normalize_header(col) for col in df_headers]
+    else:
+        # 시트에 없는 신규 컬럼은 뒤에 추가
+        for col in df_headers:
+            normalized = _normalize_header(col)
+            if normalized and _find_header_index(final_headers, normalized) is None:
+                final_headers.append(normalized)
+
+    if not final_headers:
+        return final_headers
+
+    # 컬럼 수 부족 시 확장
+    if getattr(worksheet, "col_count", len(final_headers)) < len(final_headers):
+        worksheet.add_cols(len(final_headers) - worksheet.col_count)
+
+    # 헤더를 명시적으로 재작성해 BOM/공백 문제를 고정
+    last_col = col_num_to_letter(len(final_headers))
+    worksheet.update(f"A1:{last_col}1", [final_headers], value_input_option='RAW')
+    return final_headers
+
+
 def load_existing_links_from_sheets(spreadsheet, sheet_name: str = "raw_data") -> set:
     """
     Google Sheets에서 기존 기사 링크 목록 로드
@@ -192,21 +254,23 @@ def load_existing_links_from_sheets(spreadsheet, sheet_name: str = "raw_data") -
         # 워크시트 선택
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
-        except:
+        except Exception:
             print(f"  ℹ️  '{sheet_name}' 워크시트가 없습니다. 첫 실행으로 간주합니다.")
             return set()
 
-        # 모든 데이터 읽기
-        existing_data = worksheet.get_all_records()
-
-        if not existing_data:
+        headers, rows = _read_sheet_values(worksheet)
+        if not headers or not rows:
             print(f"  ℹ️  '{sheet_name}' 워크시트가 비어있습니다.")
             return set()
 
-        # link 컬럼 추출
+        link_idx = _find_header_index(headers, "link")
+        if link_idx is None:
+            print(f"  ⚠️  '{sheet_name}'에서 link 컬럼을 찾지 못했습니다.")
+            return set()
+
         existing_links = set()
-        for row in existing_data:
-            link = row.get("link", "")
+        for row in rows:
+            link = clean_bom(row[link_idx]) if len(row) > link_idx else ""
             if link:
                 existing_links.add(link)
 
@@ -247,22 +311,33 @@ def load_analysis_status_from_sheets(
             print(f"  ℹ️  '{sheet_name}' 워크시트가 없습니다. 첫 실행으로 간주합니다.")
             return {"processed_links": set(), "missing_analysis_links": set()}
 
-        existing_data = worksheet.get_all_records()
-        if not existing_data:
+        headers, rows = _read_sheet_values(worksheet)
+        if not headers or not rows:
             print(f"  ℹ️  '{sheet_name}' 워크시트가 비어있습니다.")
             return {"processed_links": set(), "missing_analysis_links": set()}
+
+        link_idx = _find_header_index(headers, "link")
+        if link_idx is None:
+            print(f"  ⚠️  '{sheet_name}'에서 link 컬럼을 찾지 못했습니다.")
+            return {"processed_links": set(), "missing_analysis_links": set()}
+
+        analysis_indexes = {
+            col: _find_header_index(headers, col)
+            for col in analysis_cols
+        }
 
         processed_links = set()
         missing_analysis_links = set()
 
-        for row in existing_data:
-            link = row.get("link", "")
+        for row in rows:
+            link = clean_bom(row[link_idx]) if len(row) > link_idx else ""
             if not link:
                 continue
             processed_links.add(link)
             # 분석 필드가 하나라도 비어 있으면 재분석 대상으로 간주 (BOM 문자도 빈 값으로 처리)
             for col in analysis_cols:
-                val = row.get(col, "")
+                col_idx = analysis_indexes.get(col)
+                val = row[col_idx] if col_idx is not None and len(row) > col_idx else ""
                 # BOM 문자 제거 후 체크
                 cleaned_val = clean_bom(val)
                 if cleaned_val == "":
@@ -346,94 +421,128 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
         ]
 
     try:
+        if df is None or len(df) == 0:
+            return {"attempted": 0, "added": 0, "updated": 0, "skipped": 0, "errors": 0}
+
+        # DataFrame 컬럼 정규화 매핑 (소문자 키 기준)
+        df_column_lookup = {}
+        for col in df.columns:
+            normalized = _normalize_header(col).lower()
+            if normalized and normalized not in df_column_lookup:
+                df_column_lookup[normalized] = col
+
+        key_col_norm = _normalize_header(key_column).lower()
+        if key_col_norm not in df_column_lookup:
+            raise ValueError(f"'{key_column}' 컬럼이 DataFrame에 없습니다.")
+
         # 워크시트 선택 또는 생성
         worksheet = get_or_create_worksheet(spreadsheet, sheet_name, rows=1000, cols=30)
 
-        # 기존 데이터 읽기
-        try:
-            existing_data = worksheet.get_all_records()
-        except:
-            existing_data = []
+        # 기존 시트 읽기 + 헤더 보정
+        sheet_headers, raw_rows = _read_sheet_values(worksheet)
+        key_idx_before_fix = _find_header_index(sheet_headers, key_column)
+        sheet_headers = _ensure_sheet_headers(worksheet, sheet_headers, list(df.columns))
+        if not sheet_headers:
+            raise ValueError("시트 헤더를 구성할 수 없습니다.")
+
+        # 데이터 행이 이미 있는데 key 헤더가 없으면 안전하게 중단
+        if raw_rows and key_idx_before_fix is None:
+            raise ValueError(
+                f"'{sheet_name}' 시트에 데이터가 있지만 key 헤더 '{key_column}'를 찾지 못했습니다. "
+                "헤더를 확인/복구 후 다시 실행하세요."
+            )
+
+        key_idx = _find_header_index(sheet_headers, key_column)
+        if key_idx is None:
+            raise ValueError(f"'{sheet_name}' 시트 헤더에 key 컬럼 '{key_column}'이 없습니다.")
 
         attempted = len(df)
         added_count = 0
         updated_count = 0
         skipped_count = 0
 
-        # 기존 데이터를 dict로 변환 (link → row_index, row_data)
+        # 기존 데이터를 dict로 변환 (key → row_index, row_data)
         existing_by_key = {}
-        if existing_data:
-            for row_idx, row in enumerate(existing_data, start=2):  # 헤더는 1행, 데이터는 2행부터
-                key_val = row.get(key_column, "")
-                if key_val:
-                    existing_by_key[key_val] = {"row_idx": row_idx, "data": row}
+        for row_idx, row in enumerate(raw_rows, start=2):  # 헤더는 1행, 데이터는 2행부터
+            row_values = [
+                clean_bom(row[col_idx]) if col_idx < len(row) else ""
+                for col_idx in range(len(sheet_headers))
+            ]
+            key_val = row_values[key_idx] if key_idx < len(row_values) else ""
+            if not key_val:
+                continue
 
-        # 헤더 행이 없으면 추가 (BOM 제거 후)
-        if len(existing_data) == 0:
-            clean_headers = [clean_bom(col) for col in df.columns.tolist()]
-            worksheet.append_row(clean_headers)
+            row_dict = {}
+            for col_idx, header in enumerate(sheet_headers):
+                header_norm = _normalize_header(header).lower()
+                # 중복 헤더가 있어도 첫 번째 헤더를 기준으로 고정
+                if header_norm and header_norm not in row_dict:
+                    row_dict[header_norm] = row_values[col_idx]
+            existing_by_key[key_val] = {"row_idx": row_idx, "data": row_dict}
+
+        update_field_norms = {_normalize_header(field).lower() for field in update_fields}
 
         # 새로운 행과 업데이트 대상 행 분류
         new_rows = []
-        rows_to_update = []  # (row_idx, new_values)
-
-        for _, row in df.iterrows():
-            key_val = row[key_column] if key_column in df.columns else None
+        rows_to_update = []  # (row_idx, row_dict, existing_row_dict)
+        for row in df.to_dict("records"):
+            key_val = clean_bom(row.get(df_column_lookup[key_col_norm], ""))
 
             if not key_val or key_val not in existing_by_key:
-                # 새 행: append 대상
                 new_rows.append(row)
+                continue
+
+            existing_row_info = existing_by_key[key_val]
+            existing_row_data = existing_row_info["data"]
+            row_idx = existing_row_info["row_idx"]
+
+            if force_update_existing:
+                needs_update = True
             else:
-                # 기존 행: 업데이트 필요 여부 체크
-                existing_row_info = existing_by_key[key_val]
-                existing_row_data = existing_row_info["data"]
-                row_idx = existing_row_info["row_idx"]
+                needs_update = False
+                for field_norm in update_field_norms:
+                    if field_norm not in df_column_lookup:
+                        continue
+                    field_col = df_column_lookup[field_norm]
+                    new_val = clean_bom(row.get(field_col, ""))
+                    existing_val = clean_bom(existing_row_data.get(field_norm, ""))
 
-                # 업데이트 필요 여부 확인
-                if force_update_existing:
-                    needs_update = True
-                else:
-                    needs_update = False
-                    for field in update_fields:
-                        if field not in df.columns:
-                            continue
-                        new_val = clean_bom(row.get(field, ""))
-                        existing_val = clean_bom(existing_row_data.get(field, ""))
+                    # 업데이트가 필요한 경우:
+                    # 1. 빈 값에 실제 값이 들어갈 때 (기존: 빈값, 새로운: 값 있음)
+                    # 2. 둘 다 값이 있고 다를 때 (기존: 값A, 새로운: 값B)
+                    # 절대 하지 않는 경우:
+                    # - 빈 값 → 빈 값 (변경 없음)
+                    # - 기존 값 → 빈 값 (기존 분석 결과 보호!)
+                    if existing_val == "" and new_val != "":
+                        needs_update = True
+                        break
+                    if existing_val != "" and new_val != "" and new_val != existing_val:
+                        needs_update = True
+                        break
 
-                        # 업데이트가 필요한 경우:
-                        # 1. 빈 값에 실제 값이 들어갈 때 (기존: 빈값, 새로운: 값 있음)
-                        # 2. 둘 다 값이 있고 다를 때 (기존: 값A, 새로운: 값B)
-                        # 절대 하지 않는 경우:
-                        # - 빈 값 → 빈 값 (변경 없음)
-                        # - 기존 값 → 빈 값 (기존 분석 결과 보호!)
-                        if existing_val == "" and new_val != "":
-                            needs_update = True
-                            break
-                        elif existing_val != "" and new_val != "" and new_val != existing_val:
-                            needs_update = True
-                            break
-
-                if needs_update:
-                    rows_to_update.append((row_idx, row, existing_row_data))
-                else:
-                    skipped_count += 1
+            if needs_update:
+                rows_to_update.append((row_idx, row, existing_row_data))
+            else:
+                skipped_count += 1
 
         # 새 행 추가 (batch append)
         if new_rows:
             values_to_append = []
             for row in new_rows:
                 row_values = []
-                for col in df.columns:
-                    val = row[col]
-                    # BOM 문자 제거 및 빈 값 정리
-                    cleaned_val = clean_bom(val)
-                    row_values.append(cleaned_val)
+                for header in sheet_headers:
+                    header_norm = _normalize_header(header).lower()
+                    if header_norm in df_column_lookup:
+                        col_name = df_column_lookup[header_norm]
+                        row_values.append(clean_bom(row.get(col_name, "")))
+                    else:
+                        row_values.append("")
                 values_to_append.append(row_values)
 
             # 일괄 추가 (최대 1000행씩)
             batch_size = 1000
             for i in range(0, len(values_to_append), batch_size):
-                batch = values_to_append[i:i+batch_size]
+                batch = values_to_append[i:i + batch_size]
                 worksheet.append_rows(batch)
                 time.sleep(1.0)  # Rate limit 방지
 
@@ -442,30 +551,30 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
 
         # 기존 행 업데이트 (batch update)
         if rows_to_update:
-            # batch_update 준비
             updates = []
             for row_idx, row_data, existing_row_data in rows_to_update:
-                # 전체 행 값 생성 (기존 값 보호: 새 값이 비어있으면 기존 값 유지)
                 row_values = []
-                for col in df.columns:
-                    new_val = clean_bom(row_data[col])
-                    existing_val = clean_bom(existing_row_data.get(col, ""))
+                for header in sheet_headers:
+                    header_norm = _normalize_header(header).lower()
+                    existing_val = clean_bom(existing_row_data.get(header_norm, ""))
+
+                    if header_norm in df_column_lookup:
+                        col_name = df_column_lookup[header_norm]
+                        new_val = clean_bom(row_data.get(col_name, ""))
+                    else:
+                        new_val = ""
 
                     # 새 값이 비어있고 기존 값이 있으면 → 기존 값 보호
-                    if new_val == "" and existing_val != "":
+                    if (header_norm not in df_column_lookup) or (new_val == "" and existing_val != ""):
                         cleaned_val = existing_val
                     else:
                         cleaned_val = new_val
                     row_values.append(cleaned_val)
 
-                # A{row_idx}:LastCol{row_idx} 형식으로 범위 지정
-                # 컬럼 수를 올바르게 문자로 변환 (A, B, ..., Z, AA, AB, ...)
-                last_col_letter = col_num_to_letter(len(df.columns))
+                last_col_letter = col_num_to_letter(len(sheet_headers))
                 range_name = f"A{row_idx}:{last_col_letter}{row_idx}"
-
                 updates.append({"range": range_name, "values": [row_values]})
 
-            # 디버그: 업데이트 범위 요약 출력
             if len(updates) > 0:
                 first_range = updates[0]["range"]
                 last_range = updates[-1]["range"]
@@ -477,23 +586,21 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
             # batch_update 실행 (최대 100개씩)
             update_batch_size = 100
             for i in range(0, len(updates), update_batch_size):
-                batch_updates = updates[i:i+update_batch_size]
+                batch_updates = updates[i:i + update_batch_size]
                 try:
                     worksheet.batch_update(batch_updates, value_input_option='RAW')
                     time.sleep(1.0)  # Rate limit 방지
                 except Exception as e:
                     error_msg = str(e)
                     print(f"    ⚠️  batch_update 실패: {error_msg}")
-                    # 디버그: 첫 번째 업데이트 range 출력
                     if batch_updates:
                         print(f"    🔍 첫 번째 range 예시: {batch_updates[0]['range']}")
                     # Fallback: 개별 update
                     for idx, update in enumerate(batch_updates):
                         try:
                             range_str = update["range"]
-                            # 디버그: 개별 update 시 range 출력 (처음 3개만)
                             if idx < 3:
-                                print(f"    🔍 개별 update 시도 [{idx+1}]: range='{range_str}'")
+                                print(f"    🔍 개별 update 시도 [{idx + 1}]: range='{range_str}'")
                             worksheet.update(range_str, update["values"], value_input_option='RAW')
                             time.sleep(0.5)
                         except Exception as e2:

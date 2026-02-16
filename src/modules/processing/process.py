@@ -43,13 +43,17 @@ def parse_pubdate(pubdate_str: str) -> Optional[str]:
         return None
 
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_df(df: pd.DataFrame, spreadsheet=None) -> pd.DataFrame:
     """
     데이터 정규화
     - HTML 태그 제거
     - 날짜 파싱
     - article_id (영구 식별자) 추가
-    - article_no (순차 번호) 추가
+    - article_no (순차 번호, cumulative numbering)
+
+    Args:
+        df: 정규화할 DataFrame
+        spreadsheet: gspread Spreadsheet 객체 (선택사항, cumulative numbering용)
     """
     print("🔧 데이터 정규화 중...")
     df = df.copy()
@@ -64,10 +68,21 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: hashlib.md5(str(x).encode()).hexdigest()[:12] if x else ""
     )
 
-    # article_no: 순차 번호 (사람이 읽는 번호, 검토용)
-    df["article_no"] = range(1, len(df) + 1)
+    # article_no: 순차 번호 (cumulative numbering - Google Sheets 기반)
+    max_article_no = 0
+    if spreadsheet:
+        from src.utils.sheets_helpers import get_max_values_from_sheets
+        max_values = get_max_values_from_sheets(spreadsheet)
+        max_article_no = max_values["max_article_no"]
+        if max_article_no > 0:
+            print(f"  📊 기존 최대 article_no: {max_article_no} (cumulative numbering)")
+
+    # 새 article_no 할당 (기존 최대값 + 1부터 시작)
+    df["article_no"] = range(max_article_no + 1, max_article_no + len(df) + 1)
 
     print(f"✅ {len(df)}개 기사 정규화 완료 (article_id, article_no 추가)")
+    if max_article_no > 0:
+        print(f"   📌 article_no 범위: {max_article_no + 1} ~ {max_article_no + len(df)}")
     return df
 
 

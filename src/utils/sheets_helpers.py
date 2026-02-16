@@ -28,6 +28,56 @@ def get_or_create_worksheet(spreadsheet, sheet_name: str, rows: int = 1000, cols
         return worksheet
 
 
+def get_max_values_from_sheets(spreadsheet, sheet_name: str = "total_result"):
+    """
+    Google Sheets에서 기존 최대값 가져오기 (cumulative numbering용)
+
+    Args:
+        spreadsheet: gspread Spreadsheet 객체
+        sheet_name: 워크시트 이름 (기본값: "total_result")
+
+    Returns:
+        dict: {
+            "max_article_no": int,  # 최대 article_no (0이면 데이터 없음)
+            "max_cluster_num": int  # 최대 cluster_id 숫자 (0이면 데이터 없음)
+        }
+    """
+    try:
+        worksheet = spreadsheet.worksheet(sheet_name)
+        data = worksheet.get_all_records()
+
+        if not data:
+            return {"max_article_no": 0, "max_cluster_num": 0}
+
+        df = pd.DataFrame(data)
+
+        # article_no 최대값
+        max_article_no = 0
+        if "article_no" in df.columns and len(df) > 0:
+            # 숫자로 변환 가능한 값만 필터링
+            article_nos = pd.to_numeric(df["article_no"], errors="coerce").dropna()
+            if len(article_nos) > 0:
+                max_article_no = int(article_nos.max())
+
+        # cluster_id 최대 숫자 추출 (형식: {query}_c{5자리숫자})
+        max_cluster_num = 0
+        if "cluster_id" in df.columns and len(df) > 0:
+            import re
+            for cid in df["cluster_id"].dropna():
+                if cid and str(cid).strip():
+                    # {query}_c{숫자} 형식에서 숫자 추출
+                    match = re.search(r'_c(\d+)$', str(cid))
+                    if match:
+                        cluster_num = int(match.group(1))
+                        max_cluster_num = max(max_cluster_num, cluster_num)
+
+        return {"max_article_no": max_article_no, "max_cluster_num": max_cluster_num}
+
+    except Exception as e:
+        print(f"  ⚠️  Sheets에서 최대값 가져오기 실패 ({sheet_name}): {e}")
+        return {"max_article_no": 0, "max_cluster_num": 0}
+
+
 def intermediate_sync(
     df_processed: pd.DataFrame,
     df_raw: pd.DataFrame,
@@ -59,6 +109,10 @@ def intermediate_sync(
     else:
         df_temp = df_processed
     save_csv_fn(df_temp, result_csv_path)
+
+    # CSV 헤더 캐시 무효화 (전체 재작성했으므로 기존 캐시 무효)
+    from src.modules.analysis.result_writer import invalidate_csv_header_cache
+    invalidate_csv_header_cache(str(result_csv_path))
 
     # Sheets 동기화
     if spreadsheet:
