@@ -99,7 +99,10 @@ def detect_similar_articles(
     thr_desc_jac: float = 0.10,
     strong_desc_cos: float = 0.85,
     strong_desc_jac: float = 0.35,
-    min_token_len: int = 2
+    min_token_len: int = 2,
+    enable_llm_borderline: bool = False,
+    openai_key: str = None,
+    group_our_brands: bool = False,
 ) -> pd.DataFrame:
     """
     내용 기반 유사도 검사로 보도자료 식별
@@ -213,18 +216,35 @@ def detect_similar_articles(
     df["title_tokset"] = df["title_clean"].map(lambda x: set(tokenize_simple(x)))
     df["desc_tokset"] = df["desc_clean"].map(lambda x: set(tokenize_simple(x)))
 
-    # Query별 클러스터링 (cumulative global counter)
+    # 클러스터링 그룹 키 생성
+    # group_our_brands=True: OUR 브랜드 기사는 query 무관하게 하나의 풀로 묶음
+    # COMPETITOR 기사는 항상 query별 독립 클러스터링
+    if group_our_brands and "group" in df.columns:
+        df["_cluster_group_key"] = df.apply(
+            lambda r: "OUR" if r.get("group") == "OUR" else r.get("query", ""),
+            axis=1,
+        )
+        print(f"  - OUR 브랜드 통합 클러스터링 활성화 (group_our_brands=True)")
+    else:
+        df["_cluster_group_key"] = df["query"]
+
+    # 그룹별 클러스터링 (cumulative global counter)
     total_press_release = 0
     total_clusters = 0
     cluster_id_counter = max_cluster_num + 1  # 전체 global counter (기존 최대값 + 1부터 시작)
 
-    for query, group_df in df.groupby("query"):
-        # cluster_id_counter는 query 간에도 계속 증가 (cumulative)
+    group_items = list(df.groupby("_cluster_group_key"))
+    total_groups = len(group_items)
+
+    for group_idx, (group_key, group_df) in enumerate(group_items, 1):
+        print(f"  [{group_idx}/{total_groups}] 그룹 '{group_key}' ({len(group_df)}개 기사) 유사도 분석 중...", end="")
+        # cluster_id_counter는 그룹 간에도 계속 증가 (cumulative)
         idxs = group_df.index.tolist()
         m = len(idxs)
 
         # 단독 기사
         if m == 1:
+            print(f" 단독 기사, 스킵")
             continue
 
         try:
@@ -256,6 +276,7 @@ def detect_similar_articles(
             # (1) Δdays ≤ 3: Title 규칙
             cand_title = np.triu((sim_t >= thr_title_cos) & close_mask, k=1)
             ti, tj = np.where(cand_title)
+            title_pairs = len(ti)
             for i, j in zip(ti, tj):
                 if jaccard(title_sets[i], title_sets[j]) >= thr_title_jac:
                     adj[i].add(j)
@@ -264,6 +285,7 @@ def detect_similar_articles(
             # (2) Δdays ≤ 3: Description 규칙
             cand_desc = np.triu((sim_d >= thr_desc_cos) & close_mask, k=1)
             di, dj = np.where(cand_desc)
+            desc_pairs = len(di)
             for i, j in zip(di, dj):
                 if jaccard(desc_sets[i], desc_sets[j]) >= thr_desc_jac:
                     adj[i].add(j)
@@ -272,10 +294,166 @@ def detect_similar_articles(
             # (3) Δdays ≥ 4: 초강유사 규칙
             cand_strong = np.triu((sim_d >= strong_desc_cos) & far_mask, k=1)
             si, sj = np.where(cand_strong)
+            strong_pairs = len(si)
             for i, j in zip(si, sj):
                 if jaccard(desc_sets[i], desc_sets[j]) >= strong_desc_jac:
                     adj[i].add(j)
                     adj[j].add(i)
+
+            print(f" 후보쌍: title={title_pairs}, desc={desc_pairs}, strong={strong_pairs}", end="")
+
+            # (4) LLM 경계선 규칙 (enable_llm_borderline=True일 때만)
+            if enable_llm_borderline and openai_key:
+                from src.modules.analysis.source_verifier import llm_judge_component_representative
+
+                # Requested Stage 2 borderline settings
+                borderline_title_cos_low = 0.62
+                borderline_title_jac_min = 0.25
+                borderline_desc_cos_low = 0.52
+                borderline_desc_jac_min = 0.18
+                borderline_top_k = 3
+                borderline_min_component_size = 3
+
+                # 1) 경계선 후보 쌍 수집 (pair-level LLM 제거)
+                borderline_pair_scores = {}
+                title_borderline_hits = 0
+                desc_borderline_hits = 0
+
+                borderline_title = np.triu(
+                    (sim_t >= borderline_title_cos_low) & (sim_t < thr_title_cos) & close_mask, k=1
+                )
+                bti, btj = np.where(borderline_title)
+                for i, j in zip(bti, btj):
+                    if j in adj[i]:
+                        continue
+                    jac = jaccard(title_sets[i], title_sets[j])
+                    if jac < borderline_title_jac_min:
+                        continue
+                    score = 0.7 * float(sim_t[i, j]) + 0.3 * float(jac)
+                    key = (i, j) if i < j else (j, i)
+                    prev = borderline_pair_scores.get(key)
+                    if prev is None or score > prev:
+                        borderline_pair_scores[key] = score
+                    title_borderline_hits += 1
+
+                borderline_desc = np.triu(
+                    (sim_d >= borderline_desc_cos_low) & (sim_d < thr_desc_cos) & close_mask, k=1
+                )
+                bdi, bdj = np.where(borderline_desc)
+                for i, j in zip(bdi, bdj):
+                    if j in adj[i]:
+                        continue
+                    jac = jaccard(desc_sets[i], desc_sets[j])
+                    if jac < borderline_desc_jac_min:
+                        continue
+                    score = 0.7 * float(sim_d[i, j]) + 0.3 * float(jac)
+                    key = (i, j) if i < j else (j, i)
+                    prev = borderline_pair_scores.get(key)
+                    if prev is None or score > prev:
+                        borderline_pair_scores[key] = score
+                    desc_borderline_hits += 1
+
+                print(f", LLM경계선 후보: title={title_borderline_hits}, desc={desc_borderline_hits}", end="")
+
+                # 2) top-k (per article) 경계선 엣지 유지
+                selected_edges = set()
+                if borderline_pair_scores:
+                    per_node = {k: [] for k in range(m)}
+                    for (i, j), score in borderline_pair_scores.items():
+                        per_node[i].append((score, j))
+                        per_node[j].append((score, i))
+
+                    for node, score_list in per_node.items():
+                        if not score_list:
+                            continue
+                        score_list.sort(key=lambda x: x[0], reverse=True)
+                        for score, other in score_list[:borderline_top_k]:
+                            a, b = (node, other) if node < other else (other, node)
+                            selected_edges.add((a, b))
+
+                # 3) 경계선 그래프 컴포넌트 구성
+                llm_call_count = 0
+                llm_approved_components = 0
+                llm_connected = 0
+
+                if selected_edges:
+                    borderline_adj = {k: [] for k in range(m)}
+                    for i, j in selected_edges:
+                        borderline_adj[i].append(j)
+                        borderline_adj[j].append(i)
+
+                    border_components = []
+                    border_visited = set()
+                    for start in range(m):
+                        if start in border_visited or len(borderline_adj[start]) == 0:
+                            continue
+                        comp = []
+                        queue = deque([start])
+                        while queue:
+                            node = queue.popleft()
+                            if node in border_visited:
+                                continue
+                            border_visited.add(node)
+                            comp.append(node)
+                            for neighbor in borderline_adj[node]:
+                                if neighbor not in border_visited:
+                                    queue.append(neighbor)
+                        if len(comp) >= 2:
+                            border_components.append(comp)
+
+                    target_components = [c for c in border_components if len(c) >= borderline_min_component_size]
+                    comp_pbar = tqdm(
+                        total=len(target_components),
+                        desc=f"    [{group_idx}/{total_groups}] LLM 경계선 컴포넌트",
+                        unit="컴포넌트",
+                        leave=False,
+                    )
+
+                    def rep_sort_key(local_idx: int):
+                        ord_val = ordinals[local_idx]
+                        has_date = 0 if not np.isnan(ord_val) else 1
+                        ord_key = ord_val if not np.isnan(ord_val) else float("inf")
+                        gidx = idxs[local_idx]
+                        info_len = len(str(df.at[gidx, "title"])) + len(str(df.at[gidx, "description"]))
+                        return (has_date, ord_key, -info_len)
+
+                    for comp in target_components:
+                        rep_local_idx = min(comp, key=rep_sort_key)
+                        rep_global_idx = idxs[rep_local_idx]
+                        llm_call_count += 1
+
+                        should_connect = llm_judge_component_representative(
+                            {
+                                "query": str(df.at[rep_global_idx, "query"]) if "query" in df.columns else "",
+                                "group": str(df.at[rep_global_idx, "group"]) if "group" in df.columns else "",
+                                "title": str(df.at[rep_global_idx, "title"]) if "title" in df.columns else "",
+                                "description": str(df.at[rep_global_idx, "description"]) if "description" in df.columns else "",
+                            },
+                            openai_key=openai_key,
+                            mode="press_release_borderline",
+                        )
+
+                        if should_connect:
+                            llm_approved_components += 1
+                            comp_size = len(comp)
+                            for a_idx in range(comp_size):
+                                for b_idx in range(a_idx + 1, comp_size):
+                                    i, j = comp[a_idx], comp[b_idx]
+                                    if j not in adj[i]:
+                                        adj[i].add(j)
+                                        adj[j].add(i)
+                                        llm_connected += 1
+
+                        comp_pbar.update(1)
+
+                    comp_pbar.close()
+                    print(
+                        f", 컴포넌트={len(border_components)}개(대상 {len(target_components)}개), "
+                        f"LLM {llm_call_count}회, 승인 {llm_approved_components}개, "
+                        f"연결 {llm_connected}쌍"
+                    )
+                else:
+                    print(", LLM경계선 후보 없음")
 
             # Connected components (BFS)
             visited = [False] * m
@@ -300,7 +478,13 @@ def detect_similar_articles(
                     continue
 
                 members_global = [idxs[k] for k in comp]
-                cid = f"{query}_c{cluster_id_counter:05d}"
+                # cluster_id prefix: OUR 통합 시 첫 멤버의 query 사용, 아니면 group_key
+                if group_our_brands and group_key == "OUR":
+                    first_query = df.at[members_global[0], "query"]
+                    cid_prefix = str(first_query).split("|")[0]
+                else:
+                    cid_prefix = group_key
+                cid = f"{cid_prefix}_c{cluster_id_counter:05d}"
                 cluster_id_counter += 1
                 total_clusters += 1
 
@@ -309,12 +493,17 @@ def detect_similar_articles(
                     df.at[gidx, "cluster_id"] = cid
                     total_press_release += 1
 
+            # 줄바꿈 (LLM 경계선이 이미 줄바꿈을 했으면 스킵)
+            if not (enable_llm_borderline and openai_key):
+                print("")  # 줄바꿈
+
         except Exception as e:
-            print(f"  '{query}' 처리 중 오류 발생: {e}")
+            print(f"\n  '{group_key}' 처리 중 오류 발생: {e}")
             continue
 
     # 임시 컬럼 제거
-    df = df.drop(columns=["title_clean", "desc_clean", "pub_dt_ordinal", "title_tokset", "desc_tokset"])
+    drop_cols = ["title_clean", "desc_clean", "pub_dt_ordinal", "title_tokset", "desc_tokset", "_cluster_group_key"]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
     unique_count = len(df) - total_press_release
     print(f"✅ {total_press_release}개 기사를 '보도자료'로 표시 ({total_clusters}개 클러스터), {unique_count}개 기사는 독립 기사")
@@ -410,51 +599,52 @@ IMPORTANT: JSON 객체만 출력하세요. 다른 설명이나 마크다운 없�
         return {a["cluster_id"]: a["title"][:15] for a in articles}
 
 
-def summarize_press_release_groups(
+def summarize_clusters(
     df: pd.DataFrame,
     openai_key: str
 ) -> pd.DataFrame:
     """
-    보도자료 그룹별로 가장 이른 기사를 OpenAI로 요약
-    이미 요약이 있는 그룹은 스킵
+    cluster_id가 있는 모든 클러스터(보도자료+유사주제)를 OpenAI로 요약.
+    이미 요약이 있는 클러스터는 스킵.
 
     Args:
         df: cluster_id, pub_datetime, title, description 컬럼 포함
         openai_key: OpenAI API 키
 
     Returns:
-        press_release_group 컬럼이 추가된 DataFrame
+        cluster_summary 컬럼이 추가된 DataFrame
     """
-    print("📝 보도자료 그룹 요약 생성 중...")
+    print("📝 클러스터 요약 생성 중...")
     df = df.copy()
 
-    # press_release_group 컬럼이 없으면 추가 (기존 값 유지)
-    if "press_release_group" not in df.columns:
-        df["press_release_group"] = ""
+    # cluster_summary 컬럼이 없으면 추가 (기존 값 유지)
+    if "cluster_summary" not in df.columns:
+        df["cluster_summary"] = ""
 
-    press_release_mask = (df["source"] == "보도자료") & (df["cluster_id"] != "")
-    if press_release_mask.sum() == 0:
-        print("  ℹ️  보도자료 그룹이 없습니다.")
+    # cluster_id가 있는 모든 기사 대상 (source 조건 없음)
+    cluster_mask = df["cluster_id"].astype(str).str.strip() != ""
+    if cluster_mask.sum() == 0:
+        print("  ℹ️  클러스터가 없습니다.")
         return df
 
     try:
         # 그룹별 가장 이른 기사 선택
-        pr_df = df[press_release_mask].copy()
-        pr_df["pub_datetime_parsed"] = pd.to_datetime(pr_df["pub_datetime"], errors="coerce")
-        earliest_articles = pr_df.sort_values("pub_datetime_parsed").groupby("cluster_id").first().reset_index()
+        cl_df = df[cluster_mask].copy()
+        cl_df["pub_datetime_parsed"] = pd.to_datetime(cl_df["pub_datetime"], errors="coerce")
+        earliest_articles = cl_df.sort_values("pub_datetime_parsed").groupby("cluster_id").first().reset_index()
 
         # 이미 요약이 있는 클러스터는 기존 값을 전체 멤버에 전파하고, OpenAI 호출 대상에서 제외
         existing_cluster_ids = set()
-        for cluster_id, cluster_rows in pr_df.groupby("cluster_id"):
-            existing_values = cluster_rows["press_release_group"].dropna().astype(str)
+        for cluster_id, cluster_rows in cl_df.groupby("cluster_id"):
+            existing_values = cluster_rows["cluster_summary"].dropna().astype(str)
             existing_values = existing_values[existing_values.str.strip() != ""]
             if len(existing_values) == 0:
                 continue
 
             existing_cluster_ids.add(cluster_id)
             existing_summary = existing_values.iloc[0]
-            cluster_mask = press_release_mask & (df["cluster_id"] == cluster_id)
-            df.loc[cluster_mask, "press_release_group"] = existing_summary
+            c_mask = cluster_mask & (df["cluster_id"] == cluster_id)
+            df.loc[c_mask, "cluster_summary"] = existing_summary
 
         # 요약이 필요한 cluster_id만 선택 (클러스터 내 요약이 전혀 없는 경우)
         articles_to_summarize = [
@@ -464,12 +654,12 @@ def summarize_press_release_groups(
         ]
 
         if len(articles_to_summarize) == 0:
-            print(f"  ℹ️  모든 보도자료 그룹({len(existing_cluster_ids)}개)이 이미 요약되어 있습니다.")
+            print(f"  ℹ️  모든 클러스터({len(existing_cluster_ids)}개)가 이미 요약되어 있습니다.")
             return df
 
         group_summaries = {}
         total_to_summarize = len(articles_to_summarize)
-        pbar = tqdm(total=total_to_summarize, desc="보도자료 요약", unit="그룹")
+        pbar = tqdm(total=total_to_summarize, desc="클러스터 요약", unit="그룹")
         for i in range(0, total_to_summarize, 20):
             batch = articles_to_summarize[i:i+20]
             batch_summaries = _call_openai_summarize_batch(batch, openai_key)
@@ -477,22 +667,22 @@ def summarize_press_release_groups(
             pbar.update(len(batch))
         pbar.close()
 
-        # press_release_group 업데이트
-        for idx, row in df[press_release_mask].iterrows():
+        # cluster_summary 업데이트
+        for idx, row in df[cluster_mask].iterrows():
             cluster_id = row["cluster_id"]
             if cluster_id in group_summaries:
-                df.at[idx, "press_release_group"] = group_summaries[cluster_id]
+                df.at[idx, "cluster_summary"] = group_summaries[cluster_id]
 
         total_groups = len(earliest_articles)
         new_summaries = len(group_summaries)
         existing_count = len(existing_cluster_ids)
 
-        print(f"✅ 보도자료 그룹 요약 완료:")
-        print(f"   - 전체 그룹: {total_groups}개")
+        print(f"✅ 클러스터 요약 완료:")
+        print(f"   - 전체 클러스터: {total_groups}개")
         print(f"   - 새로 요약: {new_summaries}개 (LLM 호출)")
         print(f"   - 기존 유지: {existing_count}개 (스킵)")
         return df
 
     except Exception as e:
-        print(f"  보도자료 그룹 요약 중 오류: {e}")
+        print(f"  클러스터 요약 중 오류: {e}")
         return df

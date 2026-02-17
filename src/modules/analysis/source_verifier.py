@@ -13,12 +13,16 @@ import re
 import os
 from collections import deque
 from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from src.modules.analysis.llm_engine import (
     load_source_verifier_prompts,
+    load_prompts,
+    analyze_article_llm,
     render_prompt,
     call_openai_structured,
 )
@@ -42,8 +46,137 @@ CROSS_TITLE_JAC_THRESHOLD = 0.15
 CROSS_DESC_COS_THRESHOLD = 0.55
 CROSS_DESC_JAC_THRESHOLD = 0.08
 # LLM 경계선 범위
-CROSS_TITLE_COS_BORDERLINE = (0.50, 0.65)  # [low, high)
-CROSS_DESC_COS_BORDERLINE = (0.40, 0.55)   # [low, high)
+CROSS_TITLE_COS_BORDERLINE = (0.58, 0.65)  # [low, high)
+CROSS_TITLE_JAC_BORDERLINE_MIN = 0.20
+CROSS_DESC_COS_BORDERLINE = (0.48, 0.55)   # [low, high)
+CROSS_DESC_JAC_BORDERLINE_MIN = 0.12
+CROSS_BORDERLINE_DAY_HINT_MAX = 1  # Δdays <= 1
+
+
+_article_prompts_cache: Optional[dict] = None
+
+
+def _get_article_prompts() -> Optional[dict]:
+    """article 분류 프롬프트 캐시 로드."""
+    global _article_prompts_cache
+    if _article_prompts_cache is not None:
+        return _article_prompts_cache
+
+    try:
+        _article_prompts_cache = load_prompts()
+    except Exception as e:
+        print(f"  ⚠️  article prompts 로드 실패: {e}")
+        _article_prompts_cache = None
+
+    return _article_prompts_cache
+
+
+def _build_article_payload(df: pd.DataFrame, idx: int) -> Dict[str, str]:
+    """DataFrame row index를 analyze_article_llm 입력 형태로 변환."""
+    return {
+        "query": str(df.at[idx, "query"]) if "query" in df.columns else "",
+        "group": str(df.at[idx, "group"]) if "group" in df.columns else "",
+        "title": str(df.at[idx, "title"]) if "title" in df.columns else "",
+        "description": str(df.at[idx, "description"]) if "description" in df.columns else "",
+    }
+
+
+def _select_representative_index(df: pd.DataFrame, row_indices: List[int]) -> Optional[int]:
+    """
+    컴포넌트 대표 기사 선택:
+    1) 가장 이른 pub_datetime
+    2) 동일/결측이면 정보량(title+description 길이) 높은 기사
+    """
+    if not row_indices:
+        return None
+
+    has_pub = "pub_datetime" in df.columns
+    has_title = "title" in df.columns
+    has_desc = "description" in df.columns
+
+    best_idx = None
+    best_key = None
+
+    for idx in row_indices:
+        dt = pd.to_datetime(df.at[idx, "pub_datetime"], errors="coerce", utc=True) if has_pub else pd.NaT
+        has_dt = 0 if pd.notna(dt) else 1
+        dt_key = dt.value if pd.notna(dt) else float("inf")
+        info_len = (
+            len(str(df.at[idx, "title"])) if has_title else 0
+        ) + (
+            len(str(df.at[idx, "description"])) if has_desc else 0
+        )
+        key = (has_dt, dt_key, -info_len, idx)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_idx = idx
+
+    return best_idx
+
+
+def _extract_media_key(df: pd.DataFrame, idx: int) -> str:
+    """same_media 판별용 키 추출 (media_domain 우선, 없으면 link 도메인)."""
+    if "media_domain" in df.columns:
+        media_domain = str(df.at[idx, "media_domain"]).strip().lower()
+        if media_domain and media_domain != "nan":
+            return media_domain
+
+    if "link" in df.columns:
+        link = str(df.at[idx, "link"]).strip()
+        if link and link != "nan":
+            try:
+                return urlparse(link).netloc.lower()
+            except Exception:
+                return ""
+
+    return ""
+
+
+def llm_judge_component_representative(
+    article: Dict[str, str],
+    openai_key: str,
+    mode: str = "cross_query_borderline",
+) -> bool:
+    """
+    경계선 컴포넌트 대표 기사 1건만 LLM 분류해 컴포넌트 승인 여부 결정.
+
+    mode:
+      - press_release_borderline: 보도자료성 엄격 게이트
+      - cross_query_borderline: cross-query 병합 게이트
+      - topic_group_borderline: 일반기사 주제 그룹 게이트
+    """
+    if not openai_key:
+        return False
+
+    prompts = _get_article_prompts()
+    if not prompts:
+        return False
+
+    try:
+        result = analyze_article_llm(article, prompts, openai_key)
+    except Exception as e:
+        print(f"  ⚠️  컴포넌트 대표기사 LLM 실패: {e}")
+        return False
+
+    if not result:
+        return False
+
+    brand_rel = str(result.get("brand_relevance", "")).strip()
+    sentiment = str(result.get("sentiment_stage", "")).strip()
+    news_category = str(result.get("news_category", "")).strip()
+
+    if mode == "press_release_borderline":
+        if brand_rel != "관련":
+            return False
+        if sentiment in {"부정 후보", "부정 확정"}:
+            return False
+        return news_category in PR_CATEGORIES
+
+    if mode == "cross_query_borderline":
+        return brand_rel in {"관련", "언급"} and news_category != "비관련"
+
+    # topic_group_borderline
+    return brand_rel in {"관련", "언급"} and news_category != "비관련"
 
 
 def determine_verified_source(
@@ -94,7 +227,7 @@ def _get_sv_model() -> str:
 def llm_verify_cluster(
     cluster_df: pd.DataFrame,
     query: str,
-    press_release_group: str,
+    cluster_summary: str,
     openai_key: str,
 ) -> Optional[str]:
     """
@@ -103,7 +236,7 @@ def llm_verify_cluster(
     Args:
         cluster_df: 클러스터 내 기사 DataFrame
         query: 검색 브랜드
-        press_release_group: 클러스터 요약
+        cluster_summary: 클러스터 요약
         openai_key: OpenAI API 키
 
     Returns:
@@ -139,7 +272,7 @@ def llm_verify_cluster(
 
     context = {
         "query": query,
-        "press_release_group": press_release_group if press_release_group else "없음",
+        "cluster_summary": cluster_summary if cluster_summary else "없음",
         "article_count": str(len(cluster_df)),
         "titles_list": titles_list,
         "brand_relevance": brand_relevance,
@@ -202,17 +335,21 @@ def verify_press_release_clusters(
 
     # cluster_id별 그룹핑
     pr_df = df[pr_mask]
-    cluster_groups = pr_df.groupby("cluster_id", dropna=False)
+    cluster_groups = list(pr_df.groupby("cluster_id", dropna=False))
     stats["sv_clusters_verified"] = len(cluster_groups)
+    total_cl = len(cluster_groups)
 
-    for cluster_id, cluster_df in cluster_groups:
+    pbar = tqdm(total=total_cl, desc="    PR 클러스터 검증", unit="클러스터", leave=False)
+
+    for cl_idx, (cluster_id, cluster_df) in enumerate(cluster_groups, 1):
+        print(f"    [{cl_idx}/{total_cl}] 클러스터 '{cluster_id}' ({len(cluster_df)}개 기사) 검증 중...", end=" ")
         verified_source = None
 
         # LLM 클러스터 검증 시도
         if openai_key:
             query = str(cluster_df["query"].iloc[0]) if "query" in cluster_df.columns else ""
-            prg = str(cluster_df["press_release_group"].iloc[0]) if "press_release_group" in cluster_df.columns else ""
-            verified_source = llm_verify_cluster(cluster_df, query, prg, openai_key)
+            cs = str(cluster_df["cluster_summary"].iloc[0]) if "cluster_summary" in cluster_df.columns else ""
+            verified_source = llm_verify_cluster(cluster_df, query, cs, openai_key)
 
         # LLM 실패 시 규칙 기반 fallback (대표 기사 기준)
         if verified_source is None:
@@ -230,8 +367,18 @@ def verify_press_release_clusters(
 
         if verified_source == "보도자료":
             stats["sv_kept_press_release"] += len(cluster_df)
+            print(f"→ 보도자료")
         else:
             stats["sv_reclassified_similar_topic"] += len(cluster_df)
+            print(f"→ 유사주제")
+
+        pbar.set_postfix({
+            "보도자료유지": stats["sv_kept_press_release"],
+            "유사주제전환": stats["sv_reclassified_similar_topic"],
+        })
+        pbar.update(1)
+
+    pbar.close()
 
     return df, stats
 
@@ -355,8 +502,8 @@ def discover_topic_groups(
     stats = {
         "sv_new_topic_groups": 0,
         "sv_new_topic_articles": 0,
-        "sv_llm_verified": 0,  # LLM이 같은 주제로 판단한 쌍
-        "sv_llm_rejected": 0,  # LLM이 다른 주제로 판단한 쌍
+        "sv_llm_verified": 0,  # LLM이 같은 주제로 승인한 경계선 컴포넌트 수
+        "sv_llm_rejected": 0,  # LLM이 거부한 경계선 컴포넌트 수
     }
 
     # 필수 컬럼 확인
@@ -385,10 +532,14 @@ def discover_topic_groups(
     df_general = df[general_mask].copy()
 
     # query별 처리
-    for query, q_group in df_general.groupby("query", dropna=False):
+    query_groups = list(df_general.groupby("query", dropna=False))
+    total_queries = len(query_groups)
+
+    for q_idx, (query, q_group) in enumerate(query_groups, 1):
         if len(q_group) < 2:
             continue
 
+        print(f"    [{q_idx}/{total_queries}] Query '{query}' ({len(q_group)}개 일반기사) 주제 그룹 탐색 중...")
         indices = q_group.index.tolist()
 
         # 토큰화 + 카테고리 캐싱 (nan 값 명시적 처리)
@@ -414,16 +565,24 @@ def discover_topic_groups(
         if len(valid_indices) < 2:
             continue
 
-        # 인접 리스트 구성 (category 일치 + Jaccard + LLM 경계선 검증)
+        # 인접 리스트 구성 (category 일치 + Jaccard)
+        # 경계선(0.35~0.50)은 pair-level LLM 대신 컴포넌트 단위 LLM 1회 검증
         adjacency = {i: [] for i in valid_indices}
+        borderline_edges = set()
         llm_verified_count = 0
         llm_rejected_count = 0
+        n_valid = len(valid_indices)
+        total_pairs = n_valid * (n_valid - 1) // 2
 
-        for i in range(len(valid_indices)):
-            for j in range(i + 1, len(valid_indices)):
+        # tqdm progress bar
+        pbar = tqdm(total=total_pairs, desc=f"      [{q_idx}/{total_queries}] 주제 그룹 탐색", unit="쌍", leave=False)
+
+        for i in range(n_valid):
+            for j in range(i + 1, n_valid):
                 idx_a, idx_b = valid_indices[i], valid_indices[j]
                 # news_category 일치 필수 (None 체크 불필요 - valid_indices에서 이미 필터링됨)
                 if cat_cache[idx_a] != cat_cache[idx_b]:
+                    pbar.update(1)
                     continue
 
                 sim = _jaccard_similarity(token_cache[idx_a], token_cache[idx_b])
@@ -434,31 +593,89 @@ def discover_topic_groups(
                     adjacency[idx_b].append(idx_a)
                 # 확실히 다른 주제 (low threshold 이하)
                 elif sim < TOPIC_JACCARD_LOW_THRESHOLD:
-                    continue
-                # 경계선 케이스 (0.35 ~ 0.50): LLM 검증
+                    pass
+                # 경계선 케이스 (0.35 ~ 0.50): 경계선 그래프에 저장
                 else:
-                    summary_a = str(df.at[idx_a, "news_keyword_summary"])
-                    summary_b = str(df.at[idx_b, "news_keyword_summary"])
-                    title_a = str(df.at[idx_a, "title"]) if "title" in df.columns else None
-                    title_b = str(df.at[idx_b, "title"]) if "title" in df.columns else None
+                    a, b = (idx_a, idx_b) if idx_a < idx_b else (idx_b, idx_a)
+                    borderline_edges.add((a, b))
 
-                    is_same = llm_verify_topic_similarity(
-                        summary_a, summary_b, title_a, title_b,
+                pbar.update(1)
+
+        pbar.close()
+
+        # 경계선 컴포넌트 구성
+        if borderline_edges:
+            borderline_adj = {idx: [] for idx in valid_indices}
+            for a, b in borderline_edges:
+                borderline_adj[a].append(b)
+                borderline_adj[b].append(a)
+
+            borderline_components = []
+            border_visited = set()
+            for start in valid_indices:
+                if start in border_visited or len(borderline_adj[start]) == 0:
+                    continue
+                component = []
+                queue = deque([start])
+                while queue:
+                    node = queue.popleft()
+                    if node in border_visited:
+                        continue
+                    border_visited.add(node)
+                    component.append(node)
+                    for neighbor in borderline_adj[node]:
+                        if neighbor not in border_visited:
+                            queue.append(neighbor)
+                if len(component) >= 2:
+                    borderline_components.append(component)
+
+            if borderline_components and openai_key:
+                comp_pbar = tqdm(
+                    total=len(borderline_components),
+                    desc=f"      [{q_idx}/{total_queries}] 경계선 컴포넌트 검증",
+                    unit="컴포넌트",
+                    leave=False,
+                )
+                for component in borderline_components:
+                    rep_idx = _select_representative_index(df, component)
+                    if rep_idx is None:
+                        comp_pbar.update(1)
+                        continue
+
+                    is_same = llm_judge_component_representative(
+                        _build_article_payload(df, rep_idx),
                         openai_key=openai_key,
+                        mode="topic_group_borderline",
                     )
 
                     if is_same:
-                        adjacency[idx_a].append(idx_b)
-                        adjacency[idx_b].append(idx_a)
                         llm_verified_count += 1
+                        comp_size = len(component)
+                        for a_pos in range(comp_size):
+                            for b_pos in range(a_pos + 1, comp_size):
+                                a_idx = component[a_pos]
+                                b_idx = component[b_pos]
+                                if b_idx not in adjacency[a_idx]:
+                                    adjacency[a_idx].append(b_idx)
+                                if a_idx not in adjacency[b_idx]:
+                                    adjacency[b_idx].append(a_idx)
                     else:
                         llm_rejected_count += 1
+
+                    comp_pbar.update(1)
+                comp_pbar.close()
+            elif borderline_components:
+                # API 키가 없으면 경계선 컴포넌트는 보수적으로 미연결
+                llm_rejected_count += len(borderline_components)
 
         # LLM 검증 통계 누적 및 출력
         stats["sv_llm_verified"] += llm_verified_count
         stats["sv_llm_rejected"] += llm_rejected_count
         if llm_verified_count > 0 or llm_rejected_count > 0:
-            print(f"    Query '{query}': LLM 경계선 검증 {llm_verified_count}개 연결, {llm_rejected_count}개 거부")
+            print(
+                f"    Query '{query}': LLM 경계선 컴포넌트 검증 "
+                f"{llm_verified_count}개 승인, {llm_rejected_count}개 거부"
+            )
 
         # BFS connected components
         visited = set()
@@ -607,6 +824,11 @@ def merge_cross_query_clusters(
     repr_indices = [c["repr_idx"] for c in candidates]
     title_texts = [_clean_html(str(df.at[idx, "title"])) for idx in repr_indices]
     desc_texts = [_clean_html(str(df.at[idx, "description"])) for idx in repr_indices]
+    repr_media_keys = [_extract_media_key(df, idx) for idx in repr_indices]
+    if "pub_datetime" in df.columns:
+        repr_pub_dt = [pd.to_datetime(df.at[idx, "pub_datetime"], errors="coerce", utc=True) for idx in repr_indices]
+    else:
+        repr_pub_dt = [pd.NaT for _ in repr_indices]
 
     # Jaccard용 token set
     title_toksets = [_tokenize_simple(t) for t in title_texts]
@@ -632,7 +854,12 @@ def merge_cross_query_clusters(
 
     # ─── 3-5. Skip mask + 유사도 기반 adjacency ─────────────────────────────
     adjacency = {i: [] for i in range(n)}
-    llm_calls = 0
+    borderline_pair_scores: Dict[Tuple[int, int], float] = {}
+    total_pairs = n * (n - 1) // 2
+
+    # tqdm progress bar
+    print(f"    Cross-query 후보 {n}개, 비교 쌍 {total_pairs}개 처리 중...")
+    pbar = tqdm(total=total_pairs, desc="    Cross-query 병합", unit="쌍", leave=False)
 
     for i in range(n):
         for j in range(i + 1, n):
@@ -640,10 +867,12 @@ def merge_cross_query_clusters(
 
             # Skip: 같은 cluster에 속한 쌍
             if ci["cluster_id"] and ci["cluster_id"] == cj["cluster_id"]:
+                pbar.update(1)
                 continue
 
             # Skip: 같은 query이면서 둘 다 미클러스터 (STEP 2에서 이미 처리)
             if ci["query"] == cj["query"] and not ci["cluster_id"] and not cj["cluster_id"]:
+                pbar.update(1)
                 continue
 
             t_cos = sim_title[i, j]
@@ -655,35 +884,115 @@ def merge_cross_query_clusters(
             if t_cos >= CROSS_TITLE_COS_THRESHOLD and t_jac >= CROSS_TITLE_JAC_THRESHOLD:
                 adjacency[i].append(j)
                 adjacency[j].append(i)
+                pbar.update(1)
                 continue
 
             # Auto-merge: description 기준
             if d_cos >= CROSS_DESC_COS_THRESHOLD and d_jac >= CROSS_DESC_JAC_THRESHOLD:
                 adjacency[i].append(j)
                 adjacency[j].append(i)
+                pbar.update(1)
                 continue
 
-            # LLM 경계선 검증
-            title_borderline = (CROSS_TITLE_COS_BORDERLINE[0] <= t_cos < CROSS_TITLE_COS_BORDERLINE[1])
-            desc_borderline = (CROSS_DESC_COS_BORDERLINE[0] <= d_cos < CROSS_DESC_COS_BORDERLINE[1])
+            # 경계선 후보 수집 (pair-level LLM 제거)
+            title_borderline = (
+                CROSS_TITLE_COS_BORDERLINE[0] <= t_cos < CROSS_TITLE_COS_BORDERLINE[1]
+                and t_jac >= CROSS_TITLE_JAC_BORDERLINE_MIN
+            )
+            desc_borderline = (
+                CROSS_DESC_COS_BORDERLINE[0] <= d_cos < CROSS_DESC_COS_BORDERLINE[1]
+                and d_jac >= CROSS_DESC_JAC_BORDERLINE_MIN
+            )
 
             if title_borderline or desc_borderline:
-                # desc를 summary로 전달 (llm_verify_topic_similarity 재활용)
-                title_a = str(df.at[ci["repr_idx"], "title"]) if "title" in df.columns else None
-                title_b = str(df.at[cj["repr_idx"], "title"]) if "title" in df.columns else None
-                desc_a = desc_texts[i][:200]
-                desc_b = desc_texts[j][:200]
-
-                is_same = llm_verify_topic_similarity(
-                    summary_a=desc_a, summary_b=desc_b,
-                    title_a=title_a, title_b=title_b,
-                    openai_key=openai_key,
+                # strong hint gate: same_media OR Δdays <= 1
+                same_media = (
+                    bool(repr_media_keys[i])
+                    and bool(repr_media_keys[j])
+                    and repr_media_keys[i] == repr_media_keys[j]
                 )
-                llm_calls += 1
+                day_hint = False
+                if pd.notna(repr_pub_dt[i]) and pd.notna(repr_pub_dt[j]):
+                    day_diff = abs((repr_pub_dt[i] - repr_pub_dt[j]).total_seconds()) / 86400.0
+                    day_hint = day_diff <= CROSS_BORDERLINE_DAY_HINT_MAX
 
-                if is_same:
-                    adjacency[i].append(j)
-                    adjacency[j].append(i)
+                if same_media or day_hint:
+                    title_score = (0.7 * float(t_cos) + 0.3 * float(t_jac)) if title_borderline else -1.0
+                    desc_score = (0.7 * float(d_cos) + 0.3 * float(d_jac)) if desc_borderline else -1.0
+                    score = max(title_score, desc_score)
+                    key = (i, j)
+                    prev = borderline_pair_scores.get(key)
+                    if prev is None or score > prev:
+                        borderline_pair_scores[key] = score
+
+            pbar.update(1)
+
+    pbar.close()
+
+    # 경계선 그래프 컴포넌트 구성 후, 컴포넌트당 대표기사 1회 LLM 검증
+    llm_calls = 0
+    llm_component_accepted = 0
+    if borderline_pair_scores:
+        borderline_adj = {i: [] for i in range(n)}
+        for i, j in borderline_pair_scores.keys():
+            borderline_adj[i].append(j)
+            borderline_adj[j].append(i)
+
+        borderline_components = []
+        border_visited = set()
+        for start in range(n):
+            if start in border_visited or len(borderline_adj[start]) == 0:
+                continue
+            component = []
+            queue = deque([start])
+            while queue:
+                node = queue.popleft()
+                if node in border_visited:
+                    continue
+                border_visited.add(node)
+                component.append(node)
+                for neighbor in borderline_adj[node]:
+                    if neighbor not in border_visited:
+                        queue.append(neighbor)
+            if len(component) >= 2:
+                borderline_components.append(component)
+
+        if borderline_components and openai_key:
+            comp_pbar = tqdm(
+                total=len(borderline_components),
+                desc="    Cross-query 경계선 컴포넌트",
+                unit="컴포넌트",
+                leave=False,
+            )
+            for component in borderline_components:
+                rep_row_indices = [candidates[ci]["repr_idx"] for ci in component]
+                rep_idx = _select_representative_index(df, rep_row_indices)
+                if rep_idx is None:
+                    comp_pbar.update(1)
+                    continue
+
+                llm_calls += 1
+                should_merge = llm_judge_component_representative(
+                    _build_article_payload(df, rep_idx),
+                    openai_key=openai_key,
+                    mode="cross_query_borderline",
+                )
+
+                if should_merge:
+                    llm_component_accepted += 1
+                    comp_size = len(component)
+                    for a in range(comp_size):
+                        for b in range(a + 1, comp_size):
+                            i, j = component[a], component[b]
+                            if j not in adjacency[i]:
+                                adjacency[i].append(j)
+                            if i not in adjacency[j]:
+                                adjacency[j].append(i)
+
+                comp_pbar.update(1)
+            comp_pbar.close()
+        elif borderline_components:
+            print("    ⚠️  OPENAI_API_KEY 없음: Cross-query 경계선 컴포넌트 LLM 검증 스킵")
 
     # ─── 6. BFS connected components ────────────────────────────────────────
     visited = set()
@@ -722,16 +1031,16 @@ def merge_cross_query_clusters(
         sources_in_comp = {c["source"] for c in comp_candidates}
         target_source = "보도자료" if "보도자료" in sources_in_comp else "유사주제"
 
-        # target press_release_group: 기존 값 중 첫 번째
-        target_prg = ""
-        if "press_release_group" in df.columns:
+        # target cluster_summary: 기존 값 중 첫 번째
+        target_cs = ""
+        if "cluster_summary" in df.columns:
             for c in comp_candidates:
                 for midx in c["member_indices"]:
-                    val = str(df.at[midx, "press_release_group"]).strip()
+                    val = str(df.at[midx, "cluster_summary"]).strip()
                     if val and val != "nan":
-                        target_prg = val
+                        target_cs = val
                         break
-                if target_prg:
+                if target_cs:
                     break
 
         # 모든 member_indices에 대해 업데이트
@@ -740,15 +1049,18 @@ def merge_cross_query_clusters(
             for midx in c["member_indices"]:
                 df.at[midx, "cluster_id"] = target_cid
                 df.at[midx, "source"] = target_source
-                if target_prg and "press_release_group" in df.columns:
-                    df.at[midx, "press_release_group"] = target_prg
+                if target_cs and "cluster_summary" in df.columns:
+                    df.at[midx, "cluster_summary"] = target_cs
                 total_members += 1
 
         stats["sv_cross_merged_groups"] += 1
         stats["sv_cross_merged_articles"] += total_members
 
     if llm_calls > 0:
-        print(f"    Cross-query LLM 경계선 검증: {llm_calls}회 호출")
+        print(
+            f"    Cross-query 경계선 컴포넌트 LLM 검증: "
+            f"{llm_calls}회 호출, {llm_component_accepted}개 컴포넌트 승인"
+        )
 
     return df, stats
 
@@ -794,6 +1106,39 @@ def verify_and_regroup_sources(
 
     # 통합 통계
     combined = {**verify_stats, **cross_stats, **topic_stats}
+
+    # 일관성 검증
+    if "cluster_id" in df.columns and "cluster_summary" in df.columns:
+        # Rule 1: source=="일반기사" → cluster_id="", cluster_summary=""
+        general_mask = df["source"] == "일반기사"
+        r1_count = (general_mask & (df["cluster_id"].astype(str).str.strip() != "")).sum()
+        if r1_count > 0:
+            df.loc[general_mask, "cluster_id"] = ""
+            df.loc[general_mask, "cluster_summary"] = ""
+            print(f"  일관성 Rule 1: 일반기사 {r1_count}건의 cluster_id/cluster_summary 초기화")
+
+        # Rule 2: 같은 cluster_id → 같은 cluster_summary (첫 비어있지 않은 값 전파)
+        clustered = df["cluster_id"].astype(str).str.strip() != ""
+        r2_count = 0
+        if clustered.any():
+            for cid, cgroup in df[clustered].groupby("cluster_id"):
+                summaries = cgroup["cluster_summary"].dropna().astype(str)
+                summaries = summaries[summaries.str.strip() != ""]
+                if len(summaries) > 0:
+                    first_val = summaries.iloc[0]
+                    mismatch = clustered & (df["cluster_id"] == cid) & (df["cluster_summary"] != first_val)
+                    fix_count = mismatch.sum()
+                    if fix_count > 0:
+                        df.loc[mismatch, "cluster_summary"] = first_val
+                        r2_count += fix_count
+        if r2_count > 0:
+            print(f"  일관성 Rule 2: {r2_count}건의 cluster_summary 전파")
+
+        # Rule 3: cluster_id 있는데 cluster_summary 없으면 경고 (summarize_clusters 호출로 해결됨)
+        r3_mask = clustered & (df["cluster_summary"].astype(str).str.strip() == "")
+        r3_count = r3_mask.sum()
+        if r3_count > 0:
+            print(f"  일관성 Rule 3: {r3_count}건 cluster_summary 누락 (summarize_clusters 호출 예정)")
 
     # Source 분포 출력
     if "source" in df.columns:

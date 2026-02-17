@@ -10,7 +10,7 @@ import pandas as pd
 
 from .llm_engine import load_prompts, analyze_article_llm
 from .llm_orchestrator import run_chunked_parallel
-from .result_writer import save_result_to_csv_incremental, sync_result_to_sheets
+from .result_writer import sync_result_to_sheets
 from src.utils.text_cleaning import clean_bom
 
 
@@ -63,7 +63,6 @@ def classify_llm(
     dry_run: bool = False,
     max_competitor_classify: int = 50,
     max_workers: int = 3,
-    result_csv_path: Optional[str] = None,
     spreadsheet = None,
     raw_df: pd.DataFrame = None
 ) -> tuple[pd.DataFrame, Dict]:
@@ -83,7 +82,6 @@ def classify_llm(
         dry_run: True면 LLM 호출 생략
         max_competitor_classify: 경쟁사별 최대 분류 개수 (0이면 무제한)
         max_workers: 병렬 처리 워커 수 (기본값: 3)
-        result_csv_path: 결과 저장 CSV 경로 (None이면 저장하지 않음)
         spreadsheet: Google Sheets 객체 (청크별 동기화용, 선택사항)
         raw_df: 원본 DataFrame (Sheets 동기화용, 선택사항)
 
@@ -208,9 +206,6 @@ def classify_llm(
 
         df.at[idx, "classified_at"] = timestamp
 
-        # 성공한 기사 즉시 CSV에 저장
-        save_result_to_csv_incremental(df, idx, result_csv_path)
-
     def on_failure(result: Dict, _chunk_fail_count: int, total_fail_count: int):
         idx = result.get("idx")
         if idx is None:
@@ -234,8 +229,8 @@ def classify_llm(
             print(f"   상세 Traceback (첫 실패만):\n{result['error_trace']}")
 
     def sync_callback(_chunk_num: int, _total_chunks: int, _succ: int, _fail: int):
-        if spreadsheet and result_csv_path and raw_df is not None:
-            sync_result_to_sheets(result_csv_path, raw_df, spreadsheet, verbose=True)
+        if spreadsheet and raw_df is not None:
+            sync_result_to_sheets(df, raw_df, spreadsheet, verbose=True)
 
     run_stats = run_chunked_parallel(
         tasks=tasks,

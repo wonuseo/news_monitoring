@@ -414,7 +414,7 @@ def sync_to_sheets(df: pd.DataFrame, spreadsheet,
             "sentiment_stage", "danger_level", "issue_category",
             "news_category", "news_keyword_summary", "classified_at",
             # 전처리 필드
-            "press_release_group", "cluster_id", "source",
+            "cluster_id", "cluster_summary", "source",
             "media_domain", "media_name", "media_group", "media_type",
             # Looker Studio 시계열 필드
             "date_only", "week_number", "month", "article_count"
@@ -728,6 +728,74 @@ def filter_total_result_by_date(
     )
 
     return filtered
+
+
+def deduplicate_sheet(
+    spreadsheet,
+    sheet_name: str,
+    key_column: str = "link",
+) -> Dict[str, int]:
+    """
+    Sheets 탭 내 중복 행 제거 (key_column 기준 첫 번째 행 유지).
+
+    Args:
+        spreadsheet: gspread Spreadsheet 객체
+        sheet_name: 대상 워크시트 이름
+        key_column: 중복 기준 컬럼 (기본: link)
+
+    Returns:
+        {"before": N, "after": N, "removed": N}
+    """
+    try:
+        worksheet = spreadsheet.worksheet(sheet_name)
+    except Exception:
+        return {"before": 0, "after": 0, "removed": 0}
+
+    all_values = worksheet.get_all_values()
+    if not all_values or len(all_values) <= 1:
+        return {"before": 0, "after": 0, "removed": 0}
+
+    headers = [_normalize_header(h) for h in all_values[0]]
+    rows = all_values[1:]
+    before = len(rows)
+
+    key_idx = _find_header_index(headers, key_column)
+    if key_idx is None:
+        return {"before": before, "after": before, "removed": 0}
+
+    seen: set = set()
+    deduped = []
+    for row in rows:
+        key = clean_bom(row[key_idx]) if key_idx < len(row) else ""
+        if not key or key not in seen:
+            deduped.append(row)
+            if key:
+                seen.add(key)
+
+    removed = before - len(deduped)
+    if removed == 0:
+        return {"before": before, "after": before, "removed": 0}
+
+    # 헤더 길이에 맞게 패딩 후 전체 시트 재작성
+    n_cols = len(headers)
+    padded = [
+        (row + [""] * n_cols)[:n_cols]
+        for row in deduped
+    ]
+    all_data = [headers] + padded
+
+    worksheet.clear()
+    batch_size = 2000
+    last_col = col_num_to_letter(n_cols)
+    for i in range(0, len(all_data), batch_size):
+        batch = all_data[i:i + batch_size]
+        start_row = i + 1
+        end_row = i + len(batch)
+        worksheet.update(f"A{start_row}:{last_col}{end_row}", batch, value_input_option="RAW")
+        if i + batch_size < len(all_data):
+            time.sleep(1.0)
+
+    return {"before": before, "after": len(deduped), "removed": removed}
 
 
 def sync_raw_and_processed(df_raw: pd.DataFrame, df_result: pd.DataFrame, spreadsheet) -> Dict[str, Dict]:

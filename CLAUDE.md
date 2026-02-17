@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**News Monitoring System** - Automated pipeline for hotel brand news monitoring that collects articles from Naver API, performs LLM-based analysis for sentiment/risk/categorization, and outputs results to Google Sheets + CSV + Word reports.
+**News Monitoring System** - Automated pipeline for hotel brand news monitoring that collects articles from Naver API, performs LLM-based analysis for sentiment/risk/categorization, and outputs results to Google Sheets.
 
 **Core Flow**: Collection → Processing → LLM Classification → Reporting → Sheets Sync
 
@@ -12,8 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - LLM-only classification (OpenAI GPT with structured output via prompts.yaml)
 - TF-IDF similarity detection for press release grouping
 - OpenAI-powered media outlet classification
-- Automatic Google Sheets sync (primary data store)
-- CSV backups for troubleshooting
+- Google Sheets as the **sole data store** (no CSV intermediates)
+- Emergency raw.csv only when Sheets not connected (raw collection only mode)
 
 ## Quick Start
 
@@ -43,11 +43,15 @@ Linear 5-step pipeline:
 STEP 1: Collection
 ├─ Naver API (pagination: 9 pages × 100 = 900 articles/brand)
 ├─ Load existing links from Google Sheets (skip duplicates)
-├─ Save to raw.csv + append to Sheets
+├─ Sync new articles directly to Sheets (raw_data tab)
 └─ --recheck_only: Skip API, load raw_data from Sheets
 
+STEP 1.5a: Sheets Deduplication
+├─ Detect & remove duplicate rows in raw_data and total_result tabs (keep first by link)
+└─ Function: deduplicate_sheet() in sheets.py
+
 STEP 1.5: Reprocess Check
-├─ Load total_result (Sheets → CSV fallback)
+├─ Load total_result from Sheets (no CSV fallback)
 ├─ Rule 1: raw links missing from total_result
 ├─ Rules 2-5: Field-level empty check (brand_relevance, sentiment_stage, source, media_domain, date_only)
 ├─ Union all targets → clear classified_at → merge with new articles
@@ -60,7 +64,7 @@ STEP 2: Processing
 ├─ Normalize (HTML strip, ISO dates, article_id, article_no)
 ├─ Deduplicate by link
 ├─ TF-IDF similarity (detect press releases, cosine ≥ 0.8)
-├─ OpenAI group summarization (press_release_group)
+├─ OpenAI group summarization (cluster_summary)
 └─ Media classification (domain → name/group/type via OpenAI batch)
 
 STEP 3: LLM Classification & Source Verification
@@ -83,20 +87,33 @@ STEP 3: LLM Classification & Source Verification
 
 STEP 4: Reporting
 ├─ Console report (summary statistics)
-└─ Keyword extraction (automatic, saved to Google Sheets + CSV)
+└─ Keyword extraction (automatic, saved to Google Sheets only)
 
-STEP 5: Sheets Sync
-└─ Incremental upload to 2 tabs (raw_data, result)
+STEP 5: Logger Flush
+└─ Flush run_history / errors / events to Sheets (data sync already done in Steps 1 & 3)
 ```
 
 ## Module Structure
 
 ```
+main.py                  # Thin entry point (77 lines) - orchestrates 5-step pipeline
+src/cli.py              # CLI argument parsing + run_mode detection
+
+src/pipeline/           # Pipeline orchestration (NEW in Phase 15)
+├── context.py          # PipelineContext dataclass (shared state)
+├── setup.py            # Environment setup, Sheets connection, error callbacks
+├── step1_collection.py # Collection + reprocess check + date filtering
+├── step2_processing.py # Preprocessing orchestration
+├── step3_classification.py # Classification orchestration
+├── step4_reporting.py  # Reporting + keyword extraction
+├── step5_sheets_sync.py # Logger flush only (run_history/errors/events)
+└── finalize.py         # Log saving, summary, completion banner
+
 src/modules/
 ├── collection/
 │   └── collect.py       # Naver API pagination
 ├── processing/
-│   ├── process.py       # Normalize, dedupe, CSV I/O
+│   ├── process.py       # Normalize, dedupe, DataFrame I/O
 │   ├── press_release_detector.py # Press release detection & summarization
 │   ├── media_classify.py # OpenAI media outlet classification
 │   ├── reprocess_checker.py # Reprocess target detection (missing/incomplete fields)
@@ -107,7 +124,7 @@ src/modules/
 │   ├── llm_engine.py    # OpenAI Responses API engine (structured output)
 │   ├── llm_orchestrator.py # Parallel chunked task runner (ThreadPoolExecutor)
 │   ├── classification_stats.py # Statistics generation & reporting
-│   ├── result_writer.py # CSV/Sheets incremental saving (thread-safe)
+│   ├── result_writer.py # Sheets-only incremental saving (thread-safe)
 │   ├── keyword_extractor.py # Category-specific keyword extraction (kiwipiepy + Log-odds)
 │   ├── source_verifier.py # Source verification & topic grouping (LLM cluster verification)
 │   ├── source_verifier_prompts.yaml # Source verification prompts (cluster_verification + topic_similarity)
@@ -115,7 +132,7 @@ src/modules/
 ├── monitoring/
 │   └── logger.py        # Fixed-schema run metrics (55 cols, 3-sheet: run_history/errors/events)
 └── export/
-    ├── report.py        # CSV + Word generation
+    ├── report.py        # Console report generation
     └── sheets.py        # Google Sheets sync
 
 src/utils/
@@ -202,7 +219,7 @@ python main.py --recheck_only --dry_run
 
 ## Data Flow & Key Columns
 
-**Collection (raw.csv)**:
+**Collection (raw_data tab)**:
 - From API: `title`, `description`, `link`, `originallink`, `pubDate`
 - Added: `query` (brand, 복수 브랜드 수집 시 파이프 구분 예: "롯데호텔|호텔롯데"), `group` (OUR/COMPETITOR)
 
@@ -212,10 +229,10 @@ python main.py --recheck_only --dry_run
 - `article_no` (순차 번호, 사람이 읽는 번호, 검토용)
 - `source` ("보도자료" / "유사주제" / "일반기사" — verified by LLM results in Step 3-3)
 - `cluster_id` (press release cluster ID)
-- `press_release_group` (OpenAI 3-word summary)
+- `cluster_summary` (OpenAI 5-word summary)
 - `media_domain`, `media_name`, `media_group`, `media_type`
 
-**LLM Classification (result.csv)**:
+**LLM Classification (total_result tab)**:
 - `brand_relevance`: "관련" / "언급" / "무관" / "판단 필요"
 - `brand_relevance_query_keywords`: [array of keywords]
 - `sentiment_stage`: "긍정" / "중립" / "부정 후보" / "부정 확정"
@@ -253,7 +270,7 @@ python main.py --recheck_only --dry_run
 ### Media Classification (OpenAI Batch)
 - Extracts domains from URLs
 - Batch classifies unknown domains (1 API call for all)
-- Persistent CSV directory (`media_directory.csv`)
+- Media directory stored in memory per run (no persistent CSV)
 - Cost: ~$0.001 per 100 domains
 
 ### LLM Classification Strategy
@@ -265,7 +282,7 @@ python main.py --recheck_only --dry_run
   - Significantly reduces API calls vs individual classification
 - **Chunking**: Default 100 articles/chunk (reduce for timeouts)
 - **Parallel**: ThreadPoolExecutor via `llm_orchestrator.py` with max_workers (default 3)
-- **Incremental save**: Appends to result.csv after each successful chunk
+- **Incremental sync**: Syncs to Sheets after each successful chunk
 - **Configuration**: All prompts and rules in `prompts.yaml` - no code changes needed
 - **OpenAI integration**: Direct HTTP via `src/utils/openai_client.py` (no openai SDK)
 
@@ -276,22 +293,20 @@ python main.py --recheck_only --dry_run
 - **Output**: Top-K keywords per category (default: 20)
 - **Categories**: sentiment_stage, danger_level, issue_category, news_category, brand_relevance
 - **Usage**: Runs automatically after classification, adjust count with `--keyword_top_k 30`
-- **Storage**:
-  - Primary: Google Sheets `keywords` tab
-  - Backup: `data/keywords/keywords_{category}.csv`
+- **Storage**: Google Sheets `keywords` tab only (no CSV)
 
 ### Google Sheets Integration
-- **Primary data store** (CSV = backup for troubleshooting)
+- **Sole data store** — no CSV intermediates. All pipeline data stored in Sheets only.
 - **Automatic sync**: No `--sheets` flag needed - syncs automatically if credentials configured
 - **Incremental collection**: Loads existing links at start, skips duplicates
 - **Sync function**: `sync_raw_and_processed()` in `sheets.py`
-- **Graceful fallback**: Continues with CSV-only mode if credentials missing
+- **Sheets not connected**: raw collection → emergency `outdir/raw.csv` → pipeline stops
 - **Configuration**: Set `GOOGLE_SHEETS_CREDENTIALS_PATH` and `GOOGLE_SHEET_ID` in `.env`
 
 ### Error Handling
 - All steps non-blocking (pipeline always completes)
 - API failures: retry with exponential backoff
-- Sheets failures: continues with CSV-only mode
+- Sheets failures: records error, continues processing (no CSV fallback)
 - LLM failures: records error, continues with remaining articles
 
 ## Logging System
@@ -318,33 +333,28 @@ Fixed-schema 3-sheet logging system. Tracks all pipeline metrics per run.
 **Error/Event Schema** (6 columns): run_id, timestamp, category, stage, message, data_json
 
 **Log Storage**:
-- CSV: `data/logs/run_history.csv` (append mode, auto-backup on schema mismatch)
-- Google Sheets: `run_history` tab (full replace), `errors`/`events` tabs (append)
+- Google Sheets only: `run_history` tab (append row per run), `errors`/`events` tabs (append)
+- No CSV backup for logs
 
 **Usage**:
 - Automatic: No configuration needed, logs saved after every run
 - Monitor costs: Check `llm_cost_estimated` column (USD)
 - Track performance: Compare `duration_*` columns across runs (6 stages)
 
-## Output Files
+## Output
 
-**Location**: `data/` directory (or `--outdir`)
-
-- `raw.csv` - Raw API collection (UTF-8 BOM, troubleshooting backup)
-- `result.csv` - LLM classified results (UTF-8 BOM, troubleshooting backup)
-- `media_directory.csv` - Media outlet directory (persistent)
-- `keywords/` - Category-specific keyword CSV files (automatic, troubleshooting backup)
-- `logs/run_history.csv` - Run metrics history (persistent, append mode)
-
-**Google Sheets** (primary data store, if configured):
+**Google Sheets** (sole data store — Sheets connection required):
 - `raw_data` tab: Raw collected articles
 - `total_result` tab: Classified articles with all LLM columns
-- `run_history` tab: Fixed-schema run metrics (55 columns)
-- `errors` tab: ERROR-level logs with stage context
-- `events` tab: INFO-level logs with stage context
+- `run_history` tab: Fixed-schema run metrics (55 columns), appended per run
+- `errors` tab: ERROR-level logs with stage context (append)
+- `events` tab: INFO-level logs with stage context (append)
 - `keywords` tab: Category-specific keywords (automatic)
 - Auto-deduplication by link
-- CSV files are backups for troubleshooting
+
+**Emergency fallback** (Sheets not connected):
+- `outdir/raw.csv` — Raw API collection only; pipeline stops after collection (Steps 2-5 skipped)
+- No other CSV files are created
 
 ## Debugging & Troubleshooting
 
@@ -375,7 +385,7 @@ python main.py --recheck_only --dry_run
 ```
 
 **Reprocess Check** (STEP 1.5, `reprocess_checker.py`):
-- Loads total_result from Sheets (fallback: result.csv)
+- Loads total_result from Sheets only (no CSV fallback)
 - Rule 1: Finds raw links missing from total_result
 - Rules 2-5: Checks field-level completeness (brand_relevance, sentiment_stage, source, media_domain, date_only)
 - Merges all targets, clears classified_at, combines with new articles
@@ -397,6 +407,7 @@ python main.py --recheck_only --dry_run
 - Tests: `tests/test_llm_quality.py`, `tests/test_press_release_detector.py`, `tests/test_reprocess_checker.py`
 
 **Important Functions**:
+- Pipeline: `run_collection()`, `run_processing()`, `run_classification()`, `run_reporting()`, `run_sheets_sync()` in `src/pipeline/step*.py`
 - Collection: `collect_all_news()` in `collect.py`
 - Processing: `normalize_df()`, `dedupe_df()`, `detect_similar_articles()` in `process.py`
 - Classification:
@@ -404,13 +415,13 @@ python main.py --recheck_only --dry_run
   - `classify_press_releases()` in `classify_press_releases.py` - Cluster-based press release classification
   - `analyze_article_llm()` in `llm_engine.py` - Single article LLM analysis
   - `run_chunked_parallel()` in `llm_orchestrator.py` - Parallel chunked task runner
-  - `save_result_to_csv_incremental()` in `result_writer.py` - Thread-safe CSV saving
+  - `sync_result_to_sheets()` in `result_writer.py` - Thread-safe Sheets sync
   - `get_classification_stats()` in `classification_stats.py` - Statistics generation
 - Source Verification: `verify_and_regroup_sources()`, `verify_press_release_clusters()`, `llm_verify_cluster()`, `merge_cross_query_clusters()`, `discover_topic_groups()`, `llm_verify_topic_similarity()` in `source_verifier.py`
 - Source Verifier Engine: `load_source_verifier_prompts()`, `render_prompt()`, `call_openai_structured()` in `llm_engine.py`
 - Reprocess: `check_reprocess_targets()`, `load_raw_data_from_sheets()`, `clear_classified_at_for_targets()` in `reprocess_checker.py`
 - Reporting: `generate_console_report()` in `report.py`
-- Sheets: `sync_raw_and_processed()` in `sheets.py`, `sync_result_to_sheets()` in `result_writer.py`
+- Sheets: `sync_raw_and_processed()` in `sheets.py`, `sync_result_to_sheets()` in `result_writer.py`, `deduplicate_sheet()` in `sheets.py`
 
 **Documentation Notes**:
 - ⚠️ README.md is outdated - describes removed hybrid system (rules.yaml, hybrid.py)
@@ -449,7 +460,7 @@ python main.py --recheck_only --dry_run
 - **Date filtering**: Hard-coded 2026-02-01+ filter in main.py and sheets.py
 - **Utility extraction**: `src/utils/` with `openai_client.py`, `sheets_helpers.py`, `text_cleaning.py`
 
-**Phase 13 (Current - Logging System Redesign)**:
+**Phase 13 (Logging System Redesign)**:
 - **Fixed schema**: `RUN_HISTORY_SCHEMA` (51 columns) prevents column drift across runs
 - **3-sheet structure**: `run_history` + `errors` + `events` (replaces single `logs` tab)
 - **6-stage duration tracking**: collection, processing, pr_classification, general_classification, source_verification, sheets_sync
@@ -469,7 +480,32 @@ python main.py --recheck_only --dry_run
 - **Engine**: `load_source_verifier_prompts()`, `render_prompt()`, `call_openai_structured()` in `llm_engine.py`
 - **Logger**: 8 new columns in RUN_HISTORY_SCHEMA (55 total, +2 for cross-query merge)
 
-**Google Sheets as Primary Store**:
-- CSV files are backups for troubleshooting
-- Sheets provides real-time collaboration
-- Incremental sync prevents duplicate processing
+**Phase 15 (main.py Refactoring)**:
+- **Goal**: Lightweight main.py showing 5-step pipeline clearly
+- **Before**: 840 lines, single monolithic `main()` function with all logic mixed
+- **After**: 77 lines (91% reduction), thin orchestrator calling pipeline steps
+- **New structure**:
+  - `src/cli.py`: argparse + run_mode detection (90 lines)
+  - `src/pipeline/context.py`: PipelineContext dataclass for shared state (40 lines)
+  - `src/pipeline/step*.py`: Each pipeline step in separate file (150-200 lines each)
+  - `main.py`: Clean 5-step orchestration visible at a glance
+- **Key pattern**: PipelineContext (`ctx`) passed between steps instead of 6-8 individual parameters
+- **Mode branching**: Each step checks `ctx.run_mode` internally (raw_only/preprocess_only/full/dry_run/recheck_only)
+- **Zero behavior change**: Pure refactoring, same functionality
+
+**Phase 16 (Sheets-only Storage)**:
+- **Sole store**: Google Sheets is the only persistent store; all CSV intermediates removed
+- **Removed**: `result.csv`, `media_directory.csv`, `keywords/`, `data/logs/run_history.csv`
+- **Emergency mode**: Sheets not connected → raw collection → `outdir/raw.csv` → pipeline stops
+- **In-memory pipeline**: `df → memory → Sheets direct sync` (no CSV read-back)
+- **`collect_all_news()`**: `raw_csv_path` param removed; `existing_links` set passed directly
+- **`result_writer.py`**: `save_result_to_csv_incremental()` removed; `sync_result_to_sheets()` takes DataFrame directly
+- **`reprocess_checker.py`**: CSV fallback removed from `_load_total_result()`
+- **`logger.py`**: `save_csv()` replaced by `save_to_sheets()` (appends row to run_history tab)
+- **`intermediate_sync()`**: CSV params removed; Sheets sync only
+- **Tests**: `test_reprocess_checker.py` uses `MockSpreadsheet`/`MockWorksheet` instead of temp CSV files
+
+- **Phase 17 (Dedup + Step 5 Simplification — Current)**:
+- **Sheets deduplication**: `deduplicate_sheet(spreadsheet, sheet_name)` in `sheets.py` — detects and removes duplicate rows (by `link`) in any Sheets tab; called at Step 1.5a on `raw_data` and `total_result`
+- **Step 5 is logger-only**: `sync_raw_and_processed()` removed from Step 5; data sync now fully owned by Step 1 (raw_data) and Step 3 (total_result). Step 5 only calls `ctx.logger.flush_all_to_sheets()`
+- **Sync metrics moved**: `sheets_rows_uploaded_raw` logged in Step 1 `_collect_from_api()`; `sheets_rows_uploaded_result` logged in Step 3 `_save_and_sync()`

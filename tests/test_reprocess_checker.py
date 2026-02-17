@@ -1,11 +1,11 @@
 """
 test_reprocess_checker.py - reprocess_checker 모듈 검증
-더미 데이터로 모든 재처리 규칙 + clear_classified_at + CSV fallback + 통계 출력 검증
+더미 데이터로 모든 재처리 규칙 + clear_classified_at + 통계 출력 검증
+Sheets-only 모드: MockSpreadsheet으로 Sheets 인터페이스 모킹
 """
 
 import os
 import sys
-import tempfile
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,6 +29,34 @@ def ok(cond, label):
     else:
         FAIL += 1
         print(f"  [FAIL] {label}")
+
+
+# ──────────────────────────────────────────────
+# Mock Sheets 인터페이스
+# ──────────────────────────────────────────────
+
+class MockWorksheet:
+    def __init__(self, records):
+        self._records = records
+
+    def get_all_records(self):
+        return self._records
+
+
+class MockSpreadsheet:
+    def __init__(self, worksheets_data: dict):
+        self._data = worksheets_data
+
+    def worksheet(self, name):
+        if name not in self._data:
+            raise Exception(f"Worksheet '{name}' not found")
+        return MockWorksheet(self._data[name])
+
+
+def make_mock_sheets(df_result):
+    """DataFrame을 MockSpreadsheet으로 변환"""
+    records = df_result.to_dict('records') if df_result is not None else []
+    return MockSpreadsheet({"total_result": records})
 
 
 # ──────────────────────────────────────────────
@@ -87,11 +115,12 @@ def make_result_with_missing_fields():
 # 테스트 케이스
 # ──────────────────────────────────────────────
 
-def test_1_no_result_file():
-    """result 파일이 아예 없을 때 → raw 전체가 재처리 대상"""
+def test_1_no_result():
+    """total_result가 없을 때 → raw 전체가 재처리 대상"""
     print("\n[Test 1] total_result 없음 → raw 전체가 재처리 대상")
     df_raw = make_raw()
-    result = check_reprocess_targets(df_raw, spreadsheet=None, result_csv_path="/nonexistent/path.csv")
+    # Sheets 미연결 (None) → total_result 없음 → raw 전체 재처리
+    result = check_reprocess_targets(df_raw, spreadsheet=None)
 
     ok(len(result["df_to_reprocess"]) == 10, f"재처리 대상 10건 (실제: {len(result['df_to_reprocess'])})")
     ok(result["stats"]["missing_from_result"] == 10, f"missing_from_result=10 (실제: {result['stats']['missing_from_result']})")
@@ -103,76 +132,58 @@ def test_2_all_complete():
     """result가 raw와 동일하고 모든 필드 정상 → 재처리 0건"""
     print("\n[Test 2] 모두 완료 → 재처리 0건")
     df_raw = make_raw()
+    mock_sheets = make_mock_sheets(make_result_complete(n=10))
 
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
-        make_result_complete(n=10).to_csv(f.name, index=False, encoding="utf-8-sig")
-        csv_path = f.name
-
-    try:
-        result = check_reprocess_targets(df_raw, spreadsheet=None, result_csv_path=csv_path)
-        ok(len(result["df_to_reprocess"]) == 0, f"재처리 대상 0건 (실제: {len(result['df_to_reprocess'])})")
-        ok(result["stats"]["total_reprocess_targets"] == 0, f"total=0 (실제: {result['stats']['total_reprocess_targets']})")
-        ok(result["stats"]["missing_from_result"] == 0, f"missing=0 (실제: {result['stats']['missing_from_result']})")
-        print_reprocess_stats(result["stats"])
-    finally:
-        os.unlink(csv_path)
+    result = check_reprocess_targets(df_raw, spreadsheet=mock_sheets)
+    ok(len(result["df_to_reprocess"]) == 0, f"재처리 대상 0건 (실제: {len(result['df_to_reprocess'])})")
+    ok(result["stats"]["total_reprocess_targets"] == 0, f"total=0 (실제: {result['stats']['total_reprocess_targets']})")
+    ok(result["stats"]["missing_from_result"] == 0, f"missing=0 (실제: {result['stats']['missing_from_result']})")
+    print_reprocess_stats(result["stats"])
 
 
 def test_3_missing_from_result():
     """raw 10건, result 8건 → 2건 미존재"""
     print("\n[Test 3] result에 없는 기사 2건 (Rule 1)")
     df_raw = make_raw()
+    mock_sheets = make_mock_sheets(make_result_complete(n=8))
 
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
-        make_result_complete(n=8).to_csv(f.name, index=False, encoding="utf-8-sig")
-        csv_path = f.name
-
-    try:
-        result = check_reprocess_targets(df_raw, spreadsheet=None, result_csv_path=csv_path)
-        ok(result["stats"]["missing_from_result"] == 2, f"missing=2 (실제: {result['stats']['missing_from_result']})")
-        reprocess_links = result["reprocess_links"]
-        ok("https://example.com/link_09" in reprocess_links, "link_09 포함")
-        ok("https://example.com/link_10" in reprocess_links, "link_10 포함")
-        ok(result["stats"]["total_reprocess_targets"] == 2, f"total=2 (실제: {result['stats']['total_reprocess_targets']})")
-        print_reprocess_stats(result["stats"])
-    finally:
-        os.unlink(csv_path)
+    result = check_reprocess_targets(df_raw, spreadsheet=mock_sheets)
+    ok(result["stats"]["missing_from_result"] == 2, f"missing=2 (실제: {result['stats']['missing_from_result']})")
+    reprocess_links = result["reprocess_links"]
+    ok("https://example.com/link_09" in reprocess_links, "link_09 포함")
+    ok("https://example.com/link_10" in reprocess_links, "link_10 포함")
+    ok(result["stats"]["total_reprocess_targets"] == 2, f"total=2 (실제: {result['stats']['total_reprocess_targets']})")
+    print_reprocess_stats(result["stats"])
 
 
 def test_4_field_level_missing():
     """필드별 누락 감지 (BOM, 빈칸, NaN)"""
     print("\n[Test 4] 필드별 누락 감지 (Rules 2-6)")
     df_raw = make_raw()
+    mock_sheets = make_mock_sheets(make_result_with_missing_fields())
 
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
-        make_result_with_missing_fields().to_csv(f.name, index=False, encoding="utf-8-sig")
-        csv_path = f.name
+    result = check_reprocess_targets(df_raw, spreadsheet=mock_sheets)
+    s = result["stats"]
+    fm = s["field_missing"]
 
-    try:
-        result = check_reprocess_targets(df_raw, spreadsheet=None, result_csv_path=csv_path)
-        s = result["stats"]
-        fm = s["field_missing"]
+    # link_02, link_07 → brand_relevance 빈칸
+    ok(fm["brand_relevance"] == 2, f"brand_relevance 누락 2건 (실제: {fm['brand_relevance']})")
+    # link_03 → BOM만, link_07 → 빈칸
+    ok(fm["sentiment_stage"] == 2, f"sentiment_stage 누락 2건 (실제: {fm['sentiment_stage']})")
+    # link_04
+    ok(fm["source"] == 1, f"source 누락 1건 (실제: {fm['source']})")
+    # link_05 → NaN
+    ok(fm["media_domain"] == 1, f"media_domain 누락 1건 (실제: {fm['media_domain']})")
+    # link_06
+    ok(fm["date_only"] == 1, f"date_only 누락 1건 (실제: {fm['date_only']})")
 
-        # link_02, link_07 → brand_relevance 빈칸
-        ok(fm["brand_relevance"] == 2, f"brand_relevance 누락 2건 (실제: {fm['brand_relevance']})")
-        # link_03 → BOM만, link_07 → 빈칸
-        ok(fm["sentiment_stage"] == 2, f"sentiment_stage 누락 2건 (실제: {fm['sentiment_stage']})")
-        # link_04
-        ok(fm["source"] == 1, f"source 누락 1건 (실제: {fm['source']})")
-        # link_05 → NaN
-        ok(fm["media_domain"] == 1, f"media_domain 누락 1건 (실제: {fm['media_domain']})")
-        # link_06
-        ok(fm["date_only"] == 1, f"date_only 누락 1건 (실제: {fm['date_only']})")
+    # raw에 없는 2건(link_09, link_10) + 필드 누락 6건(link_02~07) = 총 8건
+    ok(s["missing_from_result"] == 2, f"missing_from_result=2 (실제: {s['missing_from_result']})")
+    # link_02,03,04,05,06,07 + link_09,10 = 8
+    ok(s["total_reprocess_targets"] == 8, f"total=8 (실제: {s['total_reprocess_targets']})")
+    ok(len(result["df_to_reprocess"]) == 8, f"df 8건 (실제: {len(result['df_to_reprocess'])})")
 
-        # raw에 없는 2건(link_09, link_10) + 필드 누락 6건(link_02~07) = 총 8건
-        ok(s["missing_from_result"] == 2, f"missing_from_result=2 (실제: {s['missing_from_result']})")
-        # link_02,03,04,05,06,07 + link_09,10 = 8
-        ok(s["total_reprocess_targets"] == 8, f"total=8 (실제: {s['total_reprocess_targets']})")
-        ok(len(result["df_to_reprocess"]) == 8, f"df 8건 (실제: {len(result['df_to_reprocess'])})")
-
-        print_reprocess_stats(s)
-    finally:
-        os.unlink(csv_path)
+    print_reprocess_stats(s)
 
 
 def test_5_clear_classified_at():
@@ -217,41 +228,35 @@ def test_7_combined_new_and_reprocess():
         "pubDate": ["2026-02-12"] * 3,
     })
 
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
-        make_result_complete(n=8).to_csv(f.name, index=False, encoding="utf-8-sig")
-        csv_path = f.name
+    mock_sheets = make_mock_sheets(make_result_complete(n=8))
+    recheck = check_reprocess_targets(df_raw, spreadsheet=mock_sheets)
+    df_reprocess = recheck["df_to_reprocess"]
 
-    try:
-        recheck = check_reprocess_targets(df_raw, spreadsheet=None, result_csv_path=csv_path)
-        df_reprocess = recheck["df_to_reprocess"]
+    # link_09, link_10이 재처리 대상
+    ok(len(df_reprocess) == 2, f"재처리 대상 2건 (실제: {len(df_reprocess)})")
 
-        # link_09, link_10이 재처리 대상
-        ok(len(df_reprocess) == 2, f"재처리 대상 2건 (실제: {len(df_reprocess)})")
+    # main.py STEP 1.5 병합 로직 시뮬레이션
+    if len(df_reprocess) > 0:
+        df_reprocess = clear_classified_at_for_targets(df_reprocess, recheck["reprocess_links"])
+        df_to_process = pd.concat([df_raw_new, df_reprocess], ignore_index=True)
+        df_to_process = df_to_process.drop_duplicates(subset=["link"], keep="first")
+    else:
+        df_to_process = df_raw_new
 
-        # main.py STEP 1.5 병합 로직 시뮬레이션
-        if len(df_reprocess) > 0:
-            df_reprocess = clear_classified_at_for_targets(df_reprocess, recheck["reprocess_links"])
-            df_to_process = pd.concat([df_raw_new, df_reprocess], ignore_index=True)
-            df_to_process = df_to_process.drop_duplicates(subset=["link"], keep="first")
-        else:
-            df_to_process = df_raw_new
+    ok(len(df_to_process) == 5, f"처리 대상 5건 (신규3 + 재처리2) (실제: {len(df_to_process)})")
 
-        ok(len(df_to_process) == 5, f"처리 대상 5건 (신규3 + 재처리2) (실제: {len(df_to_process)})")
+    # 중복 제거 확인
+    unique_links = set(df_to_process["link"].tolist())
+    ok(len(unique_links) == 5, f"중복 없음 (실제: {len(unique_links)})")
 
-        # 중복 제거 확인: df_raw_new에도 있고 reprocess에도 있는 경우 대비
-        unique_links = set(df_to_process["link"].tolist())
-        ok(len(unique_links) == 5, f"중복 없음 (실제: {len(unique_links)})")
-
-        print_reprocess_stats(recheck["stats"])
-    finally:
-        os.unlink(csv_path)
+    print_reprocess_stats(recheck["stats"])
 
 
 def test_8_empty_raw():
     """raw가 빈 경우"""
     print("\n[Test 8] raw가 빈 경우")
     df_raw = pd.DataFrame(columns=["link", "title"])
-    result = check_reprocess_targets(df_raw, spreadsheet=None, result_csv_path="")
+    result = check_reprocess_targets(df_raw, spreadsheet=None)
     ok(len(result["df_to_reprocess"]) == 0, f"재처리 0건 (실제: {len(result['df_to_reprocess'])})")
     ok(result["stats"]["total_reprocess_targets"] == 0, f"total=0 (실제: {result['stats']['total_reprocess_targets']})")
 
@@ -265,7 +270,7 @@ if __name__ == "__main__":
     print("reprocess_checker.py 검증 테스트")
     print("=" * 60)
 
-    test_1_no_result_file()
+    test_1_no_result()
     test_2_all_complete()
     test_3_missing_from_result()
     test_4_field_level_missing()

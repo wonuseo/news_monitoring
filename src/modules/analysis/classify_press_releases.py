@@ -5,13 +5,13 @@ classify_press_releases.py - Press Release LLM Classification with Result Sharin
 
 import json
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple  # Optional kept for internal use
 
 import pandas as pd
 
 from .llm_engine import load_prompts, analyze_article_llm
 from .llm_orchestrator import run_chunked_parallel
-from .result_writer import save_result_to_csv_incremental, sync_result_to_sheets
+from .result_writer import sync_result_to_sheets
 
 EMPTY_PR_METRICS = {
     "pr_clusters_analyzed": 0,
@@ -32,7 +32,7 @@ def select_representative_articles(df: pd.DataFrame) -> Dict[str, int]:
     - null/NaT는 후순위
 
     Args:
-        df: press_release_group과 cluster_id가 있는 DataFrame
+        df: cluster_summary와 cluster_id가 있는 DataFrame
 
     Returns:
         {cluster_id: representative_index} 딕셔너리
@@ -69,7 +69,6 @@ def classify_press_releases(
     openai_key: str,
     chunk_size: int = 50,
     max_workers: int = 3,
-    result_csv_path: Optional[str] = None,
     spreadsheet=None,
     raw_df: pd.DataFrame = None,
 ) -> Tuple[pd.DataFrame, Dict]:
@@ -88,7 +87,6 @@ def classify_press_releases(
         openai_key: OpenAI API 키
         chunk_size: 청크 크기
         max_workers: 병렬 워커 수 (기본값: 3)
-        result_csv_path: result.csv 경로 (즉시 저장용)
         spreadsheet: Google Sheets 객체 (청크 동기화용)
         raw_df: 원본 raw DataFrame (Sheets 동기화용)
 
@@ -198,7 +196,6 @@ def classify_press_releases(
 
             df.at[idx, "classified_at"] = timestamp
             propagated_count += 1
-            save_result_to_csv_incremental(df, idx, result_csv_path)
 
     def worker(task: Dict) -> Dict:
         cluster_id = task["cluster_id"]
@@ -245,8 +242,8 @@ def classify_press_releases(
             print(f"   상세 Traceback (첫 실패만):\n{result['error_trace']}")
 
     def sync_callback(_chunk_num: int, _total_chunks: int, _succ: int, _fail: int):
-        if spreadsheet and result_csv_path and raw_df is not None:
-            sync_result_to_sheets(result_csv_path, raw_df, spreadsheet, verbose=True)
+        if spreadsheet and raw_df is not None:
+            sync_result_to_sheets(df, raw_df, spreadsheet, verbose=True)
 
     run_stats = run_chunked_parallel(
         tasks=tasks,

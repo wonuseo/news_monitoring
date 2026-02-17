@@ -26,15 +26,13 @@ REPROCESS_RULES = [
 def check_reprocess_targets(
     df_raw: pd.DataFrame,
     spreadsheet=None,
-    result_csv_path: str = "",
 ) -> Dict[str, Any]:
     """
     total_result(Sheets 우선, fallback CSV)를 검사하여 재처리 대상을 반환.
 
     Args:
         df_raw: 전체 raw 데이터 DataFrame
-        spreadsheet: gspread Spreadsheet 객체 (None이면 CSV fallback)
-        result_csv_path: result.csv 경로 (Sheets 실패 시 fallback)
+        spreadsheet: gspread Spreadsheet 객체 (필수)
 
     Returns:
         {
@@ -53,8 +51,8 @@ def check_reprocess_targets(
 
     raw_links = set(df_raw["link"].dropna().tolist()) if "link" in df_raw.columns else set()
 
-    # total_result 로드 (Sheets 우선 → CSV fallback)
-    df_result = _load_total_result(spreadsheet, result_csv_path)
+    # total_result 로드 (Sheets에서만)
+    df_result = _load_total_result(spreadsheet)
 
     if df_result is None or len(df_result) == 0:
         # total_result 없음 → raw 전체가 재처리 대상
@@ -174,9 +172,8 @@ def print_reprocess_stats(stats: Dict[str, Any]) -> None:
 # 내부 헬퍼
 # ──────────────────────────────────────────────
 
-def _load_total_result(spreadsheet, result_csv_path: str) -> Optional[pd.DataFrame]:
-    """Sheets total_result 우선 로드, 실패 시 result.csv fallback."""
-    # 1) Sheets 시도
+def _load_total_result(spreadsheet) -> Optional[pd.DataFrame]:
+    """Sheets total_result에서 로드."""
     if spreadsheet:
         try:
             worksheet = spreadsheet.worksheet("total_result")
@@ -189,16 +186,5 @@ def _load_total_result(spreadsheet, result_csv_path: str) -> Optional[pd.DataFra
                 print("  ℹ️  total_result 시트가 비어있습니다.")
         except Exception as e:
             print(f"  ⚠️  total_result 시트 로드 실패: {e}")
-
-    # 2) CSV fallback
-    if result_csv_path:
-        import os
-        if os.path.exists(result_csv_path):
-            try:
-                df = pd.read_csv(result_csv_path, encoding="utf-8-sig")
-                print(f"📂 result.csv에서 {len(df)}개 기사 로드 (fallback)")
-                return df
-            except Exception as e:
-                print(f"  ⚠️  result.csv 로드 실패: {e}")
 
     return None

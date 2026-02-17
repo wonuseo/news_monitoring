@@ -6,8 +6,7 @@ keyword_extractor.py - Category-specific Keyword Extraction
 import numpy as np
 import pandas as pd
 from collections import Counter, defaultdict
-from typing import Dict, List, Tuple, Optional
-from pathlib import Path
+from typing import Dict, List, Tuple
 
 
 def extract_keywords_by_category(
@@ -17,7 +16,6 @@ def extract_keywords_by_category(
     top_k: int = 20,
     pos_tags: List[str] = ["NNG", "NNP", "VV", "VA"],
     min_count: int = 3,
-    output_csv: Optional[Path] = None
 ) -> Dict[str, List[Tuple[str, float]]]:
     """
     카테고리별로 특징적인 키워드를 추출 (Log-odds ratio + Laplace smoothing)
@@ -29,7 +27,6 @@ def extract_keywords_by_category(
         top_k: 카테고리별 상위 K개 키워드 (기본: 20)
         pos_tags: 추출할 형태소 태그 (기본: ["NNG", "NNP", "VV", "VA"] - 명사, 동사, 형용사)
         min_count: 최소 출현 횟수 (기본: 3)
-        output_csv: CSV 파일로 저장할 경로 (None이면 저장하지 않음)
 
     Returns:
         {category_name: [(keyword, log_odds_score), ...]} 형식의 딕셔너리
@@ -138,26 +135,6 @@ def extract_keywords_by_category(
 
         print(f"    - {category}: {len(log_odds_scores)}개 키워드 중 상위 {min(top_k, len(log_odds_scores))}개 선택")
 
-    # CSV 저장 (옵션)
-    if output_csv:
-        try:
-            rows = []
-            for category, keywords in category_keywords.items():
-                for rank, (word, score) in enumerate(keywords, 1):
-                    rows.append({
-                        "category": category,
-                        "rank": rank,
-                        "keyword": word,
-                        "log_odds_score": round(score, 4)
-                    })
-
-            df_keywords = pd.DataFrame(rows)
-            output_csv.parent.mkdir(parents=True, exist_ok=True)
-            df_keywords.to_csv(output_csv, index=False, encoding='utf-8-sig')
-            print(f"\n  💾 키워드 저장: {output_csv}")
-        except Exception as e:
-            print(f"\n  ⚠️  CSV 저장 실패: {e}")
-
     print(f"\n  ✅ 키워드 추출 완료: {len(category_keywords)}개 카테고리")
     return category_keywords
 
@@ -187,17 +164,15 @@ def print_keywords(category_keywords: Dict[str, List[Tuple[str, float]]], max_di
 
 def extract_all_categories(
     df: pd.DataFrame,
-    output_dir: Path,
     top_k: int = 20,
     max_display: int = 10,
     spreadsheet=None
 ):
     """
-    모든 주요 카테고리에 대해 키워드를 추출하고 CSV + Google Sheets로 저장
+    모든 주요 카테고리에 대해 키워드를 추출하고 Google Sheets로 저장
 
     Args:
         df: 분석 결과 DataFrame
-        output_dir: 출력 디렉토리
         top_k: 카테고리별 상위 K개 키워드
         max_display: 콘솔 출력 시 카테고리별 최대 표시 개수
         spreadsheet: Google Sheets spreadsheet 객체 (선택사항)
@@ -226,12 +201,10 @@ def extract_all_categories(
         print(f"📌 {display_name} ({col_name})")
         print("=" * 80)
 
-        output_csv = output_dir / f"keywords_{col_name}.csv"
         keywords = extract_keywords_by_category(
             df=df,
             category_column=col_name,
             top_k=top_k,
-            output_csv=output_csv
         )
 
         if keywords:
@@ -278,7 +251,6 @@ def extract_all_categories(
 
     print("\n" + "=" * 80)
     print(f"✅ 전체 카테고리 키워드 추출 완료")
-    print(f"  출력 디렉토리: {output_dir}/")
     if spreadsheet:
         print(f"  ☁️  Google Sheets: 'keywords' 시트")
     print("=" * 80)

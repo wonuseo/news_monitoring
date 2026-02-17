@@ -38,7 +38,7 @@ cluster_verification:
 
     ## 클러스터 정보
     - 검색 브랜드(query): {{query}}
-    - 클러스터 요약: {{press_release_group}}
+    - 클러스터 요약: {{cluster_summary}}
     - 기사 수: {{article_count}}개
 
     ## 클러스터 내 기사 제목

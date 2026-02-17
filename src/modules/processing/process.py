@@ -12,7 +12,7 @@ from typing import Optional
 import pandas as pd
 
 # 보도자료 검출/요약은 별도 모듈로 분리
-from .press_release_detector import detect_similar_articles, summarize_press_release_groups
+from .press_release_detector import detect_similar_articles, summarize_clusters
 
 
 def strip_html(text: str) -> str:
@@ -77,12 +77,33 @@ def normalize_df(df: pd.DataFrame, spreadsheet=None) -> pd.DataFrame:
         if max_article_no > 0:
             print(f"  📊 기존 최대 article_no: {max_article_no} (cumulative numbering)")
 
-    # 새 article_no 할당 (기존 최대값 + 1부터 시작)
-    df["article_no"] = range(max_article_no + 1, max_article_no + len(df) + 1)
+    # pub_datetime이 이미 파싱된 상태이므로 이를 기준으로 정렬 (과거 기사 = 낮은 번호)
+    df["_pub_dt_sort"] = pd.to_datetime(df["pub_datetime"], errors="coerce")
+    df = df.sort_values("_pub_dt_sort", ascending=True, na_position="last").reset_index(drop=True)
+    df = df.drop(columns=["_pub_dt_sort"])
 
+    # 기존 article_no 보존: 유효한 숫자값이 있는 행은 건너뜀
+    if "article_no" in df.columns:
+        existing_no = pd.to_numeric(df["article_no"], errors="coerce")
+        needs_no = existing_no.isna()
+    else:
+        needs_no = pd.Series(True, index=df.index)
+
+    new_count = needs_no.sum()
+    if new_count > 0:
+        new_nos = list(range(max_article_no + 1, max_article_no + new_count + 1))
+        df.loc[needs_no, "article_no"] = new_nos
+
+    # article_no를 정수형으로 변환 (5.0 → 5)
+    df["article_no"] = df["article_no"].astype("Int64")
+
+    existing_count = (~needs_no).sum() if "article_no" in df.columns else 0
     print(f"✅ {len(df)}개 기사 정규화 완료 (article_id, article_no 추가)")
-    if max_article_no > 0:
-        print(f"   📌 article_no 범위: {max_article_no + 1} ~ {max_article_no + len(df)}")
+    if existing_count > 0:
+        print(f"   📌 기존 article_no 보존: {existing_count}개")
+    if new_count > 0:
+        print(f"   📌 새 article_no 할당: {new_count}개 (범위: {max_article_no + 1} ~ {max_article_no + new_count})")
+    print(f"   📌 pubDate 오름차순 정렬 완료 (과거 기사 = 낮은 번호)")
     return df
 
 
@@ -132,7 +153,6 @@ def enrich_with_media_info(
     df: pd.DataFrame,
     spreadsheet=None,
     openai_key: str = None,
-    csv_path: Path = None
 ):
     """
     DataFrame에 언론사 정보 추가 (wrapper for media_classify.add_media_columns)
@@ -141,7 +161,6 @@ def enrich_with_media_info(
         df: 처리된 DataFrame
         spreadsheet: gspread Spreadsheet 객체 (선택사항)
         openai_key: OpenAI API 키 (선택사항)
-        csv_path: media_directory CSV 경로 (선택사항)
 
     Returns:
         (df, media_stats) 튜플
@@ -149,7 +168,7 @@ def enrich_with_media_info(
     empty_stats = {"media_domains_total": 0, "media_domains_new": 0, "media_domains_cached": 0}
     try:
         from src.modules.processing.media_classify import add_media_columns
-        return add_media_columns(df, spreadsheet, openai_key, csv_path)
+        return add_media_columns(df, spreadsheet, openai_key)
     except ImportError:
         print("⚠️  media_classify 모듈을 로드할 수 없습니다.")
         return df, empty_stats
@@ -201,7 +220,7 @@ def save_csv(df: pd.DataFrame, filepath: Path) -> None:
         print("  → 디스크 공간 또는 권한을 확인하세요.")
 
 
-# summarize_press_release_groups() 함수는 press_release_detector.py로 이동
+# summarize_clusters() 함수는 press_release_detector.py로 이동
 # 위에서 import됨
 
 

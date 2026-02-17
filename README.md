@@ -2,7 +2,7 @@
 
 네이버 뉴스 API로 호텔 브랜드 관련 기사를 수집하고, AI로 감정·카테고리·위험도를 분석하여 Google Sheets + CSV + Word 리포트를 생성합니다.
 
-![architecture](./news_monitoring_architecture.png)
+![architecture](resources/news_monitoring_architecture.png)
 
 ## ✨ 주요 기능
 
@@ -277,7 +277,7 @@ python main.py \
    - 컬럼: title, description, link, originallink, pubDate, query, group
 2. **result.csv**: LLM 분류 결과 (UTF-8 BOM)
    - 수집 컬럼: title, description, link, pub_datetime, query, group
-   - 처리 컬럼: article_id, article_no, source, cluster_id, press_release_group
+   - 처리 컬럼: article_id, article_no, source, cluster_id, cluster_summary
    - 언론사 컬럼: media_domain, media_name, media_group, media_type
    - LLM 컬럼: brand_relevance, brand_relevance_query_keywords, sentiment_stage, danger_level, issue_category, news_category, news_keyword_summary, classified_at
 3. **media_directory.csv**: 언론사 디렉토리 (자동 업데이트, 지속)

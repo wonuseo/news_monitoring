@@ -10,9 +10,6 @@ Fixed schema with 3-sheet structure:
 import time
 import uuid
 import json
-import os
-import csv
-import shutil
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 import pandas as pd
@@ -75,7 +72,7 @@ class RunLogger:
         logger = RunLogger()
         logger.log("articles_collected", 100)
         logger.log_dict({"pr_clusters_analyzed": 5, "pr_llm_success": 5})
-        logger.save_csv("data/logs/run_history.csv")
+        logger.save_to_sheets(spreadsheet)
     """
 
     def __init__(self):
@@ -161,44 +158,25 @@ class RunLogger:
 
         return pd.DataFrame([clean_metrics], columns=RUN_HISTORY_SCHEMA)
 
-    def save_csv(self, csv_path: str):
+    def save_to_sheets(self, spreadsheet, sheet_name: str = "run_history") -> bool:
         """
-        Save metrics to CSV file (append mode) with fixed schema.
-        If existing file header mismatches schema, backup and recreate.
+        Append current run metrics to run_history sheet in Google Sheets.
         """
         try:
-            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-
             df = self.to_dataframe()
+            worksheet = get_or_create_worksheet(spreadsheet, sheet_name, rows=1000, cols=60)
+            headers = self._get_or_create_headers(worksheet, RUN_HISTORY_SCHEMA)
 
-            if os.path.exists(csv_path):
-                # Check header matches schema
-                try:
-                    existing_df = pd.read_csv(csv_path, encoding='utf-8-sig',
-                                              nrows=0, quoting=csv.QUOTE_NONNUMERIC)
-                    existing_cols = list(existing_df.columns)
-                except Exception:
-                    existing_cols = []
-
-                if existing_cols != RUN_HISTORY_SCHEMA:
-                    # Header mismatch — backup old file
-                    backup_path = csv_path.replace(".csv", "_old.csv")
-                    shutil.move(csv_path, backup_path)
-                    print(f"  Schema mismatch: backed up {csv_path} -> {backup_path}")
-                    df.to_csv(csv_path, mode='w', header=True, index=False,
-                              encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
-                else:
-                    df.to_csv(csv_path, mode='a', header=False, index=False,
-                              encoding='utf-8', quoting=csv.QUOTE_NONNUMERIC)
-            else:
-                df.to_csv(csv_path, mode='w', header=True, index=False,
-                          encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
-
-            print(f"\n  Log saved: {csv_path}")
+            row_values = [
+                _clean_value_for_sheets(df[col].iloc[0]) if col in df.columns else ""
+                for col in headers
+            ]
+            worksheet.append_row(row_values)
+            print(f"\n  Run history saved to Sheets: {sheet_name}")
             return True
 
         except Exception as e:
-            print(f"\n  Log CSV save failed: {e}")
+            print(f"\n  Run history Sheets save failed: {e}")
             return False
 
     def print_summary(self):
@@ -417,42 +395,4 @@ def _clean_value_for_sheets(v):
     return v
 
 
-def sync_run_history_to_sheets(csv_path: str, spreadsheet, sheet_name: str = "run_history"):
-    """
-    Sync run history CSV to Google Sheets (full replace).
-
-    Args:
-        csv_path: Path to run_history.csv
-        spreadsheet: gspread spreadsheet object
-        sheet_name: Sheet name (default: "run_history")
-    """
-    try:
-        if not os.path.exists(csv_path):
-            print(f"  Log file not found: {csv_path}")
-            return False
-
-        df = pd.read_csv(csv_path, encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
-
-        if df.empty:
-            print("  No log data")
-            return False
-
-        # NaN 안전 처리 (Sheets API는 NaN/inf를 JSON으로 직렬화 불가)
-        df = df.fillna("")
-
-        # 데이터 먼저 준비 (clear 전에 검증)
-        data = [df.columns.tolist()] + [
-            [_clean_value_for_sheets(v) for v in row]
-            for row in df.values.tolist()
-        ]
-
-        worksheet = get_or_create_worksheet(spreadsheet, sheet_name, rows=1000, cols=50)
-        worksheet.clear()
-        worksheet.update('A1', data, value_input_option='RAW')
-
-        print(f"  Log sync complete: {len(df)} run records")
-        return True
-
-    except Exception as e:
-        print(f"  Log Sheets sync failed: {e}")
-        return False
+# Kept for backward compatibility — prefer RunLogger.save_to_sheets() for new code

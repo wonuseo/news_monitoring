@@ -138,13 +138,13 @@ def fetch_naver_paginated(query: str, display: int, max_pages: int, sort: str,
 def collect_all_news(brands: List[str], competitors: List[str],
                      display: int, max_pages: int, sort: str,
                      naver_id: str, naver_secret: str,
-                     raw_csv_path: str = None,
+                     existing_links: set = None,
                      spreadsheet = None) -> pd.DataFrame:
     """
-    모든 브랜드와 경쟁사 뉴스 수집 (각 브랜드마다 즉시 저장)
+    모든 브랜드와 경쟁사 뉴스 수집 (각 브랜드마다 즉시 Sheets 동기화)
 
     Args:
-        raw_csv_path: raw.csv 파일 경로 (중복 체크용, 선택사항)
+        existing_links: 기존 링크 set (중복 체크용, Sheets에서 미리 로드)
         spreadsheet: Google Sheets 객체 (즉시 동기화용, 선택사항)
 
     Returns:
@@ -152,16 +152,7 @@ def collect_all_news(brands: List[str], competitors: List[str],
     """
     all_rows = []
 
-    # 기존 링크 로드 (raw.csv에서)
-    existing_links = set()
-    if raw_csv_path and Path(raw_csv_path).exists():
-        try:
-            df_existing = pd.read_csv(raw_csv_path, encoding='utf-8-sig')
-            if 'link' in df_existing.columns:
-                existing_links = set(df_existing['link'].dropna().tolist())
-                print(f"📂 기존 raw.csv에서 {len(existing_links)}개 링크 로드 (중복 체크용)\n")
-        except Exception as e:
-            print(f"⚠️  raw.csv 로드 실패: {e}\n")
+    existing_links = existing_links or set()
 
     # 우리 브랜드 수집
     print(f"📰 우리 브랜드 뉴스 수집 중 (최대 {max_pages} 페이지)...")
@@ -181,9 +172,9 @@ def collect_all_news(brands: List[str], competitors: List[str],
             })
         all_rows.extend(brand_rows)
 
-        # 각 브랜드 수집 완료 시 즉시 저장
+        # 각 브랜드 수집 완료 시 즉시 Sheets 동기화
         if brand_rows:
-            _save_immediately(brand_rows, raw_csv_path, spreadsheet)
+            _save_immediately(brand_rows, spreadsheet)
 
         time.sleep(0.1)  # Rate limit 방지
 
@@ -205,9 +196,9 @@ def collect_all_news(brands: List[str], competitors: List[str],
             })
         all_rows.extend(competitor_rows)
 
-        # 각 경쟁사 수집 완료 시 즉시 저장
+        # 각 경쟁사 수집 완료 시 즉시 Sheets 동기화
         if competitor_rows:
-            _save_immediately(competitor_rows, raw_csv_path, spreadsheet)
+            _save_immediately(competitor_rows, spreadsheet)
 
         time.sleep(0.1)
 
@@ -216,47 +207,25 @@ def collect_all_news(brands: List[str], competitors: List[str],
     return df
 
 
-def _save_immediately(rows: List[Dict], raw_csv_path: str = None, spreadsheet = None):
+def _save_immediately(rows: List[Dict], spreadsheet = None):
     """
-    수집한 기사를 즉시 CSV와 Google Sheets에 저장
+    수집한 기사를 즉시 Google Sheets에 동기화
 
     Args:
         rows: 저장할 기사 리스트
-        raw_csv_path: CSV 파일 경로
         spreadsheet: Google Sheets 객체
     """
     if not rows:
         return
 
     df_new = pd.DataFrame(rows)
-    query = rows[0].get("query", "")
 
-    # CSV 저장
-    if raw_csv_path:
-        try:
-            file_exists = Path(raw_csv_path).exists()
-            df_new.to_csv(
-                raw_csv_path,
-                mode='a' if file_exists else 'w',
-                header=not file_exists,
-                index=False,
-                encoding='utf-8-sig' if not file_exists else 'utf-8'
-            )
-            print(f"    💾 CSV 저장: {len(rows)}개 기사")
-        except Exception as e:
-            print(f"    ⚠️  CSV 저장 실패: {e}")
-
-    # Google Sheets 동기화
+    # Google Sheets 동기화 (df_new 직접 전달)
     if spreadsheet:
         try:
-            # sync_to_sheets를 동적으로 임포트 (순환 참조 방지)
             from src.modules.export.sheets import sync_to_sheets
-
-            # 전체 raw.csv를 다시 읽어서 동기화 (중복 체크 자동)
-            if raw_csv_path and Path(raw_csv_path).exists():
-                df_all = pd.read_csv(raw_csv_path, encoding='utf-8-sig')
-                sync_result = sync_to_sheets(df_all, spreadsheet, "raw_data")
-                if sync_result['added'] > 0:
-                    print(f"    ☁️  Sheets 동기화: {sync_result['added']}개 추가")
+            sync_result = sync_to_sheets(df_new, spreadsheet, "raw_data")
+            if sync_result['added'] > 0:
+                print(f"    ☁️  Sheets 동기화: {sync_result['added']}개 추가")
         except Exception as e:
             print(f"    ⚠️  Sheets 동기화 실패: {e}")
