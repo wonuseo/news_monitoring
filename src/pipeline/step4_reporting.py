@@ -1,7 +1,8 @@
-"""Step 4: Console report + keyword extraction."""
+"""Step 4: Console report + keyword extraction + category discovery."""
 
 from src.modules.export.report import generate_console_report
 from src.modules.analysis.keyword_extractor import extract_all_categories
+from src.modules.analysis.category_discovery import discover_new_categories
 
 
 def run_reporting(ctx):
@@ -43,3 +44,14 @@ def run_reporting(ctx):
         max_display=10,
         spreadsheet=ctx.spreadsheet
     )
+
+    # 카테고리 발견 분석 (기타 기사 패턴 → 새 카테고리 제안)
+    if not ctx.args.dry_run:
+        print("\n" + "=" * 80)
+        print("STEP 4.6: 카테고리 발견 분석")
+        print("=" * 80)
+        discover_new_categories(
+            df=ctx.df_result,
+            openai_key=ctx.env["openai_key"],
+            logger=ctx.logger,
+        )

@@ -17,6 +17,27 @@ import pandas as pd
 from src.utils.sheets_helpers import get_or_create_worksheet
 
 
+class _NumpyEncoder(json.JSONEncoder):
+    """numpy int64/float64 등을 Python 기본형으로 변환하는 JSON 인코더."""
+    def default(self, o):
+        # numpy 설치 여부와 무관하게 동작하도록 타입명으로 판단
+        type_name = type(o).__name__
+        if type_name in ("int64", "int32", "int16", "int8", "uint64", "uint32", "uint16", "uint8"):
+            return int(o)
+        if type_name in ("float64", "float32", "float16"):
+            return float(o)
+        if type_name == "ndarray":
+            return o.tolist()
+        if type_name == "bool_":
+            return bool(o)
+        return super().default(o)
+
+
+def _dumps(obj, **kwargs) -> str:
+    """numpy 타입 안전 json.dumps 래퍼."""
+    return json.dumps(obj, cls=_NumpyEncoder, ensure_ascii=False, **kwargs)
+
+
 # ─── Fixed Schemas ───────────────────────────────────────────────────────────
 
 RUN_HISTORY_SCHEMA = [
@@ -105,7 +126,7 @@ class RunLogger:
             "category": category,
             "stage": stage,
             "message": message,
-            "data_json": json.dumps(data, ensure_ascii=False) if data else ""
+            "data_json": _dumps(data) if data else ""
         }
         self._logs.append(payload)
         return payload
@@ -152,7 +173,7 @@ class RunLogger:
             elif isinstance(value, bool):
                 clean_metrics[key] = str(value)
             elif isinstance(value, (dict, list)):
-                clean_metrics[key] = json.dumps(value, ensure_ascii=False)
+                clean_metrics[key] = _dumps(value)
             else:
                 clean_metrics[key] = value
 

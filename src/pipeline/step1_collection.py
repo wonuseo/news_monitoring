@@ -195,14 +195,16 @@ def _reprocess_check(ctx):
 
 
 def _date_filter(ctx):
-    """STEP 1.6: 2026-02-01 이후 기사만 필터링"""
+    """STEP 1.6: config/pipeline.yaml의 date_filter_start 이후 기사만 필터링"""
     if len(ctx.df_to_process) > 0 and 'pubDate' in ctx.df_to_process.columns:
+        from src.utils.config import load_config
+        date_start = load_config("pipeline").get("date_filter_start", "2026-02-01")
         before_date_filter = len(ctx.df_to_process)
         ctx.df_to_process['pub_datetime_temp'] = pd.to_datetime(ctx.df_to_process['pubDate'], errors='coerce')
-        ctx.df_to_process = ctx.df_to_process[ctx.df_to_process['pub_datetime_temp'] >= '2026-02-01'].copy()
+        ctx.df_to_process = ctx.df_to_process[ctx.df_to_process['pub_datetime_temp'] >= date_start].copy()
         ctx.df_to_process = ctx.df_to_process.drop(columns=['pub_datetime_temp'])
         date_filtered = before_date_filter - len(ctx.df_to_process)
-        print(f"🔧 날짜 필터링: {date_filtered}개 제외 (2026-02-01 이전), {len(ctx.df_to_process)}개 유지")
+        print(f"🔧 날짜 필터링: {date_filtered}개 제외 ({date_start} 이전), {len(ctx.df_to_process)}개 유지")
 
 
 def _handle_no_articles(ctx):

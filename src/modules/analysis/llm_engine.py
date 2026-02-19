@@ -3,6 +3,7 @@ llm_engine.py - LLM-Based Analysis Engine (Simplified)
 prompts.yaml 기반 단일 OpenAI 호출로 전체 분류 수행
 """
 
+import copy
 import json
 import yaml
 from pathlib import Path
@@ -17,8 +18,9 @@ from src.utils.openai_client import (
 )
 
 
-# JSON Schema 캐싱 (매번 생성 비용 제거)
-_RESPONSE_SCHEMA = {
+# issue_category / news_category enum 값이 없는 구조 템플릿
+# 실제 enum은 build_response_schema()가 prompts.yaml labels에서 주입함
+_SCHEMA_TEMPLATE = {
     "type": "object",
     "required": [
         "reasoning",
@@ -82,38 +84,11 @@ _RESPONSE_SCHEMA = {
         },
         "issue_category": {
             "type": ["string", "null"],
-            "enum": [
-                "안전/사고",
-                "위생/식음",
-                "보안/개인정보/IT",
-                "법무/규제",
-                "고객 분쟁",
-                "서비스 품질/운영",
-                "가격/상업",
-                "노무/인사",
-                "거버넌스/윤리",
-                "평판/PR",
-                "기타",
-                None
-            ]
+            "enum": []  # populated by build_response_schema() from prompts.yaml
         },
         "news_category": {
             "type": "string",
-            "enum": [
-                "PR/보도자료",
-                "사업/실적",
-                "브랜드/마케팅",
-                "상품/오퍼링",
-                "제휴/파트너십",
-                "이벤트/프로모션",
-                "시설/오픈",
-                "고객 경험",
-                "운영/기술",
-                "인사/조직",
-                "리스크/위기",
-                "ESG/사회",
-                "기타"
-            ]
+            "enum": []  # populated by build_response_schema() from prompts.yaml
         },
         "news_keyword_summary": {
             "type": "string",
@@ -134,7 +109,7 @@ def load_prompts(yaml_path: Path = None) -> dict:
         prompts 딕셔너리
     """
     if yaml_path is None:
-        yaml_path = Path(__file__).parent / "prompts.yaml"
+        yaml_path = Path(__file__).parents[3] / "config" / "prompts.yaml"
 
     with open(yaml_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
@@ -159,7 +134,7 @@ def load_source_verifier_prompts(yaml_path: Path = None) -> dict:
         return _source_verifier_prompts_cache
 
     if yaml_path is None:
-        yaml_path = Path(__file__).parent / "source_verifier_prompts.yaml"
+        yaml_path = Path(__file__).parents[3] / "config" / "source_verifier_prompts.yaml"
 
     with open(yaml_path, 'r', encoding='utf-8') as f:
         _source_verifier_prompts_cache = yaml.safe_load(f)
@@ -258,17 +233,48 @@ def call_openai_structured(
         return None
 
 
-def build_response_schema() -> dict:
-    """
-    JSON Schema 반환 (캐싱된 상수 사용)
+# 런타임 스키마 캐시 (첫 호출 시 prompts.yaml에서 enum 주입 후 재사용)
+_schema_cache: Optional[dict] = None
 
-    OpenAI Structured Output은 스키마 순서대로 생성하므로,
-    reasoning을 먼저 생성하게 하여 분류 품질을 향상시킨다.
+
+def build_response_schema(prompts_config: dict = None) -> dict:
+    """
+    prompts.yaml labels 섹션에서 issue_category / news_category enum을 주입한
+    JSON Schema를 반환한다. 첫 호출 시 빌드 후 메모리 캐시.
+
+    prompts.yaml labels만 수정하면 Python 코드 변경 없이 카테고리 추가/수정 가능.
+
+    Args:
+        prompts_config: 이미 로드된 prompts dict (None이면 자동 로드)
 
     Returns:
         JSON Schema 딕셔너리
     """
-    return _RESPONSE_SCHEMA
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
+
+    if prompts_config is None:
+        prompts_config = load_prompts()
+
+    labels = prompts_config.get("labels", {})
+    issue_cats = labels.get("issue_category_kr", [
+        "안전/사고", "위생/식음", "보안/개인정보/IT", "법무/규제",
+        "고객 분쟁", "서비스 품질/운영", "상품/서비스 철수",
+        "가격/상업", "노무/인사", "거버넌스/윤리", "평판/PR", "기타",
+    ])
+    news_cats = labels.get("news_category_kr", [
+        "PR/보도자료", "사업/실적", "브랜드/마케팅", "상품/오퍼링",
+        "제휴/파트너십", "이벤트/프로모션", "시설/오픈", "고객 경험",
+        "운영/기술", "인사/조직", "리스크/위기", "ESG/사회", "기타",
+    ])
+
+    schema = copy.deepcopy(_SCHEMA_TEMPLATE)
+    schema["properties"]["issue_category"]["enum"] = issue_cats + [None]
+    schema["properties"]["news_category"]["enum"] = news_cats
+
+    _schema_cache = schema
+    return _schema_cache
 
 
 def _post_process_result(result: Dict) -> Dict:
@@ -349,7 +355,7 @@ def analyze_article_llm(
 
     # Call OpenAI
     model = prompts_config.get("model", None)
-    response_schema = build_response_schema()
+    response_schema = build_response_schema(prompts_config)
 
     result = call_openai_structured(
         system_prompt, user_prompt, response_schema,

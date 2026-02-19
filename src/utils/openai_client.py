@@ -55,7 +55,7 @@ def load_api_models(yaml_path: Path = None) -> dict:
         return _api_models_cache
 
     if yaml_path is None:
-        yaml_path = Path(__file__).parent.parent / "api_models.yaml"
+        yaml_path = Path(__file__).parents[2] / "config" / "models.yaml"
 
     try:
         with open(yaml_path, 'r', encoding='utf-8') as f:

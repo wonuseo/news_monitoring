@@ -35,22 +35,38 @@ PR_CATEGORIES = {
     "사업/실적", "ESG/사회",
 }
 
-# Topic grouping thresholds
-TOPIC_JACCARD_LOW_THRESHOLD = 0.35   # 이하: 확실히 다른 주제
-TOPIC_JACCARD_HIGH_THRESHOLD = 0.50  # 이상: 확실히 같은 주제
-# 0.35 ~ 0.50 사이: LLM 검증 필요 (경계선 케이스)
+# ── 임계값: config/thresholds.yaml에서 로드, 없으면 하드코딩 fallback ──
+def _load_sv_thresholds():
+    try:
+        from src.utils.config import load_config
+        return load_config("thresholds")
+    except Exception:
+        return {}
 
-# Cross-query merge thresholds (STEP 2 대비 약간 완화, 날짜 제약 제거)
-CROSS_TITLE_COS_THRESHOLD = 0.65
-CROSS_TITLE_JAC_THRESHOLD = 0.15
-CROSS_DESC_COS_THRESHOLD = 0.55
-CROSS_DESC_JAC_THRESHOLD = 0.08
+_sv_thr = _load_sv_thresholds()
+_tg = _sv_thr.get("topic_grouping", {})
+_cq = _sv_thr.get("cross_query_merge", {})
+_bl = _cq.get("borderline", {})
+
+# Topic grouping thresholds (config/thresholds.yaml → topic_grouping)
+TOPIC_JACCARD_LOW_THRESHOLD  = _tg.get("jaccard_low",  0.35)  # 이하: 확실히 다른 주제
+TOPIC_JACCARD_HIGH_THRESHOLD = _tg.get("jaccard_high", 0.50)  # 이상: 확실히 같은 주제
+# 두 값 사이: LLM 검증 필요 (경계선 케이스)
+
+# Cross-query merge thresholds (config/thresholds.yaml → cross_query_merge)
+CROSS_TITLE_COS_THRESHOLD = _cq.get("title_cosine",            0.65)
+CROSS_TITLE_JAC_THRESHOLD = _cq.get("title_jaccard",           0.15)
+CROSS_DESC_COS_THRESHOLD  = _cq.get("desc_cosine",             0.55)
+CROSS_DESC_JAC_THRESHOLD  = _cq.get("desc_jaccard",            0.08)
+# Jaccard 단독 auto-merge
+CROSS_TITLE_JAC_STANDALONE = _cq.get("title_jaccard_standalone", 0.80)
 # LLM 경계선 범위
-CROSS_TITLE_COS_BORDERLINE = (0.58, 0.65)  # [low, high)
-CROSS_TITLE_JAC_BORDERLINE_MIN = 0.20
-CROSS_DESC_COS_BORDERLINE = (0.48, 0.55)   # [low, high)
-CROSS_DESC_JAC_BORDERLINE_MIN = 0.12
-CROSS_BORDERLINE_DAY_HINT_MAX = 1  # Δdays <= 1
+CROSS_TITLE_COS_BORDERLINE          = (_bl.get("title_cos_low",  0.58), _bl.get("title_cos_high", 0.65))
+CROSS_TITLE_JAC_BORDERLINE_MIN      = _bl.get("title_jac_min",   0.20)
+CROSS_DESC_COS_BORDERLINE           = (_bl.get("desc_cos_low",   0.48), _bl.get("desc_cos_high",  0.55))
+CROSS_DESC_JAC_BORDERLINE_MIN       = _bl.get("desc_jac_min",    0.12)
+CROSS_BORDERLINE_DAY_HINT_MAX       = _bl.get("day_hint_max",    1)
+CROSS_TITLE_JAC_BORDERLINE_STANDALONE = _bl.get("title_jac_standalone", 0.40)
 
 
 _article_prompts_cache: Optional[dict] = None
@@ -880,7 +896,14 @@ def merge_cross_query_clusters(
             t_jac = _jaccard_similarity(title_toksets[i], title_toksets[j])
             d_jac = _jaccard_similarity(desc_toksets[i], desc_toksets[j])
 
-            # Auto-merge: title 기준
+            # Auto-merge: Jaccard 단독 (제목 토큰 80%+ 일치, cosine 무관)
+            if t_jac >= CROSS_TITLE_JAC_STANDALONE:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+                pbar.update(1)
+                continue
+
+            # Auto-merge: title cosine+jaccard 기준
             if t_cos >= CROSS_TITLE_COS_THRESHOLD and t_jac >= CROSS_TITLE_JAC_THRESHOLD:
                 adjacency[i].append(j)
                 adjacency[j].append(i)
@@ -895,6 +918,11 @@ def merge_cross_query_clusters(
                 continue
 
             # 경계선 후보 수집 (pair-level LLM 제거)
+            # Case 1: Jaccard 단독 borderline (LLM 적극 활용, cosine/gate 무관)
+            jac_standalone_borderline = (
+                CROSS_TITLE_JAC_BORDERLINE_STANDALONE <= t_jac < CROSS_TITLE_JAC_STANDALONE
+            )
+            # Case 2: cosine 범위 기반 borderline
             title_borderline = (
                 CROSS_TITLE_COS_BORDERLINE[0] <= t_cos < CROSS_TITLE_COS_BORDERLINE[1]
                 and t_jac >= CROSS_TITLE_JAC_BORDERLINE_MIN
@@ -904,8 +932,15 @@ def merge_cross_query_clusters(
                 and d_jac >= CROSS_DESC_JAC_BORDERLINE_MIN
             )
 
-            if title_borderline or desc_borderline:
-                # strong hint gate: same_media OR Δdays <= 1
+            if jac_standalone_borderline:
+                # Jaccard 단독: gate 없이 바로 LLM 후보
+                score = float(t_jac)
+                key = (i, j)
+                prev = borderline_pair_scores.get(key)
+                if prev is None or score > prev:
+                    borderline_pair_scores[key] = score
+            elif title_borderline or desc_borderline:
+                # cosine 기반: strong hint gate (same_media OR Δdays <= 1)
                 same_media = (
                     bool(repr_media_keys[i])
                     and bool(repr_media_keys[j])

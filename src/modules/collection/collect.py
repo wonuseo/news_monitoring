@@ -10,9 +10,19 @@ from typing import List, Dict
 from pathlib import Path
 
 
-# 브랜드 설정
-OUR_BRANDS = ["롯데호텔", "호텔롯데", "L7", "시그니엘"]
-COMPETITORS = ["신라호텔", "조선호텔"]
+# 브랜드 설정 (config/brands.yaml에서 로드, 없으면 하드코딩 fallback)
+def _load_brands():
+    try:
+        from src.utils.config import load_config
+        cfg = load_config("brands")
+        return cfg.get("our_brands", []), cfg.get("competitors", [])
+    except Exception:
+        return (
+            ["롯데호텔", "호텔롯데", "L7", "시그니엘"],
+            ["신라호텔", "조선호텔"],
+        )
+
+OUR_BRANDS, COMPETITORS = _load_brands()
 
 NAVER_API_URL = "https://openapi.naver.com/v1/search/news.json"
 

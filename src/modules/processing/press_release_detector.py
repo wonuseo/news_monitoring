@@ -20,6 +20,17 @@ from src.utils.openai_client import (
     notify_error,
 )
 
+# ── 임계값: config/thresholds.yaml에서 로드, 없으면 하드코딩 fallback ──
+def _load_pr_thresholds():
+    try:
+        from src.utils.config import load_config
+        return load_config("thresholds").get("press_release", {})
+    except Exception:
+        return {}
+
+_pr_thr = _load_pr_thresholds()
+_pr_bl  = _pr_thr.get("borderline", {})
+
 
 def _trim_json_object(payload: str) -> str:
     # Remove wrapping markdown fences, keep inner braces/brackets
@@ -91,15 +102,15 @@ def _parse_summaries_from_result(result: Dict) -> List[Dict]:
 def detect_similar_articles(
     df: pd.DataFrame,
     spreadsheet=None,
-    day_window: int = 3,
-    strong_start_day: int = 4,
-    thr_title_cos: float = 0.70,
-    thr_title_jac: float = 0.18,
-    thr_desc_cos: float = 0.60,
-    thr_desc_jac: float = 0.10,
-    strong_desc_cos: float = 0.85,
-    strong_desc_jac: float = 0.35,
-    min_token_len: int = 2,
+    day_window: int          = None,
+    strong_start_day: int    = None,
+    thr_title_cos: float     = None,
+    thr_title_jac: float     = None,
+    thr_desc_cos: float      = None,
+    thr_desc_jac: float      = None,
+    strong_desc_cos: float   = None,
+    strong_desc_jac: float   = None,
+    min_token_len: int       = None,
     enable_llm_borderline: bool = False,
     openai_key: str = None,
     group_our_brands: bool = False,
@@ -130,6 +141,17 @@ def detect_similar_articles(
     Returns:
         'source', 'cluster_id' 컬럼이 추가된 DataFrame
     """
+    # config 기본값 적용 (명시적 인자가 없을 때만)
+    if day_window       is None: day_window       = _pr_thr.get("day_window",           3)
+    if strong_start_day is None: strong_start_day = _pr_thr.get("strong_start_day",     4)
+    if thr_title_cos    is None: thr_title_cos    = _pr_thr.get("title_cosine",         0.70)
+    if thr_title_jac    is None: thr_title_jac    = _pr_thr.get("title_jaccard",        0.18)
+    if thr_desc_cos     is None: thr_desc_cos     = _pr_thr.get("desc_cosine",          0.60)
+    if thr_desc_jac     is None: thr_desc_jac     = _pr_thr.get("desc_jaccard",         0.10)
+    if strong_desc_cos  is None: strong_desc_cos  = _pr_thr.get("strong_desc_cosine",   0.85)
+    if strong_desc_jac  is None: strong_desc_jac  = _pr_thr.get("strong_desc_jaccard",  0.35)
+    if min_token_len    is None: min_token_len    = _pr_thr.get("min_token_len",         2)
+
     print("🔍 유사 기사 검색 중...")
     print(f"  - 기본 규칙(Δdays≤{day_window}): title {thr_title_cos}/{thr_title_jac}, desc {thr_desc_cos}/{thr_desc_jac}")
     print(f"  - 초강유사(Δdays≥{strong_start_day}): desc {strong_desc_cos}/{strong_desc_jac}")
@@ -306,11 +328,11 @@ def detect_similar_articles(
             if enable_llm_borderline and openai_key:
                 from src.modules.analysis.source_verifier import llm_judge_component_representative
 
-                # Requested Stage 2 borderline settings
-                borderline_title_cos_low = 0.62
-                borderline_title_jac_min = 0.25
-                borderline_desc_cos_low = 0.52
-                borderline_desc_jac_min = 0.18
+                # borderline 설정 (config/thresholds.yaml → press_release.borderline)
+                borderline_title_cos_low = _pr_bl.get("title_cos_low", 0.62)
+                borderline_title_jac_min = _pr_bl.get("title_jac_min", 0.25)
+                borderline_desc_cos_low  = _pr_bl.get("desc_cos_low",  0.52)
+                borderline_desc_jac_min  = _pr_bl.get("desc_jac_min",  0.18)
                 borderline_top_k = 3
                 borderline_min_component_size = 3
 
