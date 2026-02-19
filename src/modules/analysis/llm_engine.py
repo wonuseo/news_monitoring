@@ -18,8 +18,9 @@ from src.utils.openai_client import (
 )
 
 
-# issue_category / news_category enum 값이 없는 구조 템플릿
-# 실제 enum은 build_response_schema()가 prompts.yaml labels에서 주입함
+# 1차 분류 스키마 템플릿
+# brand_relevance, sentiment_stage, news_category, news_keyword_summary 담당
+# danger_level / issue_category는 2차(negative_prompts.yaml)에서 처리
 _SCHEMA_TEMPLATE = {
     "type": "object",
     "required": [
@@ -27,8 +28,6 @@ _SCHEMA_TEMPLATE = {
         "brand_relevance",
         "brand_relevance_query_keywords",
         "sentiment_stage",
-        "danger_level",
-        "issue_category",
         "news_category",
         "news_keyword_summary"
     ],
@@ -78,14 +77,6 @@ _SCHEMA_TEMPLATE = {
             "type": "string",
             "enum": ["긍정", "중립", "부정 후보", "부정 확정"]
         },
-        "danger_level": {
-            "type": ["string", "null"],
-            "enum": ["상", "중", "하", None]
-        },
-        "issue_category": {
-            "type": ["string", "null"],
-            "enum": []  # populated by build_response_schema() from prompts.yaml
-        },
         "news_category": {
             "type": "string",
             "enum": []  # populated by build_response_schema() from prompts.yaml
@@ -115,8 +106,34 @@ def load_prompts(yaml_path: Path = None) -> dict:
         return yaml.safe_load(f)
 
 
+# Negative prompts 캐싱
+_negative_prompts_cache: Optional[dict] = None
+
 # Source verifier prompts 캐싱
 _source_verifier_prompts_cache: Optional[dict] = None
+
+
+def load_negative_prompts(yaml_path: Path = None) -> dict:
+    """
+    negative_prompts.yaml 로드 (캐싱 지원)
+
+    Args:
+        yaml_path: YAML 경로 (기본값: config/negative_prompts.yaml)
+
+    Returns:
+        negative prompts 딕셔너리
+    """
+    global _negative_prompts_cache
+    if _negative_prompts_cache is not None:
+        return _negative_prompts_cache
+
+    if yaml_path is None:
+        yaml_path = Path(__file__).parents[3] / "config" / "negative_prompts.yaml"
+
+    with open(yaml_path, 'r', encoding='utf-8') as f:
+        _negative_prompts_cache = yaml.safe_load(f)
+
+    return _negative_prompts_cache
 
 
 def load_source_verifier_prompts(yaml_path: Path = None) -> dict:
@@ -233,8 +250,51 @@ def call_openai_structured(
         return None
 
 
+# 2차 분류 스키마 템플릿 (danger_level / issue_category만 담당)
+# sentiment_stage는 1차에서 확정되므로 여기서는 출력하지 않음
+_NEGATIVE_SCHEMA_TEMPLATE = {
+    "type": "object",
+    "required": ["reasoning", "danger_level", "issue_category"],
+    "additionalProperties": False,
+    "properties": {
+        "reasoning": {
+            "type": "object",
+            "description": "위기 리스크 분석 추론 (내부용, 저장하지 않음)",
+            "required": ["severity_analysis", "attribution_analysis", "spread_signals", "final_judgment"],
+            "additionalProperties": False,
+            "properties": {
+                "severity_analysis": {
+                    "type": "string",
+                    "description": "사건 심각도 분석 (사상자/재산피해/법적제재 규모)"
+                },
+                "attribution_analysis": {
+                    "type": "string",
+                    "description": "브랜드 귀속/책임 가능성 분석 (과실/은폐/재발 프레이밍)"
+                },
+                "spread_signals": {
+                    "type": "string",
+                    "description": "확산 신호 분석 (유사기사/집단피해/미디어 집중도)"
+                },
+                "final_judgment": {
+                    "type": "string",
+                    "description": "3가지 축 종합 최종 판단 근거 1문장"
+                }
+            }
+        },
+        "danger_level": {
+            "type": ["string", "null"],
+            "enum": ["상", "중", "하", None]
+        },
+        "issue_category": {
+            "type": ["string", "null"],
+            "enum": []  # populated by build_negative_response_schema() from negative_prompts.yaml
+        }
+    }
+}
+
 # 런타임 스키마 캐시 (첫 호출 시 prompts.yaml에서 enum 주입 후 재사용)
 _schema_cache: Optional[dict] = None
+_negative_schema_cache: Optional[dict] = None
 
 
 def build_response_schema(prompts_config: dict = None) -> dict:
@@ -258,11 +318,6 @@ def build_response_schema(prompts_config: dict = None) -> dict:
         prompts_config = load_prompts()
 
     labels = prompts_config.get("labels", {})
-    issue_cats = labels.get("issue_category_kr", [
-        "안전/사고", "위생/식음", "보안/개인정보/IT", "법무/규제",
-        "고객 분쟁", "서비스 품질/운영", "상품/서비스 철수",
-        "가격/상업", "노무/인사", "거버넌스/윤리", "평판/PR", "기타",
-    ])
     news_cats = labels.get("news_category_kr", [
         "PR/보도자료", "사업/실적", "브랜드/마케팅", "상품/오퍼링",
         "제휴/파트너십", "이벤트/프로모션", "시설/오픈", "고객 경험",
@@ -270,21 +325,52 @@ def build_response_schema(prompts_config: dict = None) -> dict:
     ])
 
     schema = copy.deepcopy(_SCHEMA_TEMPLATE)
-    schema["properties"]["issue_category"]["enum"] = issue_cats + [None]
     schema["properties"]["news_category"]["enum"] = news_cats
 
     _schema_cache = schema
     return _schema_cache
 
 
+def build_negative_response_schema(prompts_config: dict = None) -> dict:
+    """
+    negative 분석용 JSON Schema 빌드 (issue_category enum 주입).
+    첫 호출 시 빌드 후 메모리 캐시.
+
+    Args:
+        prompts_config: 이미 로드된 prompts dict (None이면 자동 로드)
+
+    Returns:
+        JSON Schema 딕셔너리
+    """
+    global _negative_schema_cache
+    if _negative_schema_cache is not None:
+        return _negative_schema_cache
+
+    if prompts_config is None:
+        prompts_config = load_prompts()
+
+    labels = prompts_config.get("labels", {})
+    issue_cats = labels.get("issue_category_kr", [
+        "안전/사고", "위생/식음", "보안/개인정보/IT", "법무/규제",
+        "고객 분쟁", "서비스 품질/운영", "상품/서비스 철수",
+        "가격/상업", "노무/인사", "거버넌스/윤리", "평판/PR", "기타",
+    ])
+
+    schema = copy.deepcopy(_NEGATIVE_SCHEMA_TEMPLATE)
+    schema["properties"]["issue_category"]["enum"] = issue_cats + [None]
+
+    _negative_schema_cache = schema
+    return _negative_schema_cache
+
+
 def _post_process_result(result: Dict) -> Dict:
     """
-    LLM 출력의 논리적 일관성 보장을 위한 후처리
+    1차 LLM 출력의 논리적 일관성 보장을 위한 후처리
 
     규칙:
-    1. brand_relevance="무관" → sentiment="중립", danger=null, issue=null
-    2. danger_level은 (관련/언급) + (부정 후보/부정 확정)일 때만 유효
-    3. reasoning 필드 제거
+    1. brand_relevance="무관" → sentiment="중립", news_category="비관련"
+    2. reasoning 필드 제거
+    (danger_level / issue_category는 2차 패스에서 처리하므로 여기서 관여하지 않음)
 
     Args:
         result: LLM 원본 응답 딕셔너리
@@ -298,20 +384,10 @@ def _post_process_result(result: Dict) -> Dict:
     # reasoning 필드 제거 (LLM 내부 추론용으로만 사용)
     result.pop("reasoning", None)
 
-    brand_rel = result.get("brand_relevance", "")
-    sentiment = result.get("sentiment_stage", "")
-
-    # 규칙 1: 무관 → 중립, danger/issue null, news_category=비관련
-    if brand_rel == "무관":
+    # 무관 → sentiment 강제 중립, news_category=비관련
+    if result.get("brand_relevance") == "무관":
         result["sentiment_stage"] = "중립"
-        result["danger_level"] = None
-        result["issue_category"] = None
         result["news_category"] = "비관련"
-
-    # 규칙 2: danger_level은 (관련/언급) + (부정 후보/부정 확정)일 때만
-    if brand_rel not in ("관련", "언급") or sentiment not in ("부정 후보", "부정 확정"):
-        result["danger_level"] = None
-        result["issue_category"] = None
 
     return result
 
@@ -334,10 +410,8 @@ def analyze_article_llm(
             "brand_relevance": "관련",
             "brand_relevance_query_keywords": ["롯데호텔"],
             "sentiment_stage": "부정 확정",
-            "danger_level": "상",
-            "issue_category": "안전/사고",
             "news_category": "리스크/위기",
-            "news_keyword_summary": "화재 사고 대피"
+            "news_keyword_summary": "롯데호텔 화재 사고 대피"
         }
     """
     system_prompt = prompts_config.get("system", "")
@@ -390,3 +464,57 @@ def analyze_batch_llm(
         results.append(result if result else {})
 
     return results
+
+
+def analyze_article_negative_llm(
+    article: Dict,
+    initial_result: Dict,
+    openai_key: str
+) -> Optional[Dict]:
+    """
+    부정 기사 2차 정밀 분석 (config/negative_prompts.yaml 사용)
+
+    1차 분류에서 부정 후보/부정 확정으로 판정된 기사에 대해 별도로 호출한다.
+    danger_level, issue_category를 정밀 평가.
+
+    Args:
+        article: {"title": ..., "description": ..., "query": ..., "group": ...}
+        initial_result: 1차 분류 결과 {"brand_relevance": ..., "sentiment_stage": ...}
+        openai_key: OpenAI API 키
+
+    Returns:
+        {"danger_level": "상", "issue_category": "안전/사고"}
+        또는 None (실패시)
+    """
+    negative_config = load_negative_prompts()
+    system_prompt = negative_config.get("system", "")
+    user_template = negative_config.get("user_prompt_template", "")
+
+    if not system_prompt or not user_template:
+        return None
+
+    context = {
+        "query": article.get("query", ""),
+        "group": article.get("group", ""),
+        "title": article.get("title", ""),
+        "description": article.get("description", ""),
+        "brand_relevance": initial_result.get("brand_relevance", ""),
+        "initial_sentiment": initial_result.get("sentiment_stage", ""),
+    }
+
+    user_prompt = render_prompt(user_template, context)
+
+    model = negative_config.get("model", None)
+    response_schema = build_negative_response_schema(negative_config)
+
+    result = call_openai_structured(
+        system_prompt, user_prompt, response_schema,
+        openai_key, model=model, label="부정분석"
+    )
+
+    if not result:
+        return None
+
+    # reasoning 제거
+    result.pop("reasoning", None)
+    return result

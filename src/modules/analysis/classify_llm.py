@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, Optional
 import pandas as pd
 
-from .llm_engine import load_prompts, analyze_article_llm
+from .llm_engine import load_prompts, analyze_article_llm, analyze_article_negative_llm
 from .llm_orchestrator import run_chunked_parallel
 from .result_writer import sync_result_to_sheets
 from src.utils.text_cleaning import clean_bom
@@ -56,6 +56,45 @@ def _process_single_article(
         }
 
 
+def _process_single_negative_article(
+    idx: int,
+    article: Dict,
+    initial_result: Dict,
+    openai_key: str
+) -> Dict:
+    """
+    단일 기사 부정 정밀 분석 (병렬 처리용 헬퍼 함수)
+
+    Args:
+        idx: DataFrame 인덱스
+        article: {"title": ..., "description": ..., "query": ..., "group": ...}
+        initial_result: 1차 분류 결과 {"brand_relevance": ..., "sentiment_stage": ...}
+        openai_key: OpenAI API 키
+
+    Returns:
+        {"idx": idx, "success": True/False, "result": {...}, "error": ...}
+    """
+    try:
+        llm_result = analyze_article_negative_llm(article, initial_result, openai_key)
+        return {
+            "idx": idx,
+            "success": True,
+            "result": llm_result,
+            "error": None,
+            "error_type": None
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "idx": idx,
+            "success": False,
+            "result": None,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "error_trace": traceback.format_exc()
+        }
+
+
 def classify_llm(
     df: pd.DataFrame,
     openai_key: str,
@@ -98,19 +137,22 @@ def classify_llm(
         "press_releases_skipped": 0,
     }
 
-    # 초기화: 모든 결과 컬럼
+    # 1차 분류 결과 컬럼 (prompts.yaml 담당)
     result_columns = [
         "brand_relevance",
         "brand_relevance_query_keywords",
         "sentiment_stage",
-        "danger_level",
-        "issue_category",
         "news_category",
         "news_keyword_summary"
     ]
 
     # 컬럼 초기화 (이미 존재하는 값은 보존)
     for col in result_columns:
+        if col not in df.columns:
+            df[col] = None
+
+    # 2차 분류 결과 컬럼 (negative_prompts.yaml 담당) — 별도 초기화
+    for col in ["danger_level", "issue_category"]:
         if col not in df.columns:
             df[col] = None
 
@@ -251,14 +293,83 @@ def classify_llm(
     total_failed = run_stats["failed"]
     overall_success_rate = (total_success / total_processed * 100) if total_processed > 0 else 0
 
-    print(f"\n✅ LLM 분류 완료:")
+    print(f"\n✅ LLM 1차 분류 완료:")
     print(f"   총 처리: {total_processed}개 기사")
     print(f"   성공: {total_success}개 ({overall_success_rate:.1f}%)")
     print(f"   실패: {total_failed}개 ({100-overall_success_rate:.1f}%)")
 
+    # ========================================
+    # STEP 3: Negative 2차 정밀 분석 (danger_level / issue_category)
+    # ========================================
+    negative_columns = ["danger_level", "issue_category"]
+    negative_indices = [
+        idx for idx in indices_to_classify
+        if df.at[idx, "sentiment_stage"] in ("부정 후보", "부정 확정")
+    ]
+
+    negative_success = 0
+    if negative_indices:
+        print(f"\n[Negative Pass] 부정 기사 정밀 분석 중 ({len(negative_indices)}개)...")
+
+        negative_tasks = []
+        for idx in negative_indices:
+            article = {
+                "query": df.at[idx, "query"],
+                "group": df.at[idx, "group"] if "group" in df.columns else "",
+                "title": df.at[idx, "title"],
+                "description": df.at[idx, "description"],
+            }
+            initial_result = {
+                "brand_relevance": df.at[idx, "brand_relevance"],
+                "sentiment_stage": df.at[idx, "sentiment_stage"],
+            }
+            negative_tasks.append({
+                "task_id": idx,
+                "idx": idx,
+                "article": article,
+                "initial_result": initial_result,
+            })
+
+        def negative_worker(task: Dict) -> Dict:
+            return _process_single_negative_article(
+                task["idx"],
+                task["article"],
+                task["initial_result"],
+                openai_key
+            )
+
+        def on_negative_success(result: Dict):
+            nonlocal negative_success
+            idx = result["idx"]
+            neg_result = result["result"] or {}
+            for col in negative_columns:
+                if col in neg_result:
+                    value = neg_result[col]
+                    if isinstance(value, str):
+                        value = clean_bom(value)
+                    df.at[idx, col] = value if value is not None else ""
+            negative_success += 1
+
+        def on_negative_failure(result: Dict, _chunk_fail_count: int, _total_fail_count: int):
+            pass  # 실패 시 1차 결과 유지
+
+        run_chunked_parallel(
+            tasks=negative_tasks,
+            worker_fn=negative_worker,
+            on_success=on_negative_success,
+            on_failure=on_negative_failure,
+            chunk_size=chunk_size,
+            max_workers=max_workers,
+            progress_desc="부정 기사 정밀 분석",
+            unit="기사",
+            inter_chunk_sleep=0.5,
+        )
+
+        print(f"✅ Negative Pass 완료: {negative_success}/{len(negative_indices)}개 정밀 분석")
+
     # 메트릭 업데이트
     metrics["articles_classified_llm"] = total_success
-    metrics["llm_api_calls"] = total_success  # 1 article = 1 API call
+    metrics["llm_api_calls"] = total_success + negative_success
     metrics["classification_errors"] = total_failed
 
     # 비용 추정 (gpt-5-nano: $0.00015/1K input tokens, $0.0006/1K output tokens)

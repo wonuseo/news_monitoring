@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple  # Optional kept for internal use
 
 import pandas as pd
 
-from .llm_engine import load_prompts, analyze_article_llm
+from .llm_engine import load_prompts, analyze_article_llm, analyze_article_negative_llm
 from .llm_orchestrator import run_chunked_parallel
 from .result_writer import sync_result_to_sheets
 
@@ -121,17 +121,21 @@ def classify_press_releases(
         print(f"⚠️  prompts.yaml 로드 실패: {e}")
         return df, EMPTY_PR_METRICS.copy()
 
+    # 1차 분류 결과 컬럼 (prompts.yaml 담당)
     result_columns = [
         "brand_relevance",
         "brand_relevance_query_keywords",
         "sentiment_stage",
-        "danger_level",
-        "issue_category",
         "news_category",
         "news_keyword_summary",
         "classified_at",
     ]
     for col in result_columns:
+        if col not in df.columns:
+            df[col] = ""
+
+    # 2차 분류 결과 컬럼 (negative_prompts.yaml 담당) — 별도 초기화
+    for col in ["danger_level", "issue_category"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -181,16 +185,12 @@ def classify_press_releases(
                 keywords = result.get("brand_relevance_query_keywords", [])
                 df.at[idx, "brand_relevance_query_keywords"] = json.dumps(keywords, ensure_ascii=False)
                 df.at[idx, "sentiment_stage"] = result.get("sentiment_stage", "")
-                df.at[idx, "danger_level"] = result.get("danger_level") or ""
-                df.at[idx, "issue_category"] = result.get("issue_category") or ""
                 df.at[idx, "news_category"] = result.get("news_category", "")
                 df.at[idx, "news_keyword_summary"] = result.get("news_keyword_summary", "")
             else:
                 df.at[idx, "brand_relevance"] = ""
                 df.at[idx, "brand_relevance_query_keywords"] = "[]"
                 df.at[idx, "sentiment_stage"] = ""
-                df.at[idx, "danger_level"] = ""
-                df.at[idx, "issue_category"] = ""
                 df.at[idx, "news_category"] = ""
                 df.at[idx, "news_keyword_summary"] = ""
 
@@ -258,15 +258,103 @@ def classify_press_releases(
         sync_callback=sync_callback,
     )
 
-    print(f"✅ 보도자료 {propagated_count}개 분류 완료")
+    print(f"✅ 보도자료 1차 분류 완료: {propagated_count}개")
     print("  - 클러스터 기반 결과 공유")
     print(f"  - 대표 기사 LLM 분석: 성공 {run_stats['success']}개, 실패 {run_stats['failed']}개")
+
+    # ========================================
+    # Negative 2차 정밀 분석 (danger_level / issue_category)
+    # ========================================
+    negative_columns = ["danger_level", "issue_category"]
+    negative_clusters = [
+        cluster_id for cluster_id, rep_idx in representatives.items()
+        if df.at[rep_idx, "sentiment_stage"] in ("부정 후보", "부정 확정")
+    ]
+
+    negative_success = 0
+    if negative_clusters:
+        print(f"\n[보도자료 Negative Pass] {len(negative_clusters)}개 클러스터 정밀 분석 중...")
+
+        negative_tasks = []
+        for cluster_id in negative_clusters:
+            rep_idx = representatives[cluster_id]
+            row = df.loc[rep_idx]
+            article = {
+                "query": row.get("query", ""),
+                "group": row.get("group", ""),
+                "title": row.get("title", ""),
+                "description": row.get("description", ""),
+            }
+            initial_result = {
+                "brand_relevance": df.at[rep_idx, "brand_relevance"],
+                "sentiment_stage": df.at[rep_idx, "sentiment_stage"],
+            }
+            negative_tasks.append({
+                "task_id": cluster_id,
+                "cluster_id": cluster_id,
+                "idx": rep_idx,
+                "article": article,
+                "initial_result": initial_result,
+            })
+
+        def negative_worker(task: Dict) -> Dict:
+            cluster_id = task["cluster_id"]
+            try:
+                result = analyze_article_negative_llm(
+                    task["article"], task["initial_result"], openai_key
+                )
+                return {
+                    "task_id": cluster_id,
+                    "cluster_id": cluster_id,
+                    "success": bool(result),
+                    "result": result,
+                    "error": None if result else "Empty LLM response",
+                }
+            except Exception as e:
+                import traceback
+                return {
+                    "task_id": cluster_id,
+                    "cluster_id": cluster_id,
+                    "success": False,
+                    "result": None,
+                    "error": str(e),
+                    "error_trace": traceback.format_exc(),
+                }
+
+        def on_negative_success(result: Dict):
+            nonlocal negative_success
+            cluster_id = result["cluster_id"]
+            neg_result = result.get("result") or {}
+            for idx in cluster_to_target_indices.get(cluster_id, []):
+                for col in negative_columns:
+                    if col in neg_result:
+                        df.at[idx, col] = neg_result[col] if neg_result[col] is not None else ""
+            negative_success += 1
+
+        def on_negative_failure(result: Dict, _chunk_fail_count: int, _total_fail_count: int):
+            pass  # 실패 시 1차 결과 유지
+
+        run_chunked_parallel(
+            tasks=negative_tasks,
+            worker_fn=negative_worker,
+            on_success=on_negative_success,
+            on_failure=on_negative_failure,
+            chunk_size=chunk_size,
+            max_workers=max_workers,
+            progress_desc="보도자료 부정 기사 정밀 분석",
+            unit="클러스터",
+            inter_chunk_sleep=0.5,
+        )
+
+        print(f"✅ 보도자료 Negative Pass 완료: {negative_success}/{len(negative_clusters)}개 클러스터 정밀 분석")
 
     pr_metrics = {
         "pr_clusters_analyzed": len(tasks),
         "pr_articles_propagated": propagated_count,
         "pr_llm_success": run_stats["success"],
         "pr_llm_failed": run_stats["failed"],
+        "pr_negative_clusters": len(negative_clusters),
+        "pr_negative_success": negative_success,
         "pr_cost_estimated": 0,  # Cost tracking can be added later
     }
 
