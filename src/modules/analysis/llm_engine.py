@@ -35,12 +35,13 @@ _SCHEMA_TEMPLATE = {
     "properties": {
         "reasoning": {
             "type": "object",
-            "description": "분석 추론 과정 (내부용, 저장하지 않음)",
+            "description": "분석 추론 과정 (reasoning 탭에 저장됨)",
             "required": [
                 "article_subject",
                 "brand_role",
                 "subject_test",
-                "sentiment_rationale"
+                "sentiment_rationale",
+                "news_category_rationale"
             ],
             "additionalProperties": False,
             "properties": {
@@ -60,6 +61,10 @@ _SCHEMA_TEMPLATE = {
                 "sentiment_rationale": {
                     "type": "string",
                     "description": "감정 판단 근거 1문장"
+                },
+                "news_category_rationale": {
+                    "type": "string",
+                    "description": "뉴스 카테고리 선택 근거 1문장"
                 }
             }
         },
@@ -381,8 +386,8 @@ def _post_process_result(result: Dict) -> Dict:
     if not result:
         return result
 
-    # reasoning 필드 제거 (LLM 내부 추론용으로만 사용)
-    result.pop("reasoning", None)
+    # reasoning 필드를 _reasoning으로 보존 (reasoning_writer가 수집)
+    result["_reasoning"] = result.pop("reasoning", None)
 
     # 무관 → sentiment 강제 중립, news_category=비관련
     if result.get("brand_relevance") == "무관":
@@ -515,6 +520,6 @@ def analyze_article_negative_llm(
     if not result:
         return None
 
-    # reasoning 제거
-    result.pop("reasoning", None)
+    # reasoning 필드를 _reasoning으로 보존 (reasoning_writer가 수집)
+    result["_reasoning"] = result.pop("reasoning", None)
     return result

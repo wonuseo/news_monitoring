@@ -1,5 +1,5 @@
 """
-llm_orchestrator.py - Shared Chunked Parallel LLM Runner
+task_runner.py - Shared Chunked Parallel Task Runner
 진행률, 청크 통계, 동기화 콜백을 공통 처리한다.
 """
 

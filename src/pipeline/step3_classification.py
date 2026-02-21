@@ -5,6 +5,7 @@ import pandas as pd
 from src.modules.analysis.classify_press_releases import classify_press_releases
 from src.modules.analysis.classify_llm import classify_llm
 from src.modules.analysis.source_verifier import verify_and_regroup_sources
+from src.modules.analysis.reasoning_writer import ReasoningCollector
 from src.modules.processing.press_release_detector import summarize_clusters
 from src.modules.processing.looker_prep import add_time_series_columns
 from src.modules.analysis.classification_stats import get_classification_stats, print_classification_stats
@@ -24,6 +25,9 @@ def run_classification(ctx):
     print("\n" + "=" * 80)
     print("STEP 3: 분류")
     print("=" * 80)
+
+    # ReasoningCollector 초기화 (Sheets가 연결된 경우에만 수집)
+    ctx.reasoning_collector = ReasoningCollector() if ctx.spreadsheet else None
 
     # Step 3-1: 보도자료 LLM 분류 (대표 기사 분석 -> 클러스터 공유)
     _classify_press_releases(ctx)
@@ -63,6 +67,11 @@ def run_classification(ctx):
     # 결과 저장
     _save_and_sync(ctx)
 
+    # reasoning 탭 업로드 (Sheets 연결 시)
+    if ctx.reasoning_collector is not None and ctx.spreadsheet:
+        print("\n📝 reasoning 탭 업로드 중...")
+        ctx.reasoning_collector.flush_to_sheets(ctx.spreadsheet)
+
 
 def _classify_press_releases(ctx):
     """Step 3-1: Press release cluster classification"""
@@ -74,7 +83,8 @@ def _classify_press_releases(ctx):
         chunk_size=ctx.args.chunk_size,
         max_workers=ctx.args.max_workers,
         spreadsheet=ctx.spreadsheet,
-        raw_df=ctx.df_raw
+        raw_df=ctx.df_raw,
+        reasoning_collector=ctx.reasoning_collector,
     )
     ctx.logger.log_dict(pr_metrics)
     ctx.logger.end_stage("pr_classification")
@@ -95,7 +105,8 @@ def _classify_general(ctx):
         max_competitor_classify=ctx.args.max_competitor_classify,
         max_workers=ctx.args.max_workers,
         spreadsheet=ctx.spreadsheet,
-        raw_df=ctx.df_raw
+        raw_df=ctx.df_raw,
+        reasoning_collector=ctx.reasoning_collector,
     )
     ctx.logger.log_dict(llm_metrics)
     ctx.logger.end_stage("general_classification")

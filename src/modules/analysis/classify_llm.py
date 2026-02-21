@@ -9,8 +9,8 @@ from typing import Dict, Optional
 import pandas as pd
 
 from .llm_engine import load_prompts, analyze_article_llm, analyze_article_negative_llm
-from .llm_orchestrator import run_chunked_parallel
-from .result_writer import sync_result_to_sheets
+from .task_runner import run_chunked_parallel
+from src.modules.export.sheets import sync_result_to_sheets
 from src.utils.text_cleaning import clean_bom
 
 
@@ -103,7 +103,8 @@ def classify_llm(
     max_competitor_classify: int = 50,
     max_workers: int = 3,
     spreadsheet = None,
-    raw_df: pd.DataFrame = None
+    raw_df: pd.DataFrame = None,
+    reasoning_collector=None,
 ) -> tuple[pd.DataFrame, Dict]:
     """
     LLM-only 분류 메인 함수 (병렬 처리 최적화)
@@ -234,6 +235,12 @@ def classify_llm(
         idx = result["idx"]
         llm_result = result["result"] or {}
 
+        # reasoning 수집 (_reasoning은 DataFrame에 저장하지 않음)
+        _reasoning = llm_result.pop("_reasoning", None)
+        if reasoning_collector is not None and _reasoning:
+            article_id = df.at[idx, "article_id"] if "article_id" in df.columns else ""
+            reasoning_collector.add_first_pass(str(article_id), timestamp, _reasoning)
+
         # LLM 결과를 DataFrame에 병합
         for col in result_columns:
             if col in llm_result:
@@ -342,6 +349,13 @@ def classify_llm(
             nonlocal negative_success
             idx = result["idx"]
             neg_result = result["result"] or {}
+
+            # 2차 reasoning 수집
+            _neg_reasoning = neg_result.pop("_reasoning", None)
+            if reasoning_collector is not None and _neg_reasoning:
+                article_id = df.at[idx, "article_id"] if "article_id" in df.columns else ""
+                reasoning_collector.update_second_pass(str(article_id), _neg_reasoning)
+
             for col in negative_columns:
                 if col in neg_result:
                     value = neg_result[col]

@@ -18,6 +18,7 @@ class PipelineContext:
     spreadsheet: Optional[Any] = None      # gspread Spreadsheet or None
     sheets_required: bool = True           # False when Sheets not connected (emergency raw-only mode)
     current_stage: str = "init"            # Current pipeline stage
+    reasoning_collector: Optional[Any] = None  # ReasoningCollector instance
 
     # DataFrames that flow between steps
     df_raw: Optional[pd.DataFrame] = None

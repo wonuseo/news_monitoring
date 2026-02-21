@@ -904,3 +904,48 @@ def sync_all_sheets(df: pd.DataFrame, spreadsheet) -> Dict[str, Dict]:
     print(f"  - 오류: {total_errors}개")
 
     return results
+
+
+def sync_result_to_sheets(
+    df_result,
+    raw_df,
+    spreadsheet,
+    verbose: bool = True,
+):
+    """
+    분류 결과 DataFrame을 Google Sheets에 동기화 (upsert 방식).
+
+    classify_llm, classify_press_releases의 청크별 콜백에서 사용.
+
+    Args:
+        df_result: 분류 결과 DataFrame
+        raw_df: 원본 raw DataFrame
+        spreadsheet: gspread Spreadsheet 객체
+        verbose: 진행 메시지 출력 여부
+
+    Returns:
+        동기화 결과 딕셔너리 또는 None (실패 시)
+    """
+    if not spreadsheet or df_result is None or len(df_result) == 0:
+        return None
+
+    try:
+        sync_results = sync_raw_and_processed(raw_df, df_result, spreadsheet)
+
+        added_count = sum(r.get("added", 0) for r in sync_results.values())
+        updated_count = sum(r.get("updated", 0) for r in sync_results.values())
+
+        if verbose and (added_count > 0 or updated_count > 0):
+            msg_parts = []
+            if added_count > 0:
+                msg_parts.append(f"{added_count}개 추가")
+            if updated_count > 0:
+                msg_parts.append(f"{updated_count}개 업데이트")
+            print(f"    ☁️  Sheets 동기화: {', '.join(msg_parts)}")
+
+        return sync_results
+
+    except Exception as e:
+        if verbose:
+            print(f"    ⚠️  Sheets 동기화 실패: {e}")
+        return None

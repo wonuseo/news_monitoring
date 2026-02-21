@@ -10,8 +10,8 @@ from typing import Dict, Optional, Tuple  # Optional kept for internal use
 import pandas as pd
 
 from .llm_engine import load_prompts, analyze_article_llm, analyze_article_negative_llm
-from .llm_orchestrator import run_chunked_parallel
-from .result_writer import sync_result_to_sheets
+from .task_runner import run_chunked_parallel
+from src.modules.export.sheets import sync_result_to_sheets
 
 EMPTY_PR_METRICS = {
     "pr_clusters_analyzed": 0,
@@ -71,6 +71,7 @@ def classify_press_releases(
     max_workers: int = 3,
     spreadsheet=None,
     raw_df: pd.DataFrame = None,
+    reasoning_collector=None,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     보도자료 LLM 분류 (대표 기사 분석 -> 클러스터 내 공유)
@@ -224,7 +225,15 @@ def classify_press_releases(
             }
 
     def on_success(result: Dict):
-        apply_cluster_result(result["cluster_id"], result.get("result"))
+        cluster_result = result.get("result") or {}
+        # 대표 기사 reasoning 수집 (_reasoning은 클러스터 전파에서 제외)
+        _reasoning = cluster_result.pop("_reasoning", None)
+        if reasoning_collector is not None and _reasoning:
+            rep_idx = result.get("idx")
+            if rep_idx is not None and "article_id" in df.columns:
+                article_id = df.at[rep_idx, "article_id"]
+                reasoning_collector.add_first_pass(str(article_id), timestamp, _reasoning)
+        apply_cluster_result(result["cluster_id"], cluster_result if cluster_result else None)
 
     def on_failure(result: Dict, _chunk_fail_count: int, total_fail_count: int):
         cluster_id = result.get("cluster_id", result.get("task_id", "unknown"))
@@ -325,6 +334,15 @@ def classify_press_releases(
             nonlocal negative_success
             cluster_id = result["cluster_id"]
             neg_result = result.get("result") or {}
+
+            # 대표 기사 2차 reasoning 수집
+            _neg_reasoning = neg_result.pop("_reasoning", None)
+            if reasoning_collector is not None and _neg_reasoning:
+                rep_idx = representatives.get(cluster_id)
+                if rep_idx is not None and "article_id" in df.columns:
+                    article_id = df.at[rep_idx, "article_id"]
+                    reasoning_collector.update_second_pass(str(article_id), _neg_reasoning)
+
             for idx in cluster_to_target_indices.get(cluster_id, []):
                 for col in negative_columns:
                     if col in neg_result:
