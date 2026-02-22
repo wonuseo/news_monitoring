@@ -2,8 +2,8 @@
 
 네이버 뉴스 API로 호텔 브랜드 관련 기사를 수집하고, OpenAI 기반 LLM으로 분류/검증한 뒤 Google Sheets에 저장하는 파이프라인입니다.
 
-![architecture_dev](/Users/wonuseo/PycharmProjects/news_monitoring/resources/news_monitoring_architecture_0222A.PNG)
-![architecture_users](/Users/wonuseo/PycharmProjects/news_monitoring/resources/news_monitoring_architecture_0222B.jpeg)
+![architecture_dev](./resources/news_monitoring_architecture_0222A.PNG)
+![architecture_users](./resources/news_monitoring_architecture_0222B.jpeg)
 
 ## 개요
 
