@@ -31,17 +31,10 @@ def extract_keywords_by_category(
     Returns:
         {category_name: [(keyword, log_odds_score), ...]} 형식의 딕셔너리
     """
-    print(f"\n🔍 카테고리별 키워드 추출 시작...")
-    print(f"  - 카테고리 컬럼: {category_column}")
-    print(f"  - 텍스트 컬럼: {', '.join(text_columns)}")
-    print(f"  - 형태소 태그: {', '.join(pos_tags)}")
-    print(f"  - 상위 K개: {top_k}")
-
     # Kiwi 로드 (한 번만 로드)
     try:
         from kiwipiepy import Kiwi
         kiwi = Kiwi()
-        print("  ✅ Kiwi 형태소 분석기 로드 완료")
     except ImportError:
         print("  ❌ kiwipiepy가 설치되지 않았습니다: pip install kiwipiepy")
         return {}
@@ -61,7 +54,6 @@ def extract_keywords_by_category(
         return {}
 
     # 카테고리별로 텍스트 추출
-    print("\n  📝 형태소 분석 중...")
     category_tokens = defaultdict(list)  # {category: [token1, token2, ...]}
 
     for category in df_valid[category_column].unique():
@@ -87,10 +79,7 @@ def extract_keywords_by_category(
             except Exception as e:
                 continue
 
-    print(f"  ✅ 형태소 분석 완료: {len(category_tokens)}개 카테고리")
-
     # Log-odds ratio 계산
-    print("\n  📊 Log-odds ratio 계산 중...")
     category_keywords = {}
 
     # 전체 단어 빈도 계산
@@ -133,9 +122,6 @@ def extract_keywords_by_category(
         log_odds_scores.sort(key=lambda x: x[1], reverse=True)
         category_keywords[category] = log_odds_scores[:top_k]
 
-        print(f"    - {category}: {len(log_odds_scores)}개 키워드 중 상위 {min(top_k, len(log_odds_scores))}개 선택")
-
-    print(f"\n  ✅ 키워드 추출 완료: {len(category_keywords)}개 카테고리")
     return category_keywords
 
 
@@ -177,10 +163,6 @@ def extract_all_categories(
         max_display: 콘솔 출력 시 카테고리별 최대 표시 개수
         spreadsheet: Google Sheets spreadsheet 객체 (선택사항)
     """
-    print("\n" + "=" * 80)
-    print("🔍 전체 카테고리 키워드 추출")
-    print("=" * 80)
-
     # 추출할 카테고리 목록
     categories = [
         ("sentiment_stage", "감정 단계"),
@@ -194,12 +176,7 @@ def extract_all_categories(
 
     for col_name, display_name in categories:
         if col_name not in df.columns:
-            print(f"\n⚠️  '{col_name}' 컬럼이 없습니다. 스킵.")
             continue
-
-        print(f"\n{'=' * 80}")
-        print(f"📌 {display_name} ({col_name})")
-        print("=" * 80)
 
         keywords = extract_keywords_by_category(
             df=df,
@@ -208,8 +185,6 @@ def extract_all_categories(
         )
 
         if keywords:
-            print_keywords(keywords, max_display=max_display)
-
             # Google Sheets 저장용 데이터 수집
             for category, keyword_list in keywords.items():
                 for rank, (word, score) in enumerate(keyword_list, 1):
@@ -224,10 +199,6 @@ def extract_all_categories(
     # Google Sheets에 저장 (선택사항)
     if spreadsheet and len(all_keywords_data) > 0:
         try:
-            print("\n" + "=" * 80)
-            print("☁️  Google Sheets에 키워드 업로드 중...")
-            print("=" * 80)
-
             df_keywords = pd.DataFrame(all_keywords_data)
             sheet_name = "keywords"
 
@@ -235,22 +206,13 @@ def extract_all_categories(
             try:
                 worksheet = spreadsheet.worksheet(sheet_name)
                 spreadsheet.del_worksheet(worksheet)
-                print(f"  ✅ 기존 '{sheet_name}' 시트 삭제")
             except:
                 pass  # 시트가 없으면 스킵
 
             # 새 시트 생성 및 데이터 업로드
             worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=len(df_keywords)+1, cols=len(df_keywords.columns))
-
-            # 헤더 + 데이터 업로드
             worksheet.update([df_keywords.columns.values.tolist()] + df_keywords.values.tolist())
 
-            print(f"  ✅ '{sheet_name}' 시트에 {len(all_keywords_data)}개 키워드 업로드 완료")
+            print(f"  키워드 추출 완료: {len(all_keywords_data)}개 → Sheets 'keywords' 탭")
         except Exception as e:
-            print(f"  ⚠️  Google Sheets 업로드 실패: {e}")
-
-    print("\n" + "=" * 80)
-    print(f"✅ 전체 카테고리 키워드 추출 완료")
-    if spreadsheet:
-        print(f"  ☁️  Google Sheets: 'keywords' 시트")
-    print("=" * 80)
+            print(f"  ⚠️  키워드 Sheets 업로드 실패: {e}")

@@ -15,8 +15,6 @@ def run_reporting(ctx):
     print("\n" + "=" * 80)
     print("STEP 4: 리포트 생성")
     print("=" * 80)
-
-    # 콘솔 리포트
     generate_console_report(ctx.df_result)
 
     # 분류 결과 메트릭
@@ -36,9 +34,6 @@ def run_reporting(ctx):
     })
 
     # 키워드 추출 (자동 실행)
-    print("\n" + "=" * 80)
-    print("STEP 4.5: 카테고리별 키워드 추출")
-    print("=" * 80)
     extract_all_categories(
         df=ctx.df_result,
         top_k=ctx.args.keyword_top_k,
@@ -48,9 +43,6 @@ def run_reporting(ctx):
 
     # 카테고리 발견 분석 (기타 기사 패턴 → 새 카테고리 제안)
     if not ctx.args.dry_run:
-        print("\n" + "=" * 80)
-        print("STEP 4.6: 카테고리 발견 분석")
-        print("=" * 80)
         discover_new_categories(
             df=ctx.df_result,
             openai_key=ctx.env["openai_key"],
