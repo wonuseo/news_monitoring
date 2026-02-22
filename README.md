@@ -3,7 +3,6 @@
 네이버 뉴스 API로 호텔 브랜드 관련 기사를 수집하고, OpenAI 기반 LLM으로 분류/검증한 뒤 Google Sheets에 저장하는 파이프라인입니다.
 
 ![architecture_dev](./resources/news_monitoring_architecture_0222A.PNG)
-![architecture_users](./resources/news_monitoring_architecture_0222B.jpeg)
 
 ## 개요
 
@@ -13,7 +12,7 @@
 - **예외 모드**: Sheets 미연결 시 `raw.csv`만 비상 저장 후 파이프라인 종료
 
 ## 주요 기능
-
+![architecture_users](./resources/news_monitoring_architecture_0222B.jpeg)
 - 네이버 API 페이지네이션 수집 (`--max_api_pages`, 브랜드당 최대 900건)
 - 보도자료/유사주제 탐지 (TF-IDF + 코사인 + Jaccard)
 - OpenAI 기반 언론사 분류 (도메인 → 언론사명/그룹/유형)
