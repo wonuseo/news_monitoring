@@ -33,10 +33,27 @@ python main.py --display 20 --chunk_size 5 --max_workers 1
 python main.py --clean_bom
 ```
 
-Tests (pytest must be installed manually — not in current venv):
+Additional CLI args (see `src/cli.py` for full list):
+```bash
+--preprocess_only      # Collection + processing, skip LLM classification
+--sort date|sim        # Sort output (default: date)
+--outdir DIR           # Output directory (default: data)
+--chunk_size N         # Articles per LLM batch (default: 100)
+--max_workers N        # ThreadPoolExecutor threads (default: 3)
+--max_competitor_classify N  # Cap competitor articles to classify (0=unlimited)
+--sheets_id ID         # Override GOOGLE_SHEET_ID from .env
+--keyword_top_k N      # Top keywords to extract (default: 20)
+--start N              # Start index for display (default: 1)
+```
+
+Tests (pytest must be installed manually — not in requirements.txt):
 ```bash
 python -m pytest tests/test_press_release_detector.py
 python -m pytest tests/test_reprocess_checker.py
+python -m pytest tests/test_sheets_sync.py
+
+# LLM quality test — makes real OpenAI API calls (costs money)
+python tests/test_llm_quality.py
 ```
 
 ## Pipeline Architecture
@@ -49,12 +66,13 @@ STEP 1: Collection
 ├─ Load existing links from Sheets → skip duplicates
 ├─ Sync new articles to Sheets raw_data tab
 ├─ STEP 1.5a: Dedup raw_data + total_result tabs (by link)
-└─ STEP 1.5: Reprocess check — find articles missing from total_result
-              OR with empty fields (brand_relevance, sentiment_stage,
-              source, media_domain, date_only)
-   ⚠️  Only targets MISSING/EMPTY fields. Articles with wrong
-       classifications are NOT flagged. To force re-classify: clear
-       brand_relevance (or any REPROCESS_RULES field) in Sheets first.
+├─ STEP 1.5: Reprocess check — find articles missing from total_result
+│             OR with empty fields (brand_relevance, sentiment_stage,
+│             source, media_domain, date_only)
+│  ⚠️  Only targets MISSING/EMPTY fields. Articles with wrong
+│      classifications are NOT flagged. To force re-classify: clear
+│      brand_relevance (or any REPROCESS_RULES field) in Sheets first.
+└─ STEP 1.6: Date filtering (config/pipeline.yaml date_filter_start)
 
 STEP 2: Processing
 ├─ Normalize (HTML strip, ISO dates, article_id MD5-hash, article_no)
@@ -63,11 +81,15 @@ STEP 2: Processing
 ├─ OpenAI cluster summarization (cluster_summary, 3-word)
 └─ Media classification (domain → media_name/group/type, batch API call)
 
-STEP 3: LLM Classification
+STEP 3: LLM Classification (two-pass)
 ├─ 3-1: Press release clusters — 1 representative → LLM → share across cluster
 ├─ 3-2: General articles — parallel chunked LLM (ThreadPoolExecutor)
-│        → brand_relevance, sentiment_stage, danger_level,
-│           issue_category, news_category, news_keyword_summary
+│        Pass 1 (prompts.yaml): brand_relevance, sentiment_stage,
+│           news_category, news_keyword_summary
+│        Pass 2 (negative_prompts.yaml): for 부정 후보/부정 확정 only →
+│           re-evaluates danger_level, issue_category with chain-of-thought
+│           (severity_analysis, attribution_analysis, spread_signals)
+│        → reasoning stored in Sheets reasoning tab via reasoning_writer.py
 │        → incremental Sheets sync after each chunk
 └─ 3-3: Source verification
         Part A:  LLM verifies each cluster → 보도자료 / 유사주제
@@ -109,6 +131,7 @@ src/modules/analysis/
 ├── category_discovery.py         # STEP 4.6: "기타" pattern analysis → new category suggestions
 ├── classification_stats.py
 ├── result_writer.py              # Thread-safe incremental Sheets sync
+├── reasoning_writer.py           # Stores LLM reasoning chains to Sheets reasoning tab
 └── keyword_extractor.py          # kiwipiepy + Log-odds
 
 src/modules/processing/
@@ -129,7 +152,8 @@ src/utils/
 ├── config.py                     # load_config("name") → config/<name>.yaml
 ├── openai_client.py              # Direct HTTP to OpenAI (no SDK), retry/backoff
 ├── sheets_helpers.py
-└── text_cleaning.py
+├── text_cleaning.py
+└── group_labels.py               # Normalizes group labels (OUR→자사, COMPETITOR→경쟁사)
 
 scripts/                          # One-off maintenance scripts (not part of main pipeline)
 ```
@@ -147,6 +171,7 @@ scripts/                          # One-off maintenance scripts (not part of mai
 | `config/thresholds.yaml` | 유사도 임계값 (보도자료 탐지, cross-query 병합, 주제 그룹화) |
 | `config/models.yaml` | 기능별 OpenAI 모델 선택 |
 | `config/prompts.yaml` | ★ LLM 분류 기준 + 카테고리 목록 + few-shot 예시 |
+| `config/negative_prompts.yaml` | ★ 부정기사 2차 분석 프롬프트 (danger_level, issue_category chain-of-thought) |
 | `config/source_verifier_prompts.yaml` | 클러스터 검증 + 주제 유사도 판단 프롬프트 |
 
 설정값은 `src/utils/config.py`의 `load_config(name)` 으로 로드된다. 파일이 없으면 하드코딩 fallback으로 동작한다.
@@ -190,7 +215,7 @@ GOOGLE_SHEET_ID=...
 
 ## Data Columns
 
-**raw_data tab**: `title`, `description`, `link`, `originallink`, `pubDate`, `query` (pipe-separated if multi-brand), `group` (OUR/COMPETITOR)
+**raw_data tab**: `title`, `description`, `link`, `originallink`, `pubDate`, `query` (pipe-separated if multi-brand), `group` (자사/경쟁사)
 
 **total_result tab** (adds after processing + classification):
 - `article_id` (MD5 12-char, permanent ID), `article_no` (sequential, human-readable)
@@ -205,7 +230,12 @@ GOOGLE_SHEET_ID=...
 - `news_keyword_summary`: 5-word Korean summary
 - `classified_at`: ISO timestamp — **controls whether article is re-classified** (empty = will be processed)
 
-**Sheets tabs**: `raw_data`, `total_result`, `run_history` (55 cols), `errors`, `events`, `keywords`
+**reasoning tab** (LLM chain-of-thought from two-pass classification):
+- `article_id`, `classified_at`, `article_subject`, `brand_role`, `subject_test`
+- `sentiment_rationale`, `news_category_rationale`
+- `severity_analysis`, `attribution_analysis`, `spread_signals`, `final_judgment`
+
+**Sheets tabs**: `raw_data`, `total_result`, `reasoning`, `run_history` (55 cols), `errors`, `events`, `keywords`
 
 ## Critical Patterns
 
@@ -246,7 +276,7 @@ After every LLM call:
 
 ## Notes
 
-- `README.md` is outdated (describes removed hybrid system). This file is authoritative.
+- `README.md` is now up-to-date and describes the current 5-step pipeline.
 - Date filter is set in `config/pipeline.yaml` (`date_filter_start`). Update monthly.
 - `logger.py` uses `_NumpyEncoder` (custom `json.JSONEncoder`) to handle pandas `int64`/`float64` in metrics serialization.
 - No linting enforced. DataFrame naming convention: `df_raw`, `df_normalized`, `df_processed`, `df_result`.
