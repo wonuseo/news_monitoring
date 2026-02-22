@@ -59,26 +59,31 @@ def main():
         return
 
     # ── 전체 파이프라인 (Sheets 연결 필수) ───────────────────
-    # Step 1: Collection + Reprocess + Date filter
-    has_articles = run_collection(ctx)
-    if not has_articles:
+    try:
+        # Step 1: Collection + Reprocess + Date filter
+        has_articles = run_collection(ctx)
+        if not has_articles:
+            return
+
+        # Step 2: Processing (normalize, dedupe, press release, media)
+        run_processing(ctx)
+
+        # Step 3: Classification (PR clusters, general LLM, source verification)
+        run_classification(ctx)
+
+        # Step 4: Reporting + Keywords
+        run_reporting(ctx)
+
+        # Step 5: Google Sheets sync
+        run_sheets_sync(ctx)
+
+    except Exception as e:
+        ctx.record_error(f"파이프라인 오류: {e}", category="system")
+        import traceback
+        print(f"\n❌ 파이프라인 오류 발생:\n{traceback.format_exc()}")
+    finally:
+        # Finalize: logs, summary, completion banner (항상 실행)
         finalize_pipeline(ctx)
-        return
-
-    # Step 2: Processing (normalize, dedupe, press release, media)
-    run_processing(ctx)
-
-    # Step 3: Classification (PR clusters, general LLM, source verification)
-    run_classification(ctx)
-
-    # Step 4: Reporting + Keywords
-    run_reporting(ctx)
-
-    # Step 5: Google Sheets sync
-    run_sheets_sync(ctx)
-
-    # Finalize: logs, summary, completion banner
-    finalize_pipeline(ctx)
 
 
 def _emergency_raw_collection(ctx):

@@ -204,6 +204,7 @@ def _date_filter(ctx):
         ctx.df_to_process = ctx.df_to_process[ctx.df_to_process['pub_datetime_temp'] >= date_start].copy()
         ctx.df_to_process = ctx.df_to_process.drop(columns=['pub_datetime_temp'])
         date_filtered = before_date_filter - len(ctx.df_to_process)
+        ctx.logger.log("articles_filtered_by_date", date_filtered)
         print(f"🔧 날짜 필터링: {date_filtered}개 제외 ({date_start} 이전), {len(ctx.df_to_process)}개 유지")
 
 

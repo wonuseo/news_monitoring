@@ -83,13 +83,6 @@ def connect_sheets_and_setup(ctx):
             print("\n📊 Google Sheets 연결 중...")
             ctx.spreadsheet = connect_sheets(creds_path, sheet_id)
             if ctx.spreadsheet:
-                # Sheets 기존 BOM 자동 정리 (데이터 로드 전)
-                print("🧹 Sheets BOM 문자 자동 정리 중...")
-                bom_results = clean_all_bom_in_sheets(ctx.spreadsheet)
-                bom_total = sum(bom_results.values())
-                if bom_total > 0:
-                    print(f"  ✅ {bom_total}개 셀 BOM 제거 완료")
-
                 print("✅ Google Sheets 연결 성공 (유일한 저장소)")
                 ctx.logger.log_event("sheets_connected", {"sheet_id": sheet_id}, category="sheets_sync", stage="init")
                 ctx.logger.flush_all_to_sheets(ctx.spreadsheet)

@@ -102,6 +102,7 @@ class RunLogger:
         self.metrics = {
             "run_id": self.run_id,
             "timestamp": datetime.now().isoformat(),
+            "errors_total": 0,
         }
         self._logs: List[Dict[str, Any]] = []
         self._errors_flushed = 0
@@ -409,8 +410,13 @@ class RunLogger:
 
 
 def _clean_value_for_sheets(v):
-    """NaN/inf를 빈 문자열로 변환 (Sheets API JSON 직렬화 안전)"""
+    """NaN/inf/numpy 타입을 Python 기본형으로 변환 (Sheets API JSON 직렬화 안전)"""
     import math
+    type_name = type(v).__name__
+    if type_name in ("int64", "int32", "int16", "int8", "uint64", "uint32", "uint16", "uint8"):
+        return int(v)
+    if type_name in ("float64", "float32", "float16"):
+        v = float(v)
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return ""
     return v
