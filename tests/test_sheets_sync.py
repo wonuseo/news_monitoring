@@ -93,7 +93,7 @@ def test_sync_to_sheets_header_order_alignment_no_duplicate():
         title="raw_data",
         values=[
             ["title", "link", "group", "brand_relevance"],
-            ["old title", "https://a.com/1", "OUR", ""],
+            ["old title", "https://a.com/1", "자사", ""],
         ],
     )
     ss = FakeSpreadsheet({"raw_data": ws})
@@ -101,7 +101,7 @@ def test_sync_to_sheets_header_order_alignment_no_duplicate():
         [
             {
                 "query": "롯데호텔",
-                "group": "OUR",
+                "group": "자사",
                 "title": "new title",
                 "link": "https://a.com/1",
                 "brand_relevance": "관련",
@@ -124,7 +124,7 @@ def test_sync_to_sheets_handles_bom_and_whitespace_link_header():
         title="raw_data",
         values=[
             ["title", "\ufeffLink ", "group", "brand_relevance"],
-            ["old title", "https://a.com/1", "OUR", ""],
+            ["old title", "https://a.com/1", "자사", ""],
         ],
     )
     ss = FakeSpreadsheet({"raw_data": ws})
@@ -132,7 +132,7 @@ def test_sync_to_sheets_handles_bom_and_whitespace_link_header():
         [
             {
                 "query": "롯데호텔",
-                "group": "OUR",
+                "group": "자사",
                 "title": "new title",
                 "link": "https://a.com/1",
                 "brand_relevance": "관련",
@@ -154,8 +154,8 @@ def test_load_existing_links_from_sheets_normalizes_header_and_values():
         title="raw_data",
         values=[
             ["title", "\ufeffLink ", "group"],
-            ["a", " https://a.com/1 ", "OUR"],
-            ["b", "https://a.com/2", "OUR"],
+            ["a", " https://a.com/1 ", "자사"],
+            ["b", "https://a.com/2", "자사"],
         ],
     )
     ss = FakeSpreadsheet({"raw_data": ws})
@@ -176,7 +176,7 @@ def test_sync_to_sheets_appends_missing_header_columns():
     ss = FakeSpreadsheet({"raw_data": ws})
     df = pd.DataFrame(
         [
-            {"link": "https://a.com/2", "title": "new", "group": "OUR"},
+            {"link": "https://a.com/2", "title": "new", "group": "자사"},
         ]
     )
 
@@ -188,7 +188,7 @@ def test_sync_to_sheets_appends_missing_header_columns():
     header = ws.get_all_values()[0]
     assert header[:3] == ["link", "title", "group"]
     new_row = ws.get_all_values()[2]
-    assert new_row[:3] == ["https://a.com/2", "new", "OUR"]
+    assert new_row[:3] == ["https://a.com/2", "new", "자사"]
 
 
 def test_sync_to_sheets_stops_when_existing_rows_have_no_key_header():
@@ -196,13 +196,13 @@ def test_sync_to_sheets_stops_when_existing_rows_have_no_key_header():
         title="raw_data",
         values=[
             ["title", "group"],
-            ["old title", "OUR"],
+            ["old title", "자사"],
         ],
     )
     ss = FakeSpreadsheet({"raw_data": ws})
     df = pd.DataFrame(
         [
-            {"link": "https://a.com/1", "title": "new", "group": "OUR"},
+            {"link": "https://a.com/1", "title": "new", "group": "자사"},
         ]
     )
 

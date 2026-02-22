@@ -71,7 +71,7 @@ def make_raw():
         "description": [f"기사 내용 {i}" for i in range(1, 11)],
         "pubDate": ["2026-02-10"] * 10,
         "query": ["롯데호텔"] * 10,
-        "group": ["OUR"] * 10,
+        "group": ["자사"] * 10,
     })
 
 

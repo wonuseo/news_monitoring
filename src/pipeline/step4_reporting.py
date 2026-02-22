@@ -3,6 +3,7 @@
 from src.modules.export.report import generate_console_report
 from src.modules.analysis.keyword_extractor import extract_all_categories
 from src.modules.analysis.category_discovery import discover_new_categories
+from src.utils.group_labels import is_competitor_group, is_our_group
 
 
 def run_reporting(ctx):
@@ -19,11 +20,11 @@ def run_reporting(ctx):
     generate_console_report(ctx.df_result)
 
     # 분류 결과 메트릭
-    our_brands_relevant = len(ctx.df_result[(ctx.df_result['group'] == 'OUR') & (ctx.df_result['brand_relevance'].isin(['관련', '언급']))]) if 'brand_relevance' in ctx.df_result.columns else 0
-    our_brands_negative = len(ctx.df_result[(ctx.df_result['group'] == 'OUR') & (ctx.df_result['sentiment_stage'].isin(['부정 후보', '부정 확정']))]) if 'sentiment_stage' in ctx.df_result.columns else 0
+    our_brands_relevant = len(ctx.df_result[(ctx.df_result['group'].map(is_our_group)) & (ctx.df_result['brand_relevance'].isin(['관련', '언급']))]) if 'brand_relevance' in ctx.df_result.columns else 0
+    our_brands_negative = len(ctx.df_result[(ctx.df_result['group'].map(is_our_group)) & (ctx.df_result['sentiment_stage'].isin(['부정 후보', '부정 확정']))]) if 'sentiment_stage' in ctx.df_result.columns else 0
     danger_high = len(ctx.df_result[ctx.df_result['danger_level'] == '상']) if 'danger_level' in ctx.df_result.columns else 0
     danger_medium = len(ctx.df_result[ctx.df_result['danger_level'] == '중']) if 'danger_level' in ctx.df_result.columns else 0
-    competitor_articles = len(ctx.df_result[ctx.df_result['group'] == 'COMPETITOR']) if 'group' in ctx.df_result.columns else 0
+    competitor_articles = len(ctx.df_result[ctx.df_result['group'].map(is_competitor_group)]) if 'group' in ctx.df_result.columns else 0
 
     ctx.logger.log_dict({
         "our_brands_relevant": our_brands_relevant,

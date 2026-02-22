@@ -19,6 +19,7 @@ from src.utils.openai_client import (
     extract_response_text,
     notify_error,
 )
+from src.utils.group_labels import GROUP_OUR, is_our_group
 
 # ── 임계값: config/thresholds.yaml에서 로드, 없으면 하드코딩 fallback ──
 def _load_pr_thresholds():
@@ -239,14 +240,14 @@ def detect_similar_articles(
     df["desc_tokset"] = df["desc_clean"].map(lambda x: set(tokenize_simple(x)))
 
     # 클러스터링 그룹 키 생성
-    # group_our_brands=True: OUR 브랜드 기사는 query 무관하게 하나의 풀로 묶음
-    # COMPETITOR 기사는 항상 query별 독립 클러스터링
+    # group_our_brands=True: 자사 브랜드 기사는 query 무관하게 하나의 풀로 묶음
+    # 경쟁사 기사는 항상 query별 독립 클러스터링
     if group_our_brands and "group" in df.columns:
         df["_cluster_group_key"] = df.apply(
-            lambda r: "OUR" if r.get("group") == "OUR" else r.get("query", ""),
+            lambda r: GROUP_OUR if is_our_group(r.get("group")) else r.get("query", ""),
             axis=1,
         )
-        print(f"  - OUR 브랜드 통합 클러스터링 활성화 (group_our_brands=True)")
+        print("  - 자사 브랜드 통합 클러스터링 활성화 (group_our_brands=True)")
     else:
         df["_cluster_group_key"] = df["query"]
 
@@ -500,8 +501,8 @@ def detect_similar_articles(
                     continue
 
                 members_global = [idxs[k] for k in comp]
-                # cluster_id prefix: OUR 통합 시 첫 멤버의 query 사용, 아니면 group_key
-                if group_our_brands and group_key == "OUR":
+                # cluster_id prefix: 자사 통합 시 첫 멤버의 query 사용, 아니면 group_key
+                if group_our_brands and group_key == GROUP_OUR:
                     first_query = df.at[members_global[0], "query"]
                     cid_prefix = str(first_query).split("|")[0]
                 else:

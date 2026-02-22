@@ -11,6 +11,7 @@ import time
 
 from src.utils.text_cleaning import clean_bom
 from src.utils.sheets_helpers import get_or_create_worksheet
+from src.utils.group_labels import is_competitor_group, is_our_group
 
 
 def clean_all_bom_in_sheets(spreadsheet, sheet_names: list = None) -> Dict[str, int]:
@@ -878,17 +879,17 @@ def sync_all_sheets(df: pd.DataFrame, spreadsheet) -> Dict[str, Dict]:
 
     # 2. 우리 브랜드 부정
     print("  [2/4] 우리_부정")
-    our_negative = df[(df["group"] == "OUR") & (df["sentiment"] == "부정")]
+    our_negative = df[(df["group"].map(is_our_group)) & (df["sentiment"] == "부정")]
     results["우리_부정"] = sync_to_sheets(our_negative, spreadsheet, "우리_부정")
 
     # 3. 우리 브랜드 긍정
     print("  [3/4] 우리_긍정")
-    our_positive = df[(df["group"] == "OUR") & (df["sentiment"] == "긍정")]
+    our_positive = df[(df["group"].map(is_our_group)) & (df["sentiment"] == "긍정")]
     results["우리_긍정"] = sync_to_sheets(our_positive, spreadsheet, "우리_긍정")
 
     # 4. 경쟁사
     print("  [4/4] 경쟁사")
-    competitor = df[df["group"] == "COMPETITOR"]
+    competitor = df[df["group"].map(is_competitor_group)]
     results["경쟁사"] = sync_to_sheets(competitor, spreadsheet, "경쟁사")
 
     # 통계

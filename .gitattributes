@@ -1,0 +1,30 @@
+# Default: normalize all text files to LF on checkout
+* text=auto eol=lf
+
+# Python source files
+*.py text eol=lf
+
+# YAML / config
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+
+# CSV files
+*.csv text eol=lf
+
+# Markdown / docs
+*.md text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Binary files — no line ending conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary

@@ -5,6 +5,8 @@ report.py - Report Generation Module
 
 import pandas as pd
 
+from src.utils.group_labels import is_competitor_group, is_our_group
+
 
 def generate_console_report(df: pd.DataFrame) -> None:
     """콘솔에 요약 리포트 출력"""
@@ -21,7 +23,7 @@ def generate_console_report(df: pd.DataFrame) -> None:
     # Section A: 우리 브랜드 - 부정 기사 (위험도 높은 순)
     print("\n[A] 우리 브랜드 - 부정 기사 (위험도 높은 순)")
     print("-" * 80)
-    our_negative = df[(df["group"] == "OUR") & (df[sentiment_col].str.contains("부정", case=False, na=False))].copy()
+    our_negative = df[(df["group"].map(is_our_group)) & (df[sentiment_col].str.contains("부정", case=False, na=False))].copy()
 
     # 위험도 정렬 (HIGH > MEDIUM > LOW)
     risk_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "상": 0, "중": 1, "하": 2, "-": 3, "": 4}
@@ -47,7 +49,7 @@ def generate_console_report(df: pd.DataFrame) -> None:
     print("\n" + "-" * 80)
     print("[B] 우리 브랜드 - 긍정 기사 (최신순)")
     print("-" * 80)
-    our_positive = df[(df["group"] == "OUR") & (df[sentiment_col].str.contains("긍정", case=False, na=False))]
+    our_positive = df[(df["group"].map(is_our_group)) & (df[sentiment_col].str.contains("긍정", case=False, na=False))]
     our_positive = our_positive.sort_values("pub_datetime", ascending=False).head(10)
 
     if len(our_positive) == 0:
@@ -64,7 +66,7 @@ def generate_console_report(df: pd.DataFrame) -> None:
     print("\n" + "-" * 80)
     print("[C] 경쟁사 하이라이트 (최신순)")
     print("-" * 80)
-    comp = df[df["group"] == "COMPETITOR"]
+    comp = df[df["group"].map(is_competitor_group)]
     comp = comp.sort_values("pub_datetime", ascending=False).head(10)
 
     if len(comp) == 0:

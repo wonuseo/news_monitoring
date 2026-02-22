@@ -9,6 +9,8 @@ import pandas as pd
 from typing import List, Dict
 from pathlib import Path
 
+from src.utils.group_labels import GROUP_COMPETITOR, GROUP_OUR
+
 
 # 브랜드 설정 (config/brands.yaml에서 로드, 없으면 하드코딩 fallback)
 def _load_brands():
@@ -173,7 +175,7 @@ def collect_all_news(brands: List[str], competitors: List[str],
         for item in items:
             brand_rows.append({
                 "query": query,
-                "group": "OUR",
+                "group": GROUP_OUR,
                 "title": item.get("title", ""),
                 "description": item.get("description", ""),
                 "pubDate": item.get("pubDate", ""),
@@ -197,7 +199,7 @@ def collect_all_news(brands: List[str], competitors: List[str],
         for item in items:
             competitor_rows.append({
                 "query": query,
-                "group": "COMPETITOR",
+                "group": GROUP_COMPETITOR,
                 "title": item.get("title", ""),
                 "description": item.get("description", ""),
                 "pubDate": item.get("pubDate", ""),
